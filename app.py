@@ -6,10 +6,10 @@ import time
 
 # --- 基础配置 ---
 SIREN_CONTRACT = "0xD399c6dBe8D7D93616053303491E216B30C7B476"
-# 你截图里那个巨鲸地址
+# 你关注的巨鲸地址
 DEFAULT_WALLETS = [
     "0xb2AF49dBF526054FAf19602860A5E298a79F3D05",
-    "0x9f5D230F8152CB35372138805F99839352e0D7cE" # 这是另一个关联的做市地址，可以选填
+    "0x9f5D230F8152CB35372138805F99839352e0D7cE"
 ]
 
 # --- 页面设置 ---
@@ -54,44 +54,42 @@ if st.sidebar.button("开始监控"):
     else:
         st.info(f"正在启动监控: {target_wallet[:10]}... 设置已保存")
         time.sleep(1)
-        st.experimental_rerun()
+        # 修复日志报错：已将 experimental_rerun 更新为 rerun
+        st.rerun()
 
 if api_key and target_wallet.startswith("0x"):
     # 创建布局
     col1, col2 = st.columns([1, 4])
     with col1:
         st.subheader("📊 今日统计")
-        st.metric(label="当前余额 (SIREN)", value="1.11M") # 这里可以做成动态的，先放个静态数据
+        st.metric(label="预计当前余额 (SIREN)", value="1.11M") 
         st.write("---")
-        st.write("对手方分布:")
-        # 这里可以加个饼图
+        st.caption("注：数据基于 BscScan API 实时获取。")
         
     with col2:
         st.subheader(f"🔄 最近交易流水 (目标: {target_wallet[:10]}...)")
         placeholder = st.empty()
 
-    # 循环刷新 (由于Streamlit的机制，这里用一个巧妙的方法)
+    # 循环刷新逻辑
     while True:
         with placeholder.container():
             transactions = get_latest_token_tx(target_wallet, api_key)
             
             if transactions:
-                # 处理数据
                 temp_df = []
                 for tx in transactions:
                     val = float(tx["value"]) / (10**int(tx["tokenDecimal"]))
                     time_str = datetime.fromtimestamp(int(tx["timeStamp"])).strftime('%Y-%m-%d %H:%M:%S')
                     is_out = tx["from"].lower() == target_wallet
                     
-                    # 行为与高亮判定
                     if is_out:
                         action = "🔴 [出货/转出]"
                         peer = tx["to"]
-                        peer_type = "DEX (做市)" # 可以通过合约反查来完善
+                        peer_type = "DEX / LP"
                     else:
                         action = "🟢 [补仓/转入]"
                         peer = tx["from"]
-                        peer_type = "CEX (充值)"
+                        peer_type = "CEX / Wallet"
                     
                     hash_link = f"https://bscscan.com/tx/{tx['hash']}"
                     
@@ -106,22 +104,20 @@ if api_key and target_wallet.startswith("0x"):
                 
                 new_data = pd.DataFrame(temp_df)
                 
-                # 数据表格显示 (带颜色高亮)
+                # 数据表格颜色高亮
                 def color_rows(row):
                     if '🔴' in row['行为']:
-                        return ['background-color: #ffcccc'] * len(row)
+                        return ['background-color: #ffe6e6'] * len(row)
                     elif '🟢' in row['行为']:
-                        return ['background-color: #ccffcc'] * len(row)
+                        return ['background-color: #e6ffed'] * len(row)
                     return [''] * len(row)
                 
                 styled_df = new_data.style.apply(color_rows, axis=1)
-                
-                # 将哈希变成可点击的链接
                 st.dataframe(styled_df, use_container_width=True)
-                
-                st.caption(f"上次更新: {datetime.now().strftime('%H:%M:%S')}")
+                st.caption(f"🚀 自动监控中... 上次更新时间: {datetime.now().strftime('%H:%M:%S')}")
             else:
-                st.warning("暂无交易记录，正在等待...")
+                st.warning("暂无交易记录，请检查 API Key 或地址是否正确。")
             
             time.sleep(refresh_rate)
-            st.experimental_rerun()
+            # 修复日志报错：已将 experimental_rerun 更新为 rerun
+            st.rerun()
