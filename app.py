@@ -6,7 +6,6 @@ import time
 
 # --- 基础配置 ---
 SIREN_CONTRACT = "0xD399c6dBe8D7D93616053303491E216B30C7B476"
-# 你关注的巨鲸地址
 DEFAULT_WALLETS = [
     "0xb2AF49dBF526054FAf19602860A5E298a79F3D05",
     "0x9f5D230F8152CB35372138805F99839352e0D7cE"
@@ -28,12 +27,6 @@ else:
 
 refresh_rate = st.sidebar.slider("3. 刷新频率 (秒)", 15, 60, 30)
 
-# 初始化 SessionState 用于保存历史交易
-if 'tx_history' not in st.session_state:
-    st.session_state['tx_history'] = pd.DataFrame(columns=[
-        '时间', '行为', '数量 (SIREN)', '对手方', '对手方性质', '哈希'
-    ])
-
 # --- 核心逻辑 ---
 def get_latest_token_tx(wallet, key):
     url = f"https://api.bscscan.com/api?module=account&action=tokentx&contractaddress={SIREN_CONTRACT}&address={wallet}&page=1&offset=20&sort=desc&apikey={key}"
@@ -54,17 +47,16 @@ if st.sidebar.button("开始监控"):
     else:
         st.info(f"正在启动监控: {target_wallet[:10]}... 设置已保存")
         time.sleep(1)
-        # 修复日志报错：已将 experimental_rerun 更新为 rerun
+        # 修复：使用新的 rerun 命令替换旧的 experimental_rerun
         st.rerun()
 
 if api_key and target_wallet.startswith("0x"):
-    # 创建布局
     col1, col2 = st.columns([1, 4])
     with col1:
         st.subheader("📊 今日统计")
         st.metric(label="预计当前余额 (SIREN)", value="1.11M") 
         st.write("---")
-        st.caption("注：数据基于 BscScan API 实时获取。")
+        st.caption("数据基于 BscScan API 实时获取。")
         
     with col2:
         st.subheader(f"🔄 最近交易流水 (目标: {target_wallet[:10]}...)")
@@ -82,15 +74,8 @@ if api_key and target_wallet.startswith("0x"):
                     time_str = datetime.fromtimestamp(int(tx["timeStamp"])).strftime('%Y-%m-%d %H:%M:%S')
                     is_out = tx["from"].lower() == target_wallet
                     
-                    if is_out:
-                        action = "🔴 [出货/转出]"
-                        peer = tx["to"]
-                        peer_type = "DEX / LP"
-                    else:
-                        action = "🟢 [补仓/转入]"
-                        peer = tx["from"]
-                        peer_type = "CEX / Wallet"
-                    
+                    action = "🔴 [出货/转出]" if is_out else "🟢 [补仓/转入]"
+                    peer = tx["to"] if is_out else tx["from"]
                     hash_link = f"https://bscscan.com/tx/{tx['hash']}"
                     
                     temp_df.append({
@@ -98,7 +83,6 @@ if api_key and target_wallet.startswith("0x"):
                         '行为': action,
                         '数量 (SIREN)': f"{val:,.2f}",
                         '对手方': f"{peer[:10]}...",
-                        '对手方性质': peer_type,
                         '哈希': hash_link
                     })
                 
@@ -112,12 +96,11 @@ if api_key and target_wallet.startswith("0x"):
                         return ['background-color: #e6ffed'] * len(row)
                     return [''] * len(row)
                 
-                styled_df = new_data.style.apply(color_rows, axis=1)
-                st.dataframe(styled_df, use_container_width=True)
+                st.dataframe(new_data.style.apply(color_rows, axis=1), use_container_width=True)
                 st.caption(f"🚀 自动监控中... 上次更新时间: {datetime.now().strftime('%H:%M:%S')}")
             else:
-                st.warning("暂无交易记录，请检查 API Key 或地址是否正确。")
+                st.warning("暂无交易记录，正在等待...")
             
             time.sleep(refresh_rate)
-            # 修复日志报错：已将 experimental_rerun 更新为 rerun
+            # 修复：解决日志中第 127 行的报错
             st.rerun()
