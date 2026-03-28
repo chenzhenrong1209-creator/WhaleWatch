@@ -2,82 +2,100 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-import time
 
-# --- 页面设置 ---
-st.set_page_config(page_title="DumpDetective Pro X | 多链雷达", layout="wide")
-st.title("🐋 DumpDetective Pro X - 跨链巨鲸追踪器")
+# --- 页面基础设置 ---
+st.set_page_config(page_title="DumpDetective | 历史记录查询", layout="wide")
+st.title("🐋 巨鲸历史交易流水查询器")
+st.markdown("不用实时监控，直接调取 BscScan/Etherscan 数据库中的所有历史记录。")
 
 # --- 侧边栏配置 ---
-st.sidebar.header("📡 核心配置")
+st.sidebar.header("⚙️ 第一步：基础配置")
 
-# 1. 关键点：增加网络选择
-network = st.sidebar.selectbox("1. 选择监控网络 (对照 Arkham 图标)", ["Ethereum (以太坊)", "BSC (币安链)"])
-api_key = st.sidebar.text_input(f"2. 输入 {network.split(' ')[0]} API Key", type="password")
+# 关键：根据 Arkham 上的图标选择网络
+network = st.sidebar.selectbox(
+    "1. 选择对应的区块链网络", 
+    ["Ethereum (以太坊主网)", "BSC (币安智能链)"],
+    help="Arkham 里的灰色图标选以太坊，黄色图标选 BSC"
+)
 
-# 根据网络配置 API 终点
-if "Ethereum" in network:
-    api_url = "https://api.etherscan.io/api"
-else:
-    api_url = "https://api.bscscan.com/api"
-
-st.sidebar.markdown("---")
-token_contract = st.sidebar.text_input("3. 代币合约地址 (从 Arkham 复制)", placeholder="0x...").strip().lower()
-target_wallet = st.sidebar.text_input("4. 巨鲸钱包地址", placeholder="0x...").strip().lower()
+api_key = st.sidebar.text_input(f"2. 输入 {network.split(' ')[0]} 的 API Key", type="password")
 
 st.sidebar.markdown("---")
-record_limit = st.sidebar.select_slider("检索历史深度", options=[50, 100, 200, 500], value=100)
-refresh_rate = st.sidebar.slider("刷新频率 (秒)", 10, 60, 30)
+st.sidebar.header("🔍 第二步：目标设置")
 
-# --- 核心数据获取逻辑 ---
-def get_token_tx(wallet, token, key, limit, base_url):
-    url = f"{base_url}?module=account&action=tokentx&contractaddress={token}&address={wallet}&page=1&offset={limit}&sort=desc&apikey={key}"
-    try:
-        r = requests.get(url, timeout=10).json()
-        if r["status"] == "1" and r["result"]:
-            return r["result"]
-    except Exception as e:
-        st.error(f"API 请求异常: {e}")
-    return []
+# 允许手动输入，确保地址 100% 准确
+token_addr = st.sidebar.text_input("代币合约地址 (Token Contract)", placeholder="从 Arkham 复制 0x...").strip().lower()
+whale_addr = st.sidebar.text_input("巨鲸钱包地址 (Whale Wallet)", placeholder="从 Arkham 复制 0x...").strip().lower()
 
-# --- 主界面 ---
-if st.sidebar.button("🚀 开启跨链追踪"):
-    if not api_key or not token_contract or not target_wallet:
-        st.error("配置不完整，请检查 API Key 和地址")
-    else:
-        st.rerun()
+# 增加查询深度
+limit = st.sidebar.slider("查询最近多少笔记录？", 50, 500, 100)
 
-if api_key and target_wallet.startswith("0x") and token_contract.startswith("0x"):
-    st.subheader(f"🌐 当前网络: {network}")
-    st.info(f"正在扫描: {token_contract[:15]}...")
+# --- 数据拉取逻辑 ---
+def fetch_history(net, key, t_addr, w_addr, count):
+    # 根据网络选择接口地址
+    base_url = "https://api.etherscan.io/api" if "Ethereum" in net else "https://api.bscscan.com/api"
     
-    placeholder = st.empty()
+    params = {
+        "module": "account",
+        "action": "tokentx",
+        "contractaddress": t_addr,
+        "address": w_addr,
+        "page": 1,
+        "offset": count,
+        "sort": "desc",
+        "apikey": key
+    }
+    
+    try:
+        r = requests.get(base_url, params=params, timeout=15).json()
+        if r["status"] == "1":
+            return r["result"]
+        else:
+            st.warning(f"接口提示: {r['message']} (通常是因为该地址下无记录)")
+            return []
+    except Exception as e:
+        st.error(f"网络连接失败: {e}")
+        return []
 
-    while True:
-        with placeholder.container():
-            txs = get_token_tx(target_wallet, token_contract, api_key, record_limit, api_url)
+# --- 主界面逻辑 ---
+if st.sidebar.button("📊 立即拉取历史数据"):
+    if not (api_key and token_addr and whale_addr):
+        st.error("请把 API Key、代币地址和钱包地址填全了再查。")
+    else:
+        with st.spinner("正在穿透区块数据..."):
+            results = fetch_history(network, api_key, token_addr, whale_addr, limit)
             
-            if txs:
-                data_list = []
-                for tx in txs:
+            if results:
+                st.success(f"成功找到 {len(results)} 笔历史交易")
+                
+                # 数据处理
+                df_data = []
+                for tx in results:
                     val = float(tx["value"]) / (10**int(tx["tokenDecimal"]))
-                    time_str = datetime.fromtimestamp(int(tx["timeStamp"])).strftime('%Y-%m-%d %H:%M')
-                    is_out = tx["from"].lower() == target_wallet
+                    time_str = datetime.fromtimestamp(int(tx["timeStamp"])).strftime('%Y-%m-%d %H:%M:%S')
+                    is_out = tx["from"].lower() == whale_addr.lower()
                     
-                    data_list.append({
-                        '时间': time_str,
-                        '动作': "🔴 转出/卖出" if is_out else "🟢 转入/补仓",
-                        '数量': f"{val:,.2f} {tx['tokenSymbol']}",
-                        '对手方': tx["to"] if is_out else tx["from"],
-                        '哈希': f"https://{'etherscan.io' if 'Eth' in network else 'bscscan.com'}/tx/{tx['hash']}"
+                    df_data.append({
+                        "时间": time_str,
+                        "方向": "🔴 卖出/转出" if is_out else "🟢 买入/转入",
+                        "数量": f"{val:,.2f} {tx['tokenSymbol']}",
+                        "交易对手": tx["to"] if is_out else tx["from"],
+                        "查看详情": f"https://{'etherscan.io' if 'Eth' in network else 'bscscan.com'}/tx/{tx['hash']}"
                     })
                 
-                df = pd.DataFrame(data_list)
-                st.dataframe(df.style.applymap(lambda x: 'color: #ff4b4b' if '🔴' in str(x) else 'color: #28a745' if '🟢' in str(x) else '', subset=['动作']), use_container_width=True)
-                st.caption(f"✅ 数据已更新 | 网络: {network} | 笔数: {len(txs)}")
+                df = pd.DataFrame(df_data)
+                
+                # 结果展示
+                st.dataframe(
+                    df.style.applymap(lambda x: 'color: #ff4b4b; font-weight: bold' if '🔴' in str(x) else 'color: #28a745; font-weight: bold' if '🟢' in str(x) else '', subset=['方向']),
+                    use_container_width=True,
+                    column_config={"查看详情": st.column_config.LinkColumn("区块浏览器", display_text="点击跳转")}
+                )
             else:
-                st.warning(f"⚠️ 在 {network} 网络上未发现交易。")
-                st.write("💡 **请检查：** 你在 Arkham 看到的交易图标是灰色的（ETH）还是黄色的（BSC）？如果是灰色的，请确保侧边栏选择了 Ethereum 并使用了 Etherscan 的 Key。")
-            
-            time.sleep(refresh_rate)
-            st.rerun()
+                st.error("❌ 查询失败：数据库中未找到任何匹配记录。")
+                st.info("💡 建议排查：你确信这是 BSC 链吗？Arkham 里的 SIREN 很多是在 Ethereum 主网的，请尝试切换网络并使用 Etherscan 的 Key。")
+
+# 初始提示
+if not (api_key and token_addr and whale_addr):
+    st.write("---")
+    st.write("👈 请在左侧输入信息后点击按钮。")
