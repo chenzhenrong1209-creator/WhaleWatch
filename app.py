@@ -4,33 +4,40 @@ import pandas as pd
 from datetime import datetime
 
 # --- 页面设置 ---
-st.set_page_config(page_title="Arkham-Style 智能搜索", layout="wide")
-st.title("🔍 钱包全资产历史轨迹查询")
-st.markdown("输入钱包地址，直接穿透区块数据库，还原 Arkham 式的交易列表。")
+st.set_page_config(page_title="DumpDetective V3 | 深度穿透", layout="wide")
+st.title("🐋 跨链钱包行为穿透工具 (诊断强化版)")
 
-# --- 侧边栏：搜索中心 ---
-st.sidebar.header("🎯 搜索配置")
+# --- 侧边栏 ---
+st.sidebar.header("🛠️ 核心参数")
 
-network = st.sidebar.selectbox(
-    "1. 选择区块链网络", 
-    ["Ethereum (以太坊)", "BSC (币安链)"],
-    help="请根据 Arkham 上显示的图标选择。灰色钻石选以太坊，黄色方块选 BSC。"
+# 1. 强制选择网络 - 截图显示 SIREN 在 Ethereum 交易更活跃
+network_choice = st.sidebar.selectbox(
+    "1. 确认监控网络 (核心步骤)", 
+    ["Ethereum (以太坊主网)", "BSC (币安链)"],
+    help="Arkham 里的灰色图标选以太坊，黄色图标选 BSC。"
 )
 
-api_key = st.sidebar.text_input(f"2. 输入 {network.split(' ')[0]} API Key", type="password")
-target_address = st.sidebar.text_input("3. 粘贴目标钱包地址 (0x...)", placeholder="在此输入地址...").strip().lower()
+# 2. 对应网络的 API Key
+api_key = st.sidebar.text_input(f"2. 输入 {network_choice.split(' ')[0]} API Key", type="password")
 
-# 【修复 Bug 的关键行】：把 200 加入 options 列表，防止 ValueError
-limit = st.sidebar.select_slider("4. 检索深度", options=[100, 200, 300, 500, 1000], value=200)
+# 3. 目标钱包地址
+target_addr = st.sidebar.text_input("3. 粘贴钱包地址 (0x...)", placeholder="在此输入地址").strip().lower()
 
-# --- 核心查询引擎 ---
-def fetch_wallet_history(address, key, net, count):
+# 4. 修复之前报错的参数设置
+limit = st.sidebar.select_slider("4. 扫描记录深度", options=[100, 200, 300, 500, 1000], value=200)
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 提示：如果查不到，请检查你的 API Key 是否与网络匹配（Etherscan 还是 BscScan）。")
+
+# --- 核心逻辑 ---
+def get_data(addr, key, net, count):
+    # 根据网络切换 API
     base_url = "https://api.etherscan.io/api" if "Eth" in net else "https://api.bscscan.com/api"
     
     params = {
         "module": "account",
         "action": "tokentx",
-        "address": address,
+        "address": addr,
         "page": 1,
         "offset": count,
         "sort": "desc",
@@ -38,55 +45,55 @@ def fetch_wallet_history(address, key, net, count):
     }
     
     try:
-        response = requests.get(base_url, params=params, timeout=20).json()
-        if response.get("status") == "1":
-            return response.get("result", [])
-        return []
+        r = requests.get(base_url, params=params, timeout=15).json()
+        return r
     except Exception as e:
-        st.error(f"连接数据库失败: {e}")
-        return []
+        return {"status": "0", "message": str(e)}
 
-# --- 主界面逻辑 ---
-if st.sidebar.button("🚀 开启深度搜索") or (target_address and api_key):
-    if not target_address.startswith("0x"):
-        st.info("💡 请在左侧输入正确的钱包地址并确保 API Key 已填入。")
+# --- 主界面显示 ---
+if st.sidebar.button("🔍 立即穿透数据") or (target_addr and api_key):
+    if not target_addr.startswith("0x"):
+        st.warning("⚠️ 请输入有效的 0x 钱包地址。")
     else:
-        with st.spinner(f"正在调取 {network} 历史数据..."):
-            raw_data = fetch_wallet_history(target_address, api_key, network, limit)
+        with st.spinner(f"正在穿透 {network_choice} 区块数据..."):
+            response = get_data(target_addr, api_key, network_choice, limit)
             
-            if raw_data:
-                st.success(f"成功还原最近 {len(raw_data)} 笔代币变动记录")
+            # 状态诊断逻辑
+            if response.get("status") == "1":
+                results = response.get("result", [])
+                st.success(f"✅ 成功调取 {len(results)} 笔代币历史记录")
                 
-                display_list = []
-                for tx in raw_data:
-                    decimals = int(tx.get("tokenDecimal", 18))
-                    value = float(tx["value"]) / (10**decimals)
-                    dt = datetime.fromtimestamp(int(tx["timeStamp"])).strftime('%Y-%m-%d %H:%M')
-                    direction = "🔴 卖出/转出" if tx["from"].lower() == target_address.lower() else "🟢 买入/转入"
+                # 数据转化
+                rows = []
+                for tx in results:
+                    dec = int(tx.get("tokenDecimal", 18))
+                    val = float(tx["value"]) / (10**dec)
+                    time_str = datetime.fromtimestamp(int(tx["timeStamp"])).strftime('%Y-%m-%d %H:%M')
+                    is_out = tx["from"].lower() == target_addr.lower()
                     
-                    display_list.append({
-                        "交易时间": dt,
-                        "代币资产": f"{tx['tokenName']} ({tx['tokenSymbol']})",
-                        "行为": direction,
-                        "数量": f"{value:,.2f}",
-                        "交易对手": tx["to"] if "🔴" in direction else tx["from"],
-                        "区块链接": f"https://{'etherscan.io' if 'Eth' in network else 'bscscan.com'}/tx/{tx['hash']}"
+                    rows.append({
+                        "时间": time_str,
+                        "资产": f"{tx['tokenSymbol']}",
+                        "动作": "🔴 卖出/转出" if is_out else "🟢 买入/补仓",
+                        "数量": f"{val:,.2f}",
+                        "代币全名": tx['tokenName'],
+                        "哈希": f"https://{'etherscan.io' if 'Eth' in network_choice else 'bscscan.com'}/tx/{tx['hash']}"
                     })
                 
-                df = pd.DataFrame(display_list)
+                df = pd.DataFrame(rows)
                 
+                # 美化展示
                 st.dataframe(
-                    df.style.applymap(
-                        lambda x: 'color: #ff4b4b; font-weight: bold' if '🔴' in str(x) else 'color: #28a745; font-weight: bold' if '🟢' in str(x) else '',
-                        subset=['行为']
-                    ),
+                    df.style.applymap(lambda x: 'color: #ff4b4b; font-weight: bold' if '🔴' in str(x) else 'color: #28a745; font-weight: bold' if '🟢' in str(x) else '', subset=['动作']),
                     use_container_width=True,
-                    column_config={
-                        "区块链接": st.column_config.LinkColumn("查看详情", display_text="链上凭证")
-                    }
+                    column_config={"哈希": st.column_config.LinkColumn("查看详情", display_text="链上凭证")}
                 )
             else:
-                st.warning("未发现匹配记录。")
-                st.info("💡 请确认：\n1. 网络是否选对（以太坊 vs BSC）？\n2. API Key 是否对应当前网络？\n3. 地址是否正确？")
-else:
-    st.info("👋 欢迎使用。请在左侧配置搜索参数。")
+                # 错误诊断：当 API 返回 0 时
+                error_msg = response.get("message", "未知错误")
+                st.error(f"❌ 搜索未果：API 返回了错误信息 - '{error_msg}'")
+                
+                if "api-key" in error_msg.lower():
+                    st.info("💡 诊断建议：你的 API Key 似乎无效，请重新检查 Key 是否属于当前选择的网络。")
+                elif "no transactions found" in error_msg.lower():
+                    st.info(f"💡 诊断建议：该地址在 {network_choice} 上确实没有任何代币交易。请去 Arkham 确认他是在哪条链上动的（看图标颜色）。")
