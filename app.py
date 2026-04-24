@@ -477,52 +477,111 @@ def build_price_figure(df: pd.DataFrame):
     )
     return fig
 
-# ================= 多周期数据与分析 =================
+# ================= 多周期数据与分析（增强稳定版） =================
 def normalize_min_df(df: pd.DataFrame):
+    """统一分钟 K 线字段，兼容 AKShare / 东方财富返回格式。"""
     if df is None or df.empty:
         return None
     rename_map = {}
     for col in df.columns:
-        if col in ["时间", "日期", "datetime", "date"]:
+        if col in ["时间", "日期", "datetime", "date", "time"]:
             rename_map[col] = "date"
-        elif col == "开盘":
+        elif col in ["开盘", "open"]:
             rename_map[col] = "open"
-        elif col == "收盘":
+        elif col in ["收盘", "close"]:
             rename_map[col] = "close"
-        elif col == "最高":
+        elif col in ["最高", "high"]:
             rename_map[col] = "high"
-        elif col == "最低":
+        elif col in ["最低", "low"]:
             rename_map[col] = "low"
-        elif col in ["成交量", "volume"]:
+        elif col in ["成交量", "volume", "vol"]:
             rename_map[col] = "volume"
     df = df.rename(columns=rename_map).copy()
     need_cols = ["date", "open", "high", "low", "close", "volume"]
     if not all(col in df.columns for col in need_cols):
         return None
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna().sort_values("date").reset_index(drop=True)
+    df = df.dropna(subset=need_cols).sort_values("date").reset_index(drop=True)
+    if df.empty:
+        return None
     return df[need_cols]
 
-def get_intraday_15m(symbol, max_rows=320):
+
+def _get_market_id(symbol: str) -> str:
+    """东方财富 secid 市场代码：沪市/科创/基金为 1，其余深市为 0。"""
+    symbol = str(symbol).strip()
+    return "1" if symbol.startswith(("6", "9", "5", "7")) else "0"
+
+
+def fetch_em_minute_df(symbol: str, klt: int = 15, lmt: int = 600):
+    """东方财富分钟 K 线兜底。klt 支持 1/5/15/30/60。"""
+    market = _get_market_id(symbol)
+    url = (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        f"secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        "&fields1=f1,f2,f3,f4,f5,f6"
+        "&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+        f"&klt={klt}&fqt=1&end=20500101&lmt={lmt}"
+    )
     try:
-        df = ak.stock_zh_a_hist_min_em(symbol=str(symbol), period="15", adjust="")
+        res = fetch_json(url, timeout=8)
+        if not res or not res.get("data") or not res["data"].get("klines"):
+            return None
+        rows = []
+        for item in res["data"].get("klines", []):
+            parts = str(item).split(",")
+            if len(parts) >= 6:
+                rows.append({
+                    "date": parts[0],
+                    "open": parts[1],
+                    "close": parts[2],
+                    "high": parts[3],
+                    "low": parts[4],
+                    "volume": parts[5],
+                })
+        return normalize_min_df(pd.DataFrame(rows)) if rows else None
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"东财 {klt}分钟 K 线失败: {e}")
+        return None
+
+
+def get_intraday_by_period(symbol: str, period: str, max_rows=320):
+    """多源获取分钟 K 线：AKShare 优先，东方财富兜底。"""
+    period = str(period)
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=str(symbol), period=period, adjust="")
         df = normalize_min_df(df)
         if df is not None and not df.empty:
+            df["source"] = f"AKShare-{period}m"
             return df.tail(max_rows).reset_index(drop=True)
     except Exception as e:
         if DEBUG_MODE:
-            st.warning(f"15分钟数据获取失败: {e}")
+            st.warning(f"AKShare {period}分钟数据失败，切换东财: {e}")
+    try:
+        df = fetch_em_minute_df(symbol, klt=int(period), lmt=max(max_rows, 600))
+        if df is not None and not df.empty:
+            df["source"] = f"EastMoney-{period}m"
+            return df.tail(max_rows).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"东财 {period}分钟数据失败: {e}")
     return None
 
-def aggregate_minutes(df_15m: pd.DataFrame, bars_per_group: int):
-    if df_15m is None or df_15m.empty:
+
+def get_intraday_15m(symbol, max_rows=320):
+    return get_intraday_by_period(symbol, "15", max_rows=max_rows)
+
+
+def aggregate_minutes(df: pd.DataFrame, bars_per_group: int, label: str | None = None):
+    if df is None or df.empty:
         return None
     all_parts = []
-    df_15m = df_15m.copy()
-    df_15m["trade_day"] = df_15m["date"].dt.date
-    for _, day_df in df_15m.groupby("trade_day"):
+    df = df.copy()
+    df["trade_day"] = df["date"].dt.date
+    for _, day_df in df.groupby("trade_day"):
         day_df = day_df.sort_values("date").reset_index(drop=True)
         grp = pd.Series(range(len(day_df))) // bars_per_group
         g = day_df.groupby(grp)
@@ -532,117 +591,222 @@ def aggregate_minutes(df_15m: pd.DataFrame, bars_per_group: int):
             "high": g["high"].max(),
             "low": g["low"].min(),
             "close": g["close"].last(),
-            "volume": g["volume"].sum()
+            "volume": g["volume"].sum(),
         })
         all_parts.append(part)
     if not all_parts:
         return None
-    out = pd.concat(all_parts, ignore_index=True)
-    out = out.dropna().reset_index(drop=True)
+    out = pd.concat(all_parts, ignore_index=True).dropna().reset_index(drop=True)
+    if not out.empty:
+        out["source"] = label or "聚合分钟线"
     return out
 
+
+def _fallback_daily_as_intraday(symbol: str, days: int = 60):
+    """分钟数据完全失败时，用日线降级，确保页面不再全是 N/A。"""
+    try:
+        df = get_kline(symbol, days=days)
+        if df is not None and not df.empty:
+            df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+            df["source"] = "日线降级"
+            return df.reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"日线降级失败: {e}")
+    return None
+
+
 def summarize_intraday_tf(df: pd.DataFrame, label: str):
-    if df is None or df.empty:
-        return {
-            "label": label,
-            "status": "无数据",
-            "trend": "N/A",
-            "rsi": None,
-            "macd_state": "N/A",
-            "support": None,
-            "pressure": None,
-            "close": None,
-            "bias": "无法判断"
-        }
-    df = df.copy()
-    if len(df) >= 12:
-        df = add_indicators(df)
-        latest = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) > 1 else latest
-        trend = "震荡"
-        if pd.notna(latest["ema_short"]) and latest["close"] > latest["ema_short"]:
-            trend = "偏强"
-        if pd.notna(latest["ema_short"]) and pd.notna(latest["ema_mid"]) and latest["close"] > latest["ema_short"] > latest["ema_mid"]:
-            trend = "多头"
-        elif pd.notna(latest["ema_short"]) and pd.notna(latest["ema_mid"]) and latest["close"] < latest["ema_short"] < latest["ema_mid"]:
-            trend = "空头"
-        macd_state = "中性"
-        if pd.notna(latest["macd"]) and pd.notna(latest["macd_signal"]):
-            if latest["macd"] > latest["macd_signal"] and latest["macd_hist"] >= prev["macd_hist"]:
-                macd_state = "偏多"
-            elif latest["macd"] < latest["macd_signal"] and latest["macd_hist"] <= prev["macd_hist"]:
-                macd_state = "偏空"
-        support = df.tail(min(12, len(df)))["low"].min()
-        pressure = df.tail(min(12, len(df)))["high"].max()
-        bias_score = 0
-        if trend in ["多头", "偏强"]:
-            bias_score += 1
-        if macd_state == "偏多":
-            bias_score += 1
-        if pd.notna(latest["rsi14"]) and latest["rsi14"] > 55:
-            bias_score += 1
-        if pd.notna(latest["rsi14"]) and latest["rsi14"] < 45:
-            bias_score -= 1
-        if macd_state == "偏空":
-            bias_score -= 1
-        if trend == "空头":
-            bias_score -= 1
-        if bias_score >= 2:
-            bias = "多头占优"
-        elif bias_score <= -2:
-            bias = "空头占优"
-        else:
-            bias = "震荡分歧"
-        return {
-            "label": label,
-            "status": "有效",
-            "trend": trend,
-            "rsi": latest["rsi14"] if pd.notna(latest["rsi14"]) else None,
-            "macd_state": macd_state,
-            "support": support,
-            "pressure": pressure,
-            "close": latest["close"],
-            "bias": bias
-        }
-    latest = df.iloc[-1]
-    support = df["low"].min()
-    pressure = df["high"].max()
-    return {
-        "label": label,
-        "status": "样本较少",
-        "trend": "简化观察",
-        "rsi": None,
-        "macd_state": "N/A",
-        "support": support,
-        "pressure": pressure,
-        "close": latest["close"],
-        "bias": "轻量判断"
+    """输出尽量可用的多周期结果。即使样本较少，也给轻量判断。"""
+    empty_result = {
+        "label": label, "status": "无数据", "source": "无", "bars": 0,
+        "latest_time": "-", "trend": "无法判断", "rsi": None, "macd_state": "无法判断",
+        "support": None, "pressure": None, "close": None, "change_pct": None,
+        "vol_ratio": None, "bias": "无法判断", "score": 0,
+        "entry_zone": "-", "stop_loss": None, "target_1": None, "target_2": None,
+        "advice": "数据不足，先观察"
     }
+    if df is None or df.empty:
+        return empty_result
+
+    df = df.copy().dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if df.empty:
+        return empty_result
+
+    source = str(df["source"].iloc[-1]) if "source" in df.columns else "行情源"
+    bars = len(df)
+    latest = df.iloc[-1]
+    close = float(latest["close"])
+    support = float(df.tail(min(20, bars))["low"].min())
+    pressure = float(df.tail(min(20, bars))["high"].max())
+    latest_time = str(pd.to_datetime(latest["date"]).strftime("%Y-%m-%d %H:%M")) if pd.notna(latest["date"]) else "-"
+    first_close = float(df.iloc[0]["close"])
+    change_pct = round((close - first_close) / first_close * 100, 2) if first_close else 0.0
+
+    if bars < 12:
+        recent_close = df["close"].tail(min(5, bars))
+        slope = recent_close.iloc[-1] - recent_close.iloc[0] if len(recent_close) >= 2 else 0
+        loc = (close - support) / (pressure - support) if pressure > support else 0.5
+        score = 0
+        score += 1 if slope > 0 else -1 if slope < 0 else 0
+        score += 1 if change_pct > 0 else -1 if change_pct < 0 else 0
+        score += 1 if loc > 0.55 else -1 if loc < 0.35 else 0
+        trend = "偏强" if score > 0 else "偏弱" if score < 0 else "震荡"
+        bias = "轻量偏多" if score >= 1 else "轻量偏空" if score <= -1 else "轻量震荡"
+        stop_loss = round(support * 0.985, 2) if support else None
+        target_1 = round(pressure, 2) if pressure else None
+        target_2 = round(close + (close - stop_loss) * 1.5, 2) if stop_loss else None
+        return {
+            "label": label, "status": "样本较少", "source": source, "bars": bars,
+            "latest_time": latest_time, "trend": trend, "rsi": None, "macd_state": "简化判断",
+            "support": support, "pressure": pressure, "close": close, "change_pct": change_pct,
+            "vol_ratio": None, "bias": bias, "score": score,
+            "entry_zone": f"{support:.2f} - {close:.2f}", "stop_loss": stop_loss,
+            "target_1": target_1, "target_2": target_2,
+            "advice": "样本较少，仅作为轻量参考"
+        }
+
+    df = add_indicators(df)
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else latest
+    close = float(latest["close"])
+    ema_s = latest.get("ema_short", pd.NA)
+    ema_m = latest.get("ema_mid", pd.NA)
+    rsi = latest.get("rsi14", pd.NA)
+    atr = latest.get("atr14", pd.NA)
+
+    trend = "震荡"
+    if pd.notna(ema_s) and pd.notna(ema_m) and close > ema_s > ema_m:
+        trend = "多头"
+    elif pd.notna(ema_s) and pd.notna(ema_m) and close < ema_s < ema_m:
+        trend = "空头"
+    elif pd.notna(ema_s) and close > ema_s:
+        trend = "偏强"
+    elif pd.notna(ema_s) and close < ema_s:
+        trend = "偏弱"
+
+    macd_state = "中性"
+    if pd.notna(latest.get("macd")) and pd.notna(latest.get("macd_signal")):
+        if latest["macd"] > latest["macd_signal"] and latest["macd_hist"] >= prev["macd_hist"]:
+            macd_state = "偏多"
+        elif latest["macd"] < latest["macd_signal"] and latest["macd_hist"] <= prev["macd_hist"]:
+            macd_state = "偏空"
+
+    support = float(df.tail(min(20, len(df)))["low"].min())
+    pressure = float(df.tail(min(20, len(df)))["high"].max())
+    avg_vol = df["volume"].tail(min(20, len(df))).mean()
+    vol_ratio = round(float(latest["volume"]) / avg_vol, 2) if avg_vol and avg_vol > 0 else None
+
+    score = 0
+    score += 2 if trend == "多头" else 1 if trend == "偏强" else -2 if trend == "空头" else -1 if trend == "偏弱" else 0
+    score += 1 if macd_state == "偏多" else -1 if macd_state == "偏空" else 0
+    if pd.notna(rsi):
+        score += 1 if 55 <= rsi <= 70 else -1 if rsi < 45 or rsi > 82 else 0
+    if vol_ratio is not None:
+        score += 1 if vol_ratio >= 1.3 and change_pct >= 0 else -1 if vol_ratio >= 1.3 and change_pct < 0 else 0
+
+    bias = "多头占优" if score >= 3 else "偏多观察" if score >= 1 else "空头占优" if score <= -3 else "偏空谨慎" if score <= -1 else "震荡分歧"
+    atr_val = float(atr) if pd.notna(atr) and atr > 0 else max((pressure - support) / 4, close * 0.015)
+    entry_low = max(support, close - atr_val * 0.8)
+    entry_high = close
+    stop_loss = max(0, support - atr_val * 0.35)
+    target_1 = pressure
+    target_2 = close + max(close - stop_loss, atr_val) * 1.8
+    advice = "顺势持有/回踩低吸" if score >= 3 else "偏多但等回踩确认" if score >= 1 else "谨慎，等重新站上均线" if score <= -1 else "震荡，等方向选择"
+
+    return {
+        "label": label, "status": "有效", "source": source, "bars": len(df),
+        "latest_time": latest_time, "trend": trend, "rsi": float(rsi) if pd.notna(rsi) else None,
+        "macd_state": macd_state, "support": support, "pressure": pressure, "close": close,
+        "change_pct": change_pct, "vol_ratio": vol_ratio, "bias": bias, "score": score,
+        "entry_zone": f"{entry_low:.2f} - {entry_high:.2f}", "stop_loss": round(stop_loss, 2),
+        "target_1": round(target_1, 2), "target_2": round(target_2, 2), "advice": advice
+    }
+
 
 def get_multi_timeframe_analysis(symbol: str):
     df15 = get_intraday_15m(symbol)
-    df60 = aggregate_minutes(df15, 4) if df15 is not None else None
-    df120 = aggregate_minutes(df15, 8) if df15 is not None else None
+    df60_direct = get_intraday_by_period(symbol, "60", max_rows=260)
+    df60 = df60_direct if df60_direct is not None and not df60_direct.empty else aggregate_minutes(df15, 4, label="15m聚合60m")
+    df120 = aggregate_minutes(df60, 2, label="60m聚合120m") if df60 is not None else aggregate_minutes(df15, 8, label="15m聚合120m")
+
+    fallback_daily = None
+    if df15 is None and df60 is None and df120 is None:
+        fallback_daily = _fallback_daily_as_intraday(symbol)
+    if df15 is None and fallback_daily is not None:
+        df15 = fallback_daily.tail(30).copy()
+        df15["source"] = "日线降级-短周期参考"
+    if df60 is None and fallback_daily is not None:
+        df60 = fallback_daily.tail(45).copy()
+        df60["source"] = "日线降级-中周期参考"
+    if df120 is None and fallback_daily is not None:
+        df120 = fallback_daily.tail(60).copy()
+        df120["source"] = "日线降级-长周期参考"
+
     tf15 = summarize_intraday_tf(df15, "15分钟")
     tf60 = summarize_intraday_tf(df60, "60分钟")
     tf120 = summarize_intraday_tf(df120, "120分钟")
-    score = 0
-    mapping = {"多头占优": 2, "轻量判断": 0, "震荡分歧": 0, "空头占优": -2}
-    score += mapping.get(tf15["bias"], 0)
-    score += mapping.get(tf60["bias"], 0)
-    score += mapping.get(tf120["bias"], 0)
-    if score >= 3:
-        final_view = "多周期共振偏多"
-    elif score <= -3:
+
+    score = tf15.get("score", 0) + tf60.get("score", 0) * 1.2 + tf120.get("score", 0) * 1.5
+    if score >= 6:
+        final_view = "多周期强共振偏多"
+        action = "可关注回踩低吸或突破确认"
+    elif score >= 2:
+        final_view = "多周期偏多，但需确认"
+        action = "不追高，等回踩支撑或放量突破"
+    elif score <= -6:
         final_view = "多周期共振偏空"
+        action = "控制仓位，等待止跌结构"
+    elif score <= -2:
+        final_view = "多周期偏弱"
+        action = "谨慎观察，暂不主动加仓"
     else:
         final_view = "多周期分歧，偏观察"
+        action = "等 15m 和 60m 同向后再行动"
+
+    support_candidates = [x.get("support") for x in [tf15, tf60, tf120] if x.get("support")]
+    pressure_candidates = [x.get("pressure") for x in [tf15, tf60, tf120] if x.get("pressure")]
+    close_candidates = [x.get("close") for x in [tf15, tf60, tf120] if x.get("close")]
+    key_support = round(min(support_candidates), 2) if support_candidates else None
+    key_pressure = round(max(pressure_candidates), 2) if pressure_candidates else None
+    current_close = round(close_candidates[0], 2) if close_candidates else None
+
     return {
         "15m": tf15,
         "60m": tf60,
         "120m": tf120,
-        "final_view": final_view
+        "final_view": final_view,
+        "action": action,
+        "score": round(score, 2),
+        "key_support": key_support,
+        "key_pressure": key_pressure,
+        "current_close": current_close,
+        "data_quality": "分钟线" if fallback_daily is None else "分钟线失败，已使用日线降级参考"
     }
+
+
+def render_tf_card(tf: dict, title: str):
+    """移动端友好的多周期卡片。"""
+    st.markdown(f"**{title}**")
+    st.caption(f"数据源：{tf.get('source', '-')}｜样本：{tf.get('bars', 0)}｜时间：{tf.get('latest_time', '-')}")
+    st.metric("偏向", tf.get("bias", "无法判断"))
+    st.metric("趋势", tf.get("trend", "无法判断"))
+    st.metric("MACD", tf.get("macd_state", "无法判断"))
+    if tf.get("rsi") is not None:
+        st.metric("RSI", f"{tf['rsi']:.2f}")
+    if tf.get("close") is not None:
+        st.caption(f"收盘/现价: {tf['close']:.2f}")
+    if tf.get("support") is not None:
+        st.caption(f"支撑: {tf['support']:.2f}")
+    if tf.get("pressure") is not None:
+        st.caption(f"压力: {tf['pressure']:.2f}")
+    if tf.get("entry_zone") and tf.get("entry_zone") != "-":
+        st.caption(f"参考低吸区: {tf['entry_zone']}")
+    if tf.get("stop_loss") is not None:
+        st.caption(f"风控位: {tf['stop_loss']:.2f}")
+    if tf.get("target_1") is not None:
+        st.caption(f"目标1: {tf['target_1']:.2f}")
+    st.info(tf.get("advice", "等待确认"))
 
 # ================= 核心数据流 =================
 @st.cache_data(ttl=60)
@@ -2105,46 +2269,83 @@ with tab1:
                         z3.metric("动态压力参考", f"{pressure_zone:.2f}")
 
                     st.markdown("##### ⏱️ 多周期技术分析")
+                    st.caption(f"数据质量：{mtf.get('data_quality', '未知')}｜综合分：{mtf.get('score', 0)}")
                     m1, m2, m3 = st.columns(3)
                     with m1:
-                        tf = mtf["15m"]
-                        st.markdown("**15分钟级别**")
-                        st.metric("偏向", tf["bias"])
-                        st.metric("趋势", tf["trend"])
-                        st.metric("MACD", tf["macd_state"])
-                        if tf["rsi"] is not None:
-                            st.metric("RSI", f"{tf['rsi']:.2f}")
-                        if tf["support"] is not None:
-                            st.caption(f"支撑: {tf['support']:.2f}")
-                        if tf["pressure"] is not None:
-                            st.caption(f"压力: {tf['pressure']:.2f}")
+                        render_tf_card(mtf["15m"], "15分钟级别")
                     with m2:
-                        tf = mtf["60m"]
-                        st.markdown("**60分钟级别**")
-                        st.metric("偏向", tf["bias"])
-                        st.metric("趋势", tf["trend"])
-                        st.metric("MACD", tf["macd_state"])
-                        if tf["rsi"] is not None:
-                            st.metric("RSI", f"{tf['rsi']:.2f}")
-                        if tf["support"] is not None:
-                            st.caption(f"支撑: {tf['support']:.2f}")
-                        if tf["pressure"] is not None:
-                            st.caption(f"压力: {tf['pressure']:.2f}")
+                        render_tf_card(mtf["60m"], "60分钟级别")
                     with m3:
-                        tf = mtf["120m"]
-                        st.markdown("**120分钟级别**")
-                        st.metric("偏向", tf["bias"])
-                        st.metric("趋势", tf["trend"])
-                        st.metric("MACD", tf["macd_state"])
-                        if tf["rsi"] is not None:
-                            st.metric("RSI", f"{tf['rsi']:.2f}")
-                        if tf["support"] is not None:
-                            st.caption(f"支撑: {tf['support']:.2f}")
-                        if tf["pressure"] is not None:
-                            st.caption(f"压力: {tf['pressure']:.2f}")
+                        render_tf_card(mtf["120m"], "120分钟级别")
 
                     st.markdown("##### 🧠 多周期综合结论")
-                    st.info(f"综合结论：**{mtf['final_view']}**")
+                    v1, v2, v3, v4 = st.columns(4)
+                    v1.metric("综合结论", mtf.get("final_view", "无法判断"))
+                    v2.metric("操作倾向", mtf.get("action", "等待确认"))
+                    v3.metric("关键支撑", f"{mtf['key_support']:.2f}" if mtf.get("key_support") is not None else "N/A")
+                    v4.metric("关键压力", f"{mtf['key_pressure']:.2f}" if mtf.get("key_pressure") is not None else "N/A")
+                    st.info(f"综合结论：**{mtf.get('final_view', '无法判断')}**；执行建议：**{mtf.get('action', '等待确认')}**")
+
+                    # 新增：量化交易计划卡片，便于直接转化为盘中观察点
+                    st.markdown("##### 🎯 交易计划辅助")
+                    current_px = mtf.get("current_close") or price
+                    key_support = mtf.get("key_support")
+                    key_pressure = mtf.get("key_pressure")
+                    if key_support and key_pressure and current_px:
+                        risk = max(current_px - key_support, current_px * 0.01)
+                        reward = max(key_pressure - current_px, 0)
+                        rr = reward / risk if risk > 0 else 0
+                        p1, p2, p3, p4 = st.columns(4)
+                        p1.metric("当前参考价", f"{current_px:.2f}")
+                        p2.metric("回撤观察区", f"{key_support:.2f} - {current_px:.2f}")
+                        p3.metric("突破确认位", f"{key_pressure:.2f}")
+                        p4.metric("估算盈亏比", f"{rr:.2f}")
+                        if rr < 1:
+                            st.warning("当前价格距离压力较近，盈亏比一般，适合等回踩或放量突破后再判断。")
+                        elif rr >= 2:
+                            st.success("当前盈亏比较好，但仍需结合成交量与大盘环境确认。")
+                        else:
+                            st.info("盈亏比中性，适合小仓位观察或等待更清晰信号。")
+                    else:
+                        st.warning("关键支撑/压力尚不完整，建议先以日线结构和成交量为主。")
+
+                    # 新增：多周期结构明细表，方便手机端复制与复盘
+                    tf_table = pd.DataFrame([
+                        {
+                            "周期": "15分钟",
+                            "偏向": mtf["15m"].get("bias"),
+                            "趋势": mtf["15m"].get("trend"),
+                            "MACD": mtf["15m"].get("macd_state"),
+                            "RSI": round(mtf["15m"].get("rsi"), 2) if mtf["15m"].get("rsi") is not None else "-",
+                            "支撑": round(mtf["15m"].get("support"), 2) if mtf["15m"].get("support") is not None else "-",
+                            "压力": round(mtf["15m"].get("pressure"), 2) if mtf["15m"].get("pressure") is not None else "-",
+                            "样本": mtf["15m"].get("bars"),
+                            "数据源": mtf["15m"].get("source")
+                        },
+                        {
+                            "周期": "60分钟",
+                            "偏向": mtf["60m"].get("bias"),
+                            "趋势": mtf["60m"].get("trend"),
+                            "MACD": mtf["60m"].get("macd_state"),
+                            "RSI": round(mtf["60m"].get("rsi"), 2) if mtf["60m"].get("rsi") is not None else "-",
+                            "支撑": round(mtf["60m"].get("support"), 2) if mtf["60m"].get("support") is not None else "-",
+                            "压力": round(mtf["60m"].get("pressure"), 2) if mtf["60m"].get("pressure") is not None else "-",
+                            "样本": mtf["60m"].get("bars"),
+                            "数据源": mtf["60m"].get("source")
+                        },
+                        {
+                            "周期": "120分钟",
+                            "偏向": mtf["120m"].get("bias"),
+                            "趋势": mtf["120m"].get("trend"),
+                            "MACD": mtf["120m"].get("macd_state"),
+                            "RSI": round(mtf["120m"].get("rsi"), 2) if mtf["120m"].get("rsi") is not None else "-",
+                            "支撑": round(mtf["120m"].get("support"), 2) if mtf["120m"].get("support") is not None else "-",
+                            "压力": round(mtf["120m"].get("pressure"), 2) if mtf["120m"].get("pressure") is not None else "-",
+                            "样本": mtf["120m"].get("bars"),
+                            "数据源": mtf["120m"].get("source")
+                        }
+                    ])
+                    st.dataframe(tf_table, width="stretch", hide_index=True)
 
                     with st.spinner(f"🧠 首席策略官正在使用 {selected_model} 进行多维深度解构..."):
                         if df_kline is not None and len(df_kline) >= 15:
