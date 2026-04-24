@@ -1817,6 +1817,93 @@ class MainForceAnalyzer:
         self.selector = MainForceStockSelector()
         self.db = MainForceBatchDatabase()
 
+    @staticmethod
+    def _extract_json_from_ai_response(text: str) -> Dict[str, Any]:
+        """
+        兼容 AI 输出的多种格式：
+        1. ```json { ... } ```
+        2. ``` { ... } ```
+        3. 前后夹杂解释文字的 { ... }
+        4. 正文中包含多个括号时，自动寻找第一个可解析 JSON 对象
+        """
+        if text is None:
+            raise ValueError("AI 返回为空")
+        raw = str(text).strip()
+        if not raw:
+            raise ValueError("AI 返回为空字符串")
+
+        fence_match = re.search(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+        if fence_match:
+            raw = fence_match.group(1).strip()
+
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = raw[start:end + 1].strip()
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+
+        starts = [m.start() for m in re.finditer(r"\{", raw)]
+        for s in starts:
+            depth = 0
+            for i in range(s, len(raw)):
+                if raw[i] == "{":
+                    depth += 1
+                elif raw[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[s:i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except Exception:
+                            break
+        raise ValueError("未能从 AI 回复中提取合法 JSON")
+
+    @staticmethod
+    def _build_fallback_recommendations(filtered_data: pd.DataFrame, final_n: int) -> List[Dict[str, Any]]:
+        """AI JSON 解析失败时，用候选数据生成兜底推荐，避免整个模块失败。"""
+        recs = []
+        if filtered_data is None or filtered_data.empty:
+            return recs
+
+        df = filtered_data.copy().head(final_n)
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):
+            symbol = str(row.get("股票代码", row.get("代码", ""))).zfill(6)[:6]
+            name = str(row.get("股票名称", row.get("名称", "未知")))
+            inflow = safe_float(row.get("主力净流入", 0))
+            hot_score = safe_float(row.get("资金热度分", 0))
+            pct = safe_float(row.get("区间涨跌幅", row.get("涨跌幅", 0)))
+            turnover = safe_float(row.get("换手率", 0))
+
+            reasons = []
+            if inflow:
+                reasons.append(f"主力净流入靠前，净流入约{inflow:,.0f}")
+            if hot_score:
+                reasons.append(f"资金热度分较高，约{hot_score:.1f}")
+            if turnover:
+                reasons.append(f"换手率约{turnover:.2f}%，市场关注度较高")
+            if pct:
+                reasons.append(f"区间涨跌幅约{pct:.2f}%，具备资金博弈特征")
+            if not reasons:
+                reasons.append("AI JSON解析失败时由候选池兜底生成，需结合盘口二次确认")
+
+            recs.append({
+                "rank": idx,
+                "symbol": symbol,
+                "name": name,
+                "reasons": reasons[:3],
+                "position": "10%-20%",
+                "risks": "AI JSON解析失败后的兜底结果，需重点核验资金流、公告与技术位置。"
+            })
+        return recs
+
     def run_full_analysis(self, start_date, days_ago, final_n, max_range_change, min_market_cap, max_market_cap):
         result = {'success': False, 'final_recommendations': [], 'error': None}
         
@@ -1869,19 +1956,45 @@ class MainForceAnalyzer:
             """
             final_resp = call_ai(final_prompt, temperature=0.2)
             
-            # 解析 JSON
+            # 解析 JSON：兼容 ```json、```、前后夹杂解释文字等情况
             try:
-                json_match = re.search(r'```json\s*(\{.*?\})\s*```', final_resp, re.DOTALL)
-                json_str = json_match.group(1) if json_match else final_resp
-                parsed_json = json.loads(json_str)
-                result['final_recommendations'] = parsed_json.get('recommendations', [])
+                parsed_json = self._extract_json_from_ai_response(final_resp)
+                recommendations = parsed_json.get('recommendations', [])
+                if not isinstance(recommendations, list):
+                    recommendations = []
+
+                # 如果 AI 没给出有效 recommendations，则使用候选池兜底，避免页面失败
+                if not recommendations:
+                    recommendations = self._build_fallback_recommendations(filtered_data, final_n)
+
+                result['final_recommendations'] = recommendations[:final_n]
                 result['success'] = True
-                
+                result['ai_raw_response'] = final_resp
+
                 # 存入本地数据库保存历史
-                self.db.save_analysis(len(filtered_data), len(result['final_recommendations']), json.dumps(result['final_recommendations'], ensure_ascii=False))
+                self.db.save_analysis(
+                    len(filtered_data),
+                    len(result['final_recommendations']),
+                    json.dumps(result['final_recommendations'], ensure_ascii=False)
+                )
             except Exception as e:
-                result['error'] = f"AI 输出 JSON 解析失败: {str(e)}。AI 原始回复: {final_resp[:200]}..."
-                
+                # 兜底：即使 AI 输出完全不可解析，也不让主力选股模块失败
+                fallback_recs = self._build_fallback_recommendations(filtered_data, final_n)
+                if fallback_recs:
+                    result['final_recommendations'] = fallback_recs
+                    result['success'] = True
+                    result['warning'] = f"AI JSON解析失败，已启用候选池兜底推荐。解析错误：{str(e)}"
+                    result['ai_raw_response'] = final_resp
+                    try:
+                        self.db.save_analysis(
+                            len(filtered_data),
+                            len(result['final_recommendations']),
+                            json.dumps(result['final_recommendations'], ensure_ascii=False)
+                        )
+                    except Exception:
+                        pass
+                else:
+                    result['error'] = f"AI 输出 JSON 解析失败且兜底推荐为空: {str(e)}。AI 原始回复: {final_resp[:200]}..."
         return result
 
 def render_main_force_tab():
@@ -1912,6 +2025,8 @@ def render_main_force_tab():
         
         if result['success']:
             st.success(f"✅ AI 军团测算完成！已为您锁定 {len(result['final_recommendations'])} 只优质标的。")
+            if result.get('warning'):
+                st.warning(result['warning'])
             st.markdown("### ⭐ 首席精选标的池")
             for rec in result['final_recommendations']:
                 with st.expander(f"🏅 TOP {rec.get('rank', '-')} | {rec.get('name', '未知')} ({rec.get('symbol', '未知')})", expanded=True):
