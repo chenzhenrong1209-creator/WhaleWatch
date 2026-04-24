@@ -1,3 +1,9 @@
 streamlit
-requests
+groq
 pandas
+requests
+akshare
+tushare
+baostock
+plotly
+pywencai
