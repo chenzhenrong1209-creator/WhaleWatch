@@ -1,0 +1,2296 @@
+import streamlit as st
+from groq import Groq
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+import json
+import re
+import sqlite3
+import pywencai 
+import akshare as ak
+import tushare as ts
+import baostock as bs
+import random
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any, List
+from collections import Counter
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ================= 页面与终端 UI 配置 =================
+st.set_page_config(
+    page_title="AI 智能投研终端 Pro Max",
+    page_icon="🏦",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+st.markdown("""
+    <style>
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: auto;
+        min-height: 40px;
+        white-space: normal;
+        background-color: transparent;
+        border-radius: 4px 4px 0 0;
+        padding: 8px 12px;
+        font-weight: bold;
+    }
+    .terminal-header {
+        font-family: 'Courier New', Courier, monospace;
+        color: #888;
+        font-size: 0.8em;
+        margin-bottom: 20px;
+        word-wrap: break-word;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.5rem;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🏦 AI 智能量化投研终端")
+st.markdown(
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.0 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    unsafe_allow_html=True
+)
+
+api_key = st.secrets.get("GROQ_API_KEY","")
+
+# ================= 侧边栏与参数调优 =================
+with st.sidebar:
+    st.header("⚙️ 终端控制台")
+
+    # 新增：手动选择 LLM 模型
+    st.markdown("### 🧠 核心推理引擎")
+    selected_model = st.selectbox(
+        "选择大模型",
+        ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"],
+        index=0,
+        help="手动指定底层计算模型，精准控制分析逻辑"
+    )
+
+    # 新增：手动干预技术参数
+    st.markdown("### 🎛️ 策略参数微调")
+    with st.expander("自定义均线周期 (手动输入)", expanded=False):
+        ema_short = st.number_input("短期 EMA", min_value=5, max_value=50, value=20, step=1)
+        ema_mid = st.number_input("中期 EMA", min_value=10, max_value=100, value=60, step=1)
+        ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
+
+    ts_token = st.text_input("🔑 Tushare Token", type="password", help="仅作极致容灾兜底")
+    DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
+
+    st.markdown("---")
+    st.markdown("### 📡 数据连通性")
+    st.success("行情引流 : ACTIVE")
+    st.success("7x24快讯 : ACTIVE")
+    st.success("板块扫描 : ACTIVE (带熔断保护)")
+    st.success("技术结构引擎 : ACTIVE")
+    st.success("多周期分析 : ACTIVE (15m / 60m / 120m)")
+    st.success("智瞰龙虎榜 : ACTIVE")
+
+if ts_token:
+    ts.set_token(ts_token)
+
+# ================= 网络底座 =================
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+]
+
+@st.cache_resource
+def get_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+SESSION = get_session()
+
+def safe_float(val, default=0.0):
+    if val is None or val == "-" or str(val).strip() == "":
+        return default
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+def fetch_json(url, timeout=5, extra_headers=None):
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        res = SESSION.get(url, headers=headers, timeout=timeout)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        if DEBUG_MODE:
+            st.error(f"Feed Error: {e}")
+        return None
+
+# ================= 价格归一化修复 =================
+def normalize_em_price(raw_price, prev_close=None):
+    raw_price = safe_float(raw_price)
+    prev_close = safe_float(prev_close)
+    if raw_price <= 0:
+        return 0.0
+    candidates = [raw_price, raw_price / 10, raw_price / 100, raw_price / 1000]
+    candidates = [x for x in candidates if 0.01 <= x <= 100000]
+    if not candidates:
+        return raw_price
+    if prev_close > 0:
+        best = min(candidates, key=lambda x: abs(x - prev_close))
+        return best
+    if raw_price > 100000:
+        return raw_price / 1000
+    if raw_price > 10000:
+        return raw_price / 100
+    if raw_price > 1000:
+        return raw_price / 10
+    return raw_price
+
+# ================= 技术面核心函数 =================
+def add_indicators(df: pd.DataFrame) ->pd.DataFrame:
+    df = df.copy()
+    df["ema_short"] = df["close"].ewm(span=ema_short, adjust=False).mean()
+    df["ema_mid"] = df["close"].ewm(span=ema_mid, adjust=False).mean()
+    df["ema_long"] = df["close"].ewm(span=ema_long, adjust=False).mean()
+
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    df["rsi14"] = 100 - (100 / (1 + rs))
+
+    prev_close = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr14"] = df["tr"].rolling(14).mean()
+
+    ma20 = df["close"].rolling(20).mean()
+    std20 = df["close"].rolling(20).std()
+    df["bb_mid"] = ma20
+    df["bb_up"] = ma20 + 2 * std20
+    df["bb_low"] = ma20 - 2 * std20
+
+    df["vol_ma20"] = df["volume"].rolling(20).mean()
+    return df
+
+def detect_swings(df: pd.DataFrame, left=2, right=2):
+    swing_highs = []
+    swing_lows = []
+    if len(df) < left + right + 1:
+        return swing_highs, swing_lows
+    for i in range(left, len(df) - right):
+        high = df["high"].iloc[i]
+        low = df["low"].iloc[i]
+        if high == df["high"].iloc[i-left: i+right+1].max():
+            swing_highs.append((i, high))
+        if low == df["low"].iloc[i-left: i+right+1].min():
+            swing_lows.append((i, low))
+    return swing_highs, swing_lows
+
+def detect_fvg(df: pd.DataFrame, max_zones=5):
+    zones = []
+    if len(df) < 3:
+        return zones
+    for i in range(2, len(df)):
+        c1 = df.iloc[i - 2]
+        c3 = df.iloc[i]
+        if c3["low"] > c1["high"]:
+            zones.append({
+                "type": "bullish",
+                "start_idx": i - 2,
+                "end_idx": i,
+                "top": c3["low"],
+                "bottom": c1["high"],
+                "date": str(pd.to_datetime(c3["date"]).date())
+            })
+        if c3["high"] < c1["low"]:
+            zones.append({
+                "type": "bearish",
+                "start_idx": i - 2,
+                "end_idx": i,
+                "top": c1["low"],
+                "bottom": c3["high"],
+                "date": str(pd.to_datetime(c3["date"]).date())
+            })
+    return zones[-max_zones:]
+
+def detect_liquidity_sweep(df: pd.DataFrame):
+    if len(df) < 25:
+        return "样本不足"
+    recent = df.tail(20).copy()
+    latest = recent.iloc[-1]
+    prev_high = recent.iloc[:-1]["high"].max()
+    prev_low = recent.iloc[:-1]["low"].min()
+    if latest["high"] > prev_high and latest["close"] < prev_high:
+        return "向上扫流动性后回落"
+    if latest["low"] < prev_low and latest["close"] > prev_low:
+        return "向下扫流动性后收回"
+    return "未见明显扫流动性"
+
+def detect_bos(df: pd.DataFrame):
+    swing_highs, swing_lows = detect_swings(df)
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "结构样本不足"
+    latest_close = df.iloc[-1]["close"]
+    last_swing_high = swing_highs[-1][1]
+    last_swing_low = swing_lows[-1][1]
+    if latest_close > last_swing_high:
+        return "向上 BOS (结构突破)"
+    if latest_close < last_swing_low:
+        return "向下 BOS (结构破坏)"
+    return "结构未突破"
+
+def detect_order_blocks(df: pd.DataFrame, lookback=30, max_zones=4):
+    zones = []
+    recent = df.tail(lookback).reset_index(drop=True)
+    if len(recent) < 3 or "atr14" not in recent.columns:
+        return zones
+    for i in range(1, len(recent) - 1):
+        curr = recent.iloc[i]
+        nxt = recent.iloc[i + 1]
+        body_curr = abs(curr["close"] - curr["open"])
+        atr = recent["atr14"].iloc[i]
+        if pd.isna(atr):
+            continue
+        if curr["close"] < curr["open"] and nxt["close"] > curr["high"] and body_curr < atr * 1.2:
+            zones.append({
+                "type": "bullish_ob",
+                "date": str(pd.to_datetime(curr["date"]).date()),
+                "top": max(curr["open"], curr["close"]),
+                "bottom": min(curr["open"], curr["close"])
+            })
+        if curr["close"] > curr["open"] and nxt["close"] < curr["low"] and body_curr < atr * 1.2:
+            zones.append({
+                "type": "bearish_ob",
+                "date": str(pd.to_datetime(curr["date"]).date()),
+                "top": max(curr["open"], curr["close"]),
+                "bottom": min(curr["open"], curr["close"])
+            })
+    return zones[-max_zones:]
+
+def detect_equal_high_low(df: pd.DataFrame, tolerance=0.003):
+    swing_highs, swing_lows = detect_swings(df)
+    eqh = []
+    eql = []
+    for i in range(len(swing_highs) - 1):
+        h1 = swing_highs[i][1]
+        h2 = swing_highs[i + 1][1]
+        if h1 > 0 and abs(h1 - h2) / h1 <= tolerance:
+            eqh.append((swing_highs[i], swing_highs[i + 1]))
+    for i in range(len(swing_lows) - 1):
+        l1 = swing_lows[i][1]
+        l2 = swing_lows[i + 1][1]
+        if l1 > 0 and abs(l1 - l2) / l1 <= tolerance:
+            eql.append((swing_lows[i], swing_lows[i + 1]))
+    return eqh[-3:], eql[-3:]
+
+def detect_mss(df: pd.DataFrame):
+    swing_highs, swing_lows = detect_swings(df)
+    if len(swing_highs) < 2 or len(swing_lows) < 2 or len(df) < 2:
+        return "样本不足"
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    last_high = swing_highs[-1][1]
+    last_low = swing_lows[-1][1]
+    if prev["close"] < last_high and latest["close"] > last_high:
+        return "Bullish MSS (多头结构转换)"
+    if prev["close"] > last_low and latest["close"] < last_low:
+        return "Bearish MSS (空头结构转换)"
+    return "暂无明显 MSS"
+
+def get_premium_discount_zone(df: pd.DataFrame, lookback=60):
+    recent = df.tail(lookback)
+    if recent.empty:
+        return None
+    range_high = recent["high"].max()
+    range_low = recent["low"].min()
+    eq = (range_high + range_low) / 2
+    latest_close = recent.iloc[-1]["close"]
+    zone = "Equilibrium"
+    if latest_close > eq:
+        zone = "Premium Zone"
+    elif latest_close < eq:
+        zone = "Discount Zone"
+    return {
+        "range_high": range_high,
+        "range_low": range_low,
+        "equilibrium": eq,
+        "zone": zone
+    }
+
+def build_smc_summary(df: pd.DataFrame):
+    obs = detect_order_blocks(df)
+    eqh, eql = detect_equal_high_low(df)
+    mss = detect_mss(df)
+    pd_zone = get_premium_discount_zone(df)
+    latest_bull_ob = next((z for z in reversed(obs) if z["type"] == "bullish_ob"), None)
+    latest_bear_ob = next((z for z in reversed(obs) if z["type"] == "bearish_ob"), None)
+    return {
+        "latest_bull_ob": latest_bull_ob,
+        "latest_bear_ob": latest_bear_ob,
+        "eqh": eqh,
+        "eql": eql,
+        "mss": mss,
+        "pd_zone": pd_zone
+    }
+
+def summarize_technicals(df: pd.DataFrame):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else latest
+    trend = "震荡"
+    if latest["close"] > latest["ema_short"] > latest["ema_mid"]:
+        trend = "多头趋势"
+    elif latest["close"] < latest["ema_short"] < latest["ema_mid"]:
+        trend = "空头趋势"
+    momentum = "中性"
+    rsi = latest["rsi14"]
+    if pd.notna(rsi):
+        if rsi >= 70:
+            momentum = "超买"
+        elif rsi <= 30:
+            momentum = "超卖"
+        elif rsi > 55:
+            momentum = "偏强"
+        elif rsi < 45:
+            momentum = "偏弱"
+    macd_state = "中性"
+    if latest["macd"] > latest["macd_signal"] and latest["macd_hist"] > prev["macd_hist"]:
+        macd_state = "金叉后增强"
+    elif latest["macd"] < latest["macd_signal"] and latest["macd_hist"] < prev["macd_hist"]:
+        macd_state = "死叉后走弱"
+    bb_state = "带内运行"
+    if latest["close"] > latest["bb_up"]:
+        bb_state = "突破布林上轨"
+    elif latest["close"] < latest["bb_low"]:
+        bb_state = "跌破布林下轨"
+    vol_state = "量能平稳"
+    if pd.notna(latest["vol_ma20"]) and latest["vol_ma20"] > 0:
+        if latest["volume"] > latest["vol_ma20"] * 1.8:
+            vol_state = "显著放量"
+        elif latest["volume"] < latest["vol_ma20"] * 0.7:
+            vol_state = "明显缩量"
+    fvg_zones = detect_fvg(df)
+    bos_state = detect_bos(df)
+    sweep_state = detect_liquidity_sweep(df)
+    nearest_bull_fvg = next((z for z in reversed(fvg_zones) if z["type"] == "bullish"), None)
+    nearest_bear_fvg = next((z for z in reversed(fvg_zones) if z["type"] == "bearish"), None)
+    smc = build_smc_summary(df)
+    return {
+        "trend": trend,
+        "momentum": momentum,
+        "macd_state": macd_state,
+        "bb_state": bb_state,
+        "vol_state": vol_state,
+        "atr14": latest["atr14"],
+        "rsi14": latest["rsi14"],
+        "bos_state": bos_state,
+        "sweep_state": sweep_state,
+        "nearest_bull_fvg": nearest_bull_fvg,
+        "nearest_bear_fvg": nearest_bear_fvg,
+        "latest_close": latest["close"],
+        "ema_short": latest["ema_short"],
+        "ema_mid": latest["ema_mid"],
+        "ema_long": latest["ema_long"],
+        "smc": smc
+    }
+
+def build_price_figure(df: pd.DataFrame):
+    plot_df = df.copy()
+    plot_df["date_str"] = plot_df["date"].dt.strftime("%Y-%m-%d")
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, subplot_titles=('K 线与结构', '成交量'),
+                        row_width=[0.2, 0.7])
+
+    fig.add_trace(go.Candlestick(
+        x=plot_df["date_str"],
+        open=plot_df["open"],
+        high=plot_df["high"],
+        low=plot_df["low"],
+        close=plot_df["close"],
+        name="K线"
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_short"], mode="lines", name=f"EMA{ema_short}", line=dict(width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_mid"], mode="lines", name=f"EMA{ema_mid}", line=dict(width=1)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_long"], mode="lines", name=f"EMA{ema_long}", line=dict(width=1)), row=1, col=1)
+
+    colors = ['red' if row['open'] - row['close'] >= 0 else 'green' for index, row in plot_df.iterrows()]
+    fig.add_trace(go.Bar(
+        x=plot_df['date_str'],
+        y=plot_df['volume'],
+        marker_color=colors,
+        name='成交量'
+    ), row=2, col=1)
+
+    for zone in detect_fvg(plot_df, max_zones=4):
+        start_idx = zone["start_idx"]
+        end_idx = min(len(plot_df) - 1, start_idx + 12)
+        x0 = plot_df.iloc[start_idx]["date_str"]
+        x1 = plot_df.iloc[end_idx]["date_str"]
+        fillcolor = "rgba(0, 200, 0, 0.15)" if zone["type"] == "bullish" else "rgba(200, 0, 0, 0.15)"
+        fig.add_shape(
+            type="rect",
+            x0=x0, x1=x1,
+            y0=zone["bottom"], y1=zone["top"],
+            line=dict(width=0),
+            fillcolor=fillcolor,
+            row=1, col=1
+        )
+
+    fig.update_layout(
+        height=650,
+        xaxis_rangeslider_visible=False,
+        legend_title="图层",
+        margin=dict(l=20, r=20, t=30, b=20),
+        showlegend=False
+    )
+    return fig
+
+# ================= 多周期数据与分析 =================
+def normalize_min_df(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    rename_map = {}
+    for col in df.columns:
+        if col in ["时间","日期","datetime","date"]:
+            rename_map[col] = "date"
+        elif col == "开盘":
+            rename_map[col] = "open"
+        elif col == "收盘":
+            rename_map[col] = "close"
+        elif col == "最高":
+            rename_map[col] = "high"
+        elif col == "最低":
+            rename_map[col] = "low"
+        elif col in ["成交量","volume"]:
+            rename_map[col] = "volume"
+    df = df.rename(columns=rename_map).copy()
+    need_cols = ["date", "open", "high", "low", "close", "volume"]
+    if not all(col in df.columns for col in need_cols):
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna().sort_values("date").reset_index(drop=True)
+    return df[need_cols]
+
+def get_intraday_15m(symbol, max_rows=320):
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=str(symbol), period="15", adjust="")
+        df = normalize_min_df(df)
+        if df is not None and not df.empty:
+            return df.tail(max_rows).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"15分钟数据获取失败: {e}")
+    return None
+
+def aggregate_minutes(df_15m: pd.DataFrame, bars_per_group: int):
+    if df_15m is None or df_15m.empty:
+        return None
+    all_parts = []
+    df_15m = df_15m.copy()
+    df_15m["trade_day"] = df_15m["date"].dt.date
+    for _, day_df in df_15m.groupby("trade_day"):
+        day_df = day_df.sort_values("date").reset_index(drop=True)
+        grp = pd.Series(range(len(day_df))) // bars_per_group
+        g = day_df.groupby(grp)
+        part = pd.DataFrame({
+            "date": g["date"].last(),
+            "open": g["open"].first(),
+            "high": g["high"].max(),
+            "low": g["low"].min(),
+            "close": g["close"].last(),
+            "volume": g["volume"].sum()
+        })
+        all_parts.append(part)
+    if not all_parts:
+        return None
+    out = pd.concat(all_parts, ignore_index=True)
+    out = out.dropna().reset_index(drop=True)
+    return out
+
+def summarize_intraday_tf(df: pd.DataFrame, label: str):
+    if df is None or df.empty:
+        return {
+            "label": label,
+            "status": "无数据",
+            "trend": "N/A",
+            "rsi": None,
+            "macd_state": "N/A",
+            "support": None,
+            "pressure": None,
+            "close": None,
+            "bias": "无法判断"
+        }
+    df = df.copy()
+    if len(df) >= 12:
+        df = add_indicators(df)
+        latest = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else latest
+        trend = "震荡"
+        if pd.notna(latest["ema_short"]) and latest["close"] > latest["ema_short"]:
+            trend = "偏强"
+        if pd.notna(latest["ema_short"]) and pd.notna(latest["ema_mid"]) and latest["close"] > latest["ema_short"] > latest["ema_mid"]:
+            trend = "多头"
+        elif pd.notna(latest["ema_short"]) and pd.notna(latest["ema_mid"]) and latest["close"] < latest["ema_short"] < latest["ema_mid"]:
+            trend = "空头"
+        macd_state = "中性"
+        if pd.notna(latest["macd"]) and pd.notna(latest["macd_signal"]):
+            if latest["macd"] > latest["macd_signal"] and latest["macd_hist"] >= prev["macd_hist"]:
+                macd_state = "偏多"
+            elif latest["macd"] < latest["macd_signal"] and latest["macd_hist"] <= prev["macd_hist"]:
+                macd_state = "偏空"
+        support = df.tail(min(12, len(df)))["low"].min()
+        pressure = df.tail(min(12, len(df)))["high"].max()
+        bias_score = 0
+        if trend in ["多头","偏强"]:
+            bias_score += 1
+        if macd_state == "偏多":
+            bias_score += 1
+        if pd.notna(latest["rsi14"]) and latest["rsi14"] > 55:
+            bias_score += 1
+        if pd.notna(latest["rsi14"]) and latest["rsi14"] < 45:
+            bias_score -= 1
+        if macd_state == "偏空":
+            bias_score -= 1
+        if trend == "空头":
+            bias_score -= 1
+        if bias_score >= 2:
+            bias = "多头占优"
+        elif bias_score <= -2:
+            bias = "空头占优"
+        else:
+            bias = "震荡分歧"
+        return {
+            "label": label,
+            "status": "有效",
+            "trend": trend,
+            "rsi": latest["rsi14"] if pd.notna(latest["rsi14"]) else None,
+            "macd_state": macd_state,
+            "support": support,
+            "pressure": pressure,
+            "close": latest["close"],
+            "bias": bias
+        }
+    latest = df.iloc[-1]
+    support = df["low"].min()
+    pressure = df["high"].max()
+    return {
+        "label": label,
+        "status": "样本较少",
+        "trend": "简化观察",
+        "rsi": None,
+        "macd_state": "N/A",
+        "support": support,
+        "pressure": pressure,
+        "close": latest["close"],
+        "bias": "轻量判断"
+    }
+
+def get_multi_timeframe_analysis(symbol: str):
+    df15 = get_intraday_15m(symbol)
+    df60 = aggregate_minutes(df15, 4) if df15 is not None else None
+    df120 = aggregate_minutes(df15, 8) if df15 is not None else None
+    tf15 = summarize_intraday_tf(df15, "15分钟")
+    tf60 = summarize_intraday_tf(df60, "60分钟")
+    tf120 = summarize_intraday_tf(df120, "120分钟")
+    score = 0
+    mapping = {"多头占优": 2,"轻量判断": 0,"震荡分歧": 0,"空头占优": -2}
+    score += mapping.get(tf15["bias"], 0)
+    score += mapping.get(tf60["bias"], 0)
+    score += mapping.get(tf120["bias"], 0)
+    if score >= 3:
+        final_view = "多周期共振偏多"
+    elif score <= -3:
+        final_view = "多周期共振偏空"
+    else:
+        final_view = "多周期分歧，偏观察"
+    return {
+        "15m": tf15,
+        "60m": tf60,
+        "120m": tf120,
+        "final_view": final_view
+    }
+
+# ================= 核心数据流 =================
+@st.cache_data(ttl=60)
+def get_global_news():
+    url = "https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size=60&zhibo_id=152&tag_id=0&dire=f&dpc=1"
+    res = fetch_json(url, extra_headers={"Referer": "https://finance.sina.com.cn/"})
+    news = []
+    if res and res.get("result", {}).get("data", {}).get("feed", {}).get("list"):
+        for item in res["result"]["data"]["feed"]["list"]:
+            text = re.sub(r'<[^>]+>', '', str(item.get("rich_text", "")).strip())
+            if len(text) > 15:
+                news.append(f"[{item.get('create_time', '')}] {text}")
+    return news
+
+@st.cache_data(ttl=60)
+def get_market_pulse():
+    pulse = {}
+    indices = {"上证指数":"1.000001","深证成指":"0.399001","创业板指":"0.399006"}
+    for name, code in indices.items():
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={code}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
+        res = fetch_json(url)
+        if res and res.get("data"):
+            pulse[name] = {"price": safe_float(res["data"].get("f43")), "pct": safe_float(res["data"].get("f170"))}
+    cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
+    cnh_res = fetch_json(cnh_url)
+    if cnh_res and cnh_res.get("data"):
+        pulse["USD/CNH(离岸)"] = {"price": safe_float(cnh_res["data"].get("f43")),"pct": safe_float(cnh_res["data"].get("f170"))}
+    return pulse
+
+@st.cache_data(ttl=300)
+def get_hot_blocks():
+    try:
+        df = ak.stock_board_industry_name_em()
+        if df is not None and not df.empty:
+            top_blocks = df.sort_values(by="涨跌幅", ascending=False).head(10)
+            return top_blocks[["板块名称","涨跌幅","上涨家数","下跌家数","领涨股票"]].to_dict('records')
+    except Exception:
+        pass
+    time.sleep(1)
+    try:
+        df = ak.stock_board_concept_name_em()
+        if df is not None and not df.empty:
+            top_blocks = df.sort_values(by="涨跌幅", ascending=False).head(10)
+            return top_blocks[["板块名称","涨跌幅","上涨家数","下跌家数","领涨股票"]].to_dict('records')
+    except Exception:
+        pass
+    return None
+
+def get_stock_quote(symbol):
+    try:
+        spot_df = ak.stock_zh_a_spot_em()
+        if spot_df is not None and not spot_df.empty:
+            row = spot_df[spot_df["代码"].astype(str) == str(symbol)]
+            if not row.empty:
+                row = row.iloc[0]
+                return {
+                    "name": row.get("名称","未知"),
+                    "price": safe_float(row.get("最新价")),
+                    "pct": safe_float(row.get("涨跌幅")),
+                    "market_cap": safe_float(row.get("总市值")) / 100000000,
+                    "pe": row.get("市盈率-动态","-"),
+                    "pb": row.get("市净率","-"),
+                    "turnover": safe_float(row.get("换手率"))
+                }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"AKShare 实时行情失败，回退东财: {e}")
+    market = "1" if str(symbol).startswith(("6", "9", "5", "7")) else "0"
+    url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167"
+    res = fetch_json(url)
+    if res and res.get("data"):
+        d = res["data"]
+        prev_close = safe_float(d.get("f60"))
+        price = normalize_em_price(d.get("f43"), prev_close)
+        return {
+            "name": d.get("f58", "未知"),
+            "price": price,
+            "pct": safe_float(d.get("f170")),
+            "market_cap": safe_float(d.get("f116")) / 100000000,
+            "pe": d.get("f162", "-"),
+            "pb": d.get("f167", "-"),
+            "turnover": safe_float(d.get("f168"))
+        }
+    return None
+
+def get_kline(symbol, days=220):
+    end_date = datetime.now()
+    start_date = end_date - pd.Timedelta(days=days + 150)
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+    start_str_bs = start_date.strftime("%Y-%m-%d")
+    end_str_bs = end_date.strftime("%Y-%m-%d")
+    try:
+        df = ak.stock_zh_a_hist(symbol=str(symbol), period="daily", start_date=start_str, end_date=end_str, adjust="qfq")
+        if df is not None and not df.empty:
+            df = df.rename(columns={
+                "日期":"date","开盘":"open","收盘":"close",
+                "最高":"high","最低":"low","成交量":"volume",
+                "成交额":"amount","换手率":"turnover_rate"
+            })
+            keep_cols = ["date", "open", "high", "low", "close", "volume", "turnover_rate"]
+            if all(col in df.columns for col in keep_cols):
+                df = df[keep_cols].copy()
+                df["date"] = pd.to_datetime(df["date"])
+                for col in ["open", "high", "low", "close", "volume", "turnover_rate"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna().reset_index(drop=True)
+                if len(df) > 0:
+                    return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"AKShare qfq 降级失败: {e}")
+    try:
+        df = ak.stock_zh_a_hist(symbol=str(symbol), period="daily", start_date=start_str, end_date=end_str, adjust="")
+        if df is not None and not df.empty:
+            df = df.rename(columns={
+                "日期":"date","开盘":"open","收盘":"close",
+                "最高":"high","最低":"low","成交量":"volume"
+            })
+            keep_cols = ["date", "open", "high", "low", "close", "volume"]
+            if all(col in df.columns for col in keep_cols):
+                df = df[keep_cols].copy()
+                df["date"] = pd.to_datetime(df["date"])
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna().reset_index(drop=True)
+                if len(df) > 0:
+                    return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"AKShare raw 降级失败: {e}")
+    try:
+        bs.login()
+        bs_code = f"sh.{symbol}" if str(symbol).startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,high,low,close,volume",
+            start_date=start_str_bs, end_date=end_str_bs,
+            frequency="d", adjustflag="2"
+        )
+        data_list = []
+        while (rs.error_code == '0') & rs.next():
+            data_list.append(rs.get_row_data())
+        bs.logout()
+        if data_list:
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df["date"] = pd.to_datetime(df["date"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna().sort_values("date").reset_index(drop=True)
+            if len(df) > 0:
+                return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"Baostock 降级失败: {e}")
+        try:
+            bs.logout()
+        except Exception:
+            pass
+    try:
+        if ts_token:
+            pro = ts.pro_api()
+            market = ".SH" if str(symbol).startswith(("6", "9", "5", "7")) else ".SZ"
+            ts_code = f"{symbol}{market}"
+            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+            if df is not None and not df.empty:
+                df = df.rename(columns={
+                    "trade_date": "date", "open": "open",
+                    "high": "high", "low": "low",
+                    "close": "close", "vol": "volume"
+                })
+                keep_cols = ["date", "open", "high", "low", "close", "volume"]
+                if all(col in df.columns for col in keep_cols):
+                    df = df[keep_cols].copy()
+                    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df.dropna().sort_values("date").reset_index(drop=True)
+                    if len(df) > 0:
+                        return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"Tushare 兜底失败: {e}")
+    return None
+
+# ================= AI 计算核心 =================
+def call_ai(prompt, model=None, temperature=0.3):
+    try:
+        exec_model = model if model else selected_model
+        client = Groq(api_key=api_key)
+        completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=exec_model,
+            temperature=temperature
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"❌ AI 计算节点故障: {e}"
+# ================= 宏观分析与数据采集模块 (整合版) =================
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class MacroAnalysisDataFetcher:
+    """宏观分析板块数据获取器"""
+    NBS_URL = "https://data.stats.gov.cn/easyquery.htm"
+    NBS_SERIES_CONFIG = {
+        "gdp_yoy": {"dbcode": "hgjd", "group_code": "A0103", "series_code": "A010301", "label": "GDP当季同比","unit":"%","period":"LAST8","transform":"index_minus_100"},
+        "industrial_yoy": {"dbcode": "hgyd", "group_code": "A0201", "series_code": "A020101", "label": "规上工业增加值同比","unit":"%","period":"LAST8"},
+        "cpi_yoy": {"dbcode": "hgyd", "group_code": "A01010J", "series_code": "A01010J01", "label": "CPI同比","unit":"%","period":"LAST8","transform":"index_minus_100"},
+        "ppi_yoy": {"dbcode": "hgyd", "group_code": "A010801", "series_code": "A01080101", "label": "PPI同比","unit":"%","period":"LAST8","transform":"index_minus_100"},
+        "manufacturing_pmi": {"dbcode": "hgyd", "group_code": "A0B01", "series_code": "A0B0101", "label": "制造业PMI","unit":"","period":"LAST8"},
+        "non_manufacturing_pmi": {"dbcode": "hgyd", "group_code": "A0B02", "series_code": "A0B0201", "label": "非制造业商务活动指数","unit":"","period":"LAST8"},
+        "m2_yoy": {"dbcode": "hgyd", "group_code": "A0D01", "series_code": "A0D0102", "label": "M2同比","unit":"%","period":"LAST8"},
+        "retail_sales_yoy": {"dbcode": "hgyd", "group_code": "A0701", "series_code": "A070104", "label": "社零累计同比","unit":"%","period":"LAST8"},
+        "fixed_asset_yoy": {"dbcode": "hgyd", "group_code": "A0401", "series_code": "A040102", "label": "固定资产投资累计同比","unit":"%","period":"LAST8"},
+        "real_estate_invest_yoy": {"dbcode": "hgyd", "group_code": "A0601", "series_code": "A060102", "label": "房地产开发投资累计同比","unit":"%","period":"LAST8"},
+        "urban_unemployment": {"dbcode": "hgyd", "group_code": "A0E01", "series_code": "A0E0101", "label": "全国城镇调查失业率","unit":"%","period":"LAST8"},
+    }
+    A_SHARE_INDEX_CONFIG = {"上证指数":"sh000001","深证成指":"sz399001","创业板指":"sz399006","沪深300":"sh000300"}
+    SECTOR_STOCK_POOLS = {
+        "银行": [{"code":"600036","name":"招商银行"}, {"code":"601166","name":"兴业银行"}],
+        "券商": [{"code":"300059","name":"东方财富"}, {"code":"600030","name":"中信证券"}],
+        "半导体": [{"code":"002371","name":"北方华创"}, {"code":"688981","name":"中芯国际"}],
+        "算力AI": [{"code":"300308","name":"中际旭创"}, {"code":"601138","name":"工业富联"}],
+        "消费电子": [{"code":"002475","name":"立讯精密"}, {"code":"300433","name":"蓝思科技"}],
+        "房地产": [{"code":"600048","name":"保利发展"}, {"code":"000002","name":"万科A"}],
+        "医药": [{"code":"600276","name":"恒瑞医药"}, {"code":"688235","name":"百济神州"}]
+    }
+    SECTOR_ALIASES = {"AI": ["算力AI"],"红利": ["银行","煤炭"]}
+
+    def fetch_all_data(self) -> Dict[str, Any]:
+        result = {"success": False, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "macro_series": {}, "macro_snapshot": {}, "macro_tables": {}, "market_indices": {}, "news": [], "candidate_pools": self.SECTOR_STOCK_POOLS, "rule_based_sector_view": {}, "errors": []}
+        for key, config in self.NBS_SERIES_CONFIG.items():
+            try:
+                result["macro_series"][key] = self._fetch_nbs_series(config)
+            except Exception as exc:
+                result["errors"].append(f"{config['label']}: {exc}")
+        result["macro_snapshot"] = self._build_macro_snapshot(result["macro_series"])
+        result["macro_tables"] = self._build_macro_tables(result["macro_series"])
+        result["rule_based_sector_view"] = self.build_rule_based_sector_view(result["macro_snapshot"])
+        try: result["market_indices"] = self._fetch_market_indices()
+        except Exception as exc: result["errors"].append(f"市场指数: {exc}")
+        try: result["news"] = self._fetch_macro_news()
+        except Exception as exc: result["errors"].append(f"宏观新闻: {exc}")
+        result["success"] = bool(result["macro_snapshot"])
+        return result
+
+    def _fetch_nbs_series(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        params = {"m": "QueryData", "dbcode": config["dbcode"], "rowcode": "zb", "colcode": "sj", "wds": "[]", "dfwds": json.dumps([{"wdcode": "zb", "valuecode": config["group_code"]}, {"wdcode": "sj", "valuecode": config["period"]}], ensure_ascii=False), "k1": str(int(time.time() * 1000))}
+        res = requests.post(self.NBS_URL, params=params, verify=False, timeout=15)
+        data = res.json()["returndata"]
+        indicator_nodes = {item["code"]: item for item in data["wdnodes"][0]["nodes"]}
+        time_nodes = {item["code"]: item for item in data["wdnodes"][1]["nodes"]}
+        rows = []
+        for node in data["datanodes"]:
+            match = re.search(r"zb\.([^_]+)_sj\.([^_]+)", node["code"])
+            if not match or match.group(1) != config["series_code"]: continue
+            val = node.get("data", {}).get("data")
+            if val in ("", None) or node.get("data", {}).get("strdata") == "": continue
+            v_raw = float(val)
+            v_trans = round(v_raw - 100, 2) if config.get("transform") == "index_minus_100" else round(v_raw, 2)
+            rows.append({"series_code": match.group(1), "series_label": config["label"], "period_code": match.group(2), "period_label": time_nodes.get(match.group(2), {}).get("cname", ""), "value_raw": v_raw, "value": v_trans, "unit": config.get("unit", "")})
+        return sorted(rows, key=lambda x: x["period_code"], reverse=True)
+
+    def _build_macro_snapshot(self, macro_series):
+        snapshot = {}
+        for k, s in macro_series.items():
+            if not s: continue
+            latest, prev = s[0], s[1] if len(s) > 1 else None
+            snapshot[k] = {"label": latest["series_label"], "value": latest["value"], "value_raw": latest["value_raw"], "unit": latest["unit"], "period_label": latest["period_label"], "change": round(latest["value"] - prev["value"], 2) if prev else None}
+        return snapshot
+
+    def _build_macro_tables(self, macro_series):
+        return {k: pd.DataFrame([{"期间": i["period_label"],"数值": i["value"],"原始值": i["value_raw"],"单位": i["unit"] or"-"} for i in s]) for k, s in macro_series.items() if s}
+
+    def _fetch_market_indices(self):
+        res = {}
+        for label, symbol in self.A_SHARE_INDEX_CONFIG.items():
+            df = ak.stock_zh_index_daily(symbol=symbol)
+            if df is None or df.empty: continue
+            latest, prev = df.iloc[-1], df.iloc[-2] if len(df) > 1 else df.iloc[-1]
+            res[label] = {"close": round(float(latest["close"]), 2), "date": str(latest["date"]), "daily_change_pct": round(((float(latest["close"]) - float(prev["close"])) / float(prev["close"])) * 100, 2) if float(prev["close"]) != 0 else 0.0, "pct_20d": self._calc_return(df, 20), "pct_60d": self._calc_return(df, 60)}
+        return res
+
+    def _fetch_macro_news(self):
+        df = ak.stock_info_global_em()
+        if df is None or df.empty: return []
+        kw = ["财政","货币","央行","地产","消费","PMI","CPI"]
+        return [{"title": r["标题"],"summary": str(r.get("摘要",""))[:180],"publish_time": str(r.get("发布时间",""))} for _, r in df.iterrows() if any(k in str(r.get("标题")) or k in str(r.get("摘要")) for k in kw)][:12]
+
+    def _calc_return(self, df, days):
+        if len(df) <= days: return 0.0
+        base = float(df.iloc[-days - 1]["close"])
+        return round((float(df.iloc[-1]["close"]) - base) / base * 100, 2) if base != 0 else 0.0
+
+    def build_rule_based_sector_view(self, snapshot):
+        return {"market_view": "结构性机会为主","bullish_sectors": [],"bearish_sectors": [],"watch_signals": []}
+
+    def build_stock_candidates_for_sectors(self, sectors):
+        return [s for sec in sectors for s in self.SECTOR_STOCK_POOLS.get(sec, [])][:10]
+
+    def build_prompt_context(self, data):
+        lines = ["===== 当前国内宏观数据快照 ====="]
+        for k, v in data.get("macro_snapshot", {}).items():
+            lines.append(f"- {v['label']}: {v['value']}{v['unit']} ({v['period_label']})")
+        lines.append("\n===== A股指数快照 =====")
+        for k, v in data.get("market_indices", {}).items():
+            lines.append(f"- {k}: {v['close']}, 日涨跌 {v['daily_change_pct']}%")
+        lines.append("\n===== 可选板块池 =====\n"+"、".join(self.SECTOR_STOCK_POOLS.keys()))
+        return "\n".join(lines)
+
+
+class MacroAnalysisAgents:
+    """基于主程序 call_ai 接口的宏观智能体集群"""
+    def macro_analyst_agent(self, context_text: str) -> Dict:
+        prompt = f"你是一位资深中国宏观经济研究员。请严格基于下面的数据，分析当前国内宏观经济形势。\n\n{context_text}\n重点回答：1.当前经济所处阶段。2.核心矛盾。3.关键跟踪变量。4.对A股投资的影响。"
+        return self._call_text("你是中国宏观经济分析师", prompt,"宏观总量分析师", ["增长","通胀","信用"])
+
+    def policy_analyst_agent(self, context_text: str) -> Dict:
+        prompt = f"你是一位资深的政策与流动性分析师。请基于以下数据评估中国政策环境与流动性。\n\n{context_text}\n重点回答：1.当前政策组合倾向。2.流动性对A股估值的支撑。3.A股风格与板块轮动含义。"
+        return self._call_text("你是政策流动性分析师", prompt,"政策流动性分析师", ["货币","财政","风格"])
+
+    def sector_mapper_agent(self, context_text: str, sector_pool: List[str]) -> Dict:
+        prompt = f"你是行业配置分析师。请结合数据，从以下板块池选择未来1季度受益和承压板块。\n板块池：{', '.join(sector_pool)}\n\n数据：\n{context_text}\n请只返回JSON：{{\"market_view\": \"...\", \"bullish_sectors\": [{{\"sector\":\"银行\", \"logic\":\"...\"}}], \"bearish_sectors\": []}}"
+        structured = self._call_json("只输出合法JSON", prompt, {"market_view":"结构性震荡","bullish_sectors": [],"bearish_sectors": []})
+        analysis_prompt = f"请基于以下JSON写一份A股行业配置报告：\n{json.dumps(structured, ensure_ascii=False)}\n包含市场主线、看多/看空逻辑及传导链。"
+        analysis = call_ai(f"你是A股行业配置专家\n\n{analysis_prompt}")
+        return {"agent_name": "行业映射分析师","analysis": analysis,"structured": structured}
+
+    def stock_selector_agent(self, context_text: str, sector_view: Dict, stock_candidates: List[Dict]) -> Dict:
+        cand_str = json.dumps(stock_candidates, ensure_ascii=False)
+        prompt = f"你是选股分析师。结合行业视图从候选池中选股。\n行业视图：\n{json.dumps(sector_view, ensure_ascii=False)}\n候选池：\n{cand_str}\n请只返回JSON格式包含 'recommended_stocks' 和 'watchlist'。"
+        structured = self._call_json("只输出合法JSON", prompt, {"recommended_stocks": stock_candidates[:2],"watchlist": []})
+        analysis_prompt = f"请基于结构化结果写一份选股说明：\n{json.dumps(structured, ensure_ascii=False)}\n解释适配逻辑，指出催化剂与风险。"
+        analysis = call_ai(f"你是A股选股专家\n\n{analysis_prompt}")
+        return {"agent_name": "优质标的分析师","analysis": analysis,"structured": structured}
+
+    def chief_strategist_agent(self, context_text: str, macro_report: str, policy_report: str, sector_view: Dict) -> Dict:
+        prompt = f"你是首席策略官，请给出A股后市综合报告。\n\n宏观数据：\n{context_text}\n\n【宏观研判】\n{macro_report}\n\n【政策研判】\n{policy_report}\n\n【行业映射】\n{json.dumps(sector_view, ensure_ascii=False)}\n\n要求输出：宏观判断、后市展望、利多利空板块及风险跟踪。"
+        return self._call_text("你是首席策略官", prompt,"首席策略官", ["总策略","配置"])
+
+    def _call_text(self, sys_prompt, user_prompt, agent_name, focus_areas):
+        res = call_ai(f"{sys_prompt}\n\n{user_prompt}")
+        return {"agent_name": agent_name, "analysis": res, "focus_areas": focus_areas}
+
+    def _call_json(self, sys_prompt, user_prompt, fallback):
+        res = call_ai(f"{sys_prompt}\n\n{user_prompt}")
+        if not res: return fallback
+        match = re.search(r"(\{.*\})", res.strip(), re.S)
+        if match:
+            try: return json.loads(match.group(1))
+            except: pass
+        return fallback
+
+class MacroAnalysisEngine:
+    def run_full_analysis(self, progress_callback=None):
+        results = {"success": False, "raw_data": {}, "agents_analysis": {}, "sector_view": {}, "candidate_stocks": [], "errors": []}
+        try:
+            fetcher = MacroAnalysisDataFetcher()
+            agents = MacroAnalysisAgents()
+            if progress_callback: progress_callback(10, "正在获取国家统计局宏观数据...")
+            raw_data = fetcher.fetch_all_data()
+            results["raw_data"] = raw_data
+            ctx = fetcher.build_prompt_context(raw_data)
+            
+            if progress_callback: progress_callback(30, "宏观与政策分析师正在研判...")
+            macro_res = agents.macro_analyst_agent(ctx)
+            policy_res = agents.policy_analyst_agent(ctx)
+            
+            if progress_callback: progress_callback(60, "行业分析师生成映射...")
+            sector_res = agents.sector_mapper_agent(ctx, list(fetcher.SECTOR_STOCK_POOLS.keys()))
+            sector_view = sector_res.get("structured", {})
+            
+            bullish_sectors = [s.get("sector") for s in sector_view.get("bullish_sectors", []) if s.get("sector")]
+            cands = fetcher.build_stock_candidates_for_sectors(bullish_sectors)
+            results["candidate_stocks"] = cands
+            
+            if progress_callback: progress_callback(80, "筛选标的与生成最终策略...")
+            stock_res = agents.stock_selector_agent(ctx, sector_view, cands)
+            chief_res = agents.chief_strategist_agent(ctx, macro_res["analysis"], policy_res["analysis"], sector_view)
+            
+            results["agents_analysis"] = {"macro": macro_res, "policy": policy_res, "sector": sector_res, "stock": stock_res, "chief": chief_res}
+            results["sector_view"] = sector_view
+            results["stock_view"] = stock_res.get("structured", {})
+            results["success"] = True
+            if progress_callback: progress_callback(100, "分析完成")
+        except Exception as e:
+            results["error"] = str(e)
+        return results
+
+# ====== 宏观 UI 渲染函数 ======
+def display_macro_analysis_ui():
+    st.info("本板块通过国家统计局官方接口抓取最新宏观经济数据，并联动 AI 多智能体进行 A 股大势研判与行业映射。")
+    if st.button("🚀 启动全局宏观深度推演", type="primary", width="stretch"):
+        if not api_key:
+            st.error("配置缺失: GROQ_API_KEY")
+            return
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        def p_call(pct, txt):
+            progress_bar.progress(pct)
+            status_text.text(txt)
+            
+        engine = MacroAnalysisEngine()
+        res = engine.run_full_analysis(progress_callback=p_call)
+        progress_bar.empty()
+        status_text.empty()
+        
+        if res.get("success"):
+            st.success("推演完成！")
+            mt1, mt2, mt3, mt4 = st.tabs(["📌 首席综合结论","📊 宏观核心数据","🏭 行业多空映射","🧠 智能体推演过程"])
+            with mt1:
+                st.markdown(res["agents_analysis"]["chief"]["analysis"])
+            with mt2:
+                st.write("##### 国家统计局最新宏观快照")
+                snap = res["raw_data"].get("macro_snapshot", {})
+                if snap:
+                    df_snap = pd.DataFrame([{"指标": v["label"],"最新值": f"{v['value']}{v['unit']}","发布期": v["period_label"],"环比/同比变动": f"{v['change']:+.2f}{v['unit']}"if v.get("change") else"-"} for k,v in snap.items()])
+                    st.dataframe(df_snap, width="stretch", hide_index=True)
+            with mt3:
+                st.markdown(res["agents_analysis"]["sector"]["analysis"])
+            with mt4:
+                with st.expander("宏观总量分析师报告"): st.markdown(res["agents_analysis"]["macro"]["analysis"])
+                with st.expander("政策流动性分析师报告"): st.markdown(res["agents_analysis"]["policy"]["analysis"])
+                with st.expander("优质标的筛选报告"): st.markdown(res["agents_analysis"]["stock"]["analysis"])
+        else:
+            st.error(f"推演失败: {res.get('error')}")
+# ================= 宏观分析板块结束 =================
+# ================= 智瞰龙虎榜数据与分析模块 =================
+class LonghubangDataFetcher:
+    """龙虎榜数据获取类"""
+    def __init__(self, api_key=None):
+        self.base_url = "http://lhb-api.ws4.cn/v1"
+        self.api_key = api_key
+        self.max_retries = 3
+        self.retry_delay = 2
+        self.request_delay = 0.025
+
+    def _safe_request(self, url, params=None):
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(url, params=params, timeout=10)
+                time.sleep(self.request_delay)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('code') == 20000:
+                        return data
+                    else:
+                        if DEBUG_MODE: st.warning(f"API返回错误: {data.get('msg', '未知错误')}")
+                        return None
+                else:
+                    if DEBUG_MODE: st.warning(f"HTTP错误: {response.status_code}")
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    return None
+        return None
+
+    def get_longhubang_data(self, date):
+        url = f"{self.base_url}/youzi/all"
+        params = {'date': date}
+        return self._safe_request(url, params)
+
+    def parse_to_dataframe(self, data_list):
+        if not data_list:
+            return pd.DataFrame()
+        df = pd.DataFrame(data_list)
+        column_mapping = {
+            'yzmc': '游资名称', 'yyb': '营业部', 'sblx': '榜单类型',
+            'gpdm': '股票代码', 'gpmc': '股票名称', 'mrje': '买入金额',
+            'mcje': '卖出金额', 'jlrje': '净流入金额', 'rq': '日期', 'gl': '概念'
+        }
+        df = df.rename(columns=column_mapping)
+        numeric_columns = ['买入金额', '卖出金额', '净流入金额']
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        if '净流入金额' in df.columns:
+            df = df.sort_values('净流入金额', ascending=False)
+        return df
+
+    def analyze_data_summary(self, data_list):
+        if not data_list:
+            return {}
+        df = self.parse_to_dataframe(data_list)
+        summary = {
+            'total_records': len(df),
+            'total_stocks': df['股票代码'].nunique() if '股票代码' in df.columns else 0,
+            'total_youzi': df['游资名称'].nunique() if '游资名称' in df.columns else 0,
+            'total_buy_amount': df['买入金额'].sum() if '买入金额' in df.columns else 0,
+            'total_sell_amount': df['卖出金额'].sum() if '卖出金额' in df.columns else 0,
+            'total_net_inflow': df['净流入金额'].sum() if '净流入金额' in df.columns else 0,
+        }
+        if '游资名称' in df.columns and '净流入金额' in df.columns:
+            top_youzi = df.groupby('游资名称')['净流入金额'].sum().sort_values(ascending=False)
+            summary['top_youzi'] = top_youzi.head(10).to_dict()
+        if '股票代码' in df.columns and '净流入金额' in df.columns:
+            top_stocks = df.groupby(['股票代码', '股票名称'])['净流入金额'].sum().sort_values(ascending=False)
+            summary['top_stocks'] = [
+                {'code': code, 'name': name, 'net_inflow': amount}
+                for (code, name), amount in top_stocks.head(20).items()
+            ]
+        if '概念' in df.columns:
+            all_concepts = []
+            for concepts in df['概念'].dropna():
+                all_concepts.extend([c.strip() for c in str(concepts).split(',')])
+            concept_counter = Counter(all_concepts)
+            summary['hot_concepts'] = dict(concept_counter.most_common(20))
+        return summary
+
+    def format_data_for_ai(self, data_list, summary=None):
+        if not data_list:
+            return "暂无龙虎榜数据"
+        df = self.parse_to_dataframe(data_list)
+        if summary is None:
+            summary = self.analyze_data_summary(data_list)
+        text_parts = []
+        text_parts.append(f"""
+【龙虎榜总体概况】
+数据时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+记录总数: {summary.get('total_records', 0)}
+涉及股票: {summary.get('total_stocks', 0)} 只
+涉及游资: {summary.get('total_youzi', 0)} 个
+总买入金额: {summary.get('total_buy_amount', 0):,.2f} 元
+总卖出金额: {summary.get('total_sell_amount', 0):,.2f} 元
+净流入金额: {summary.get('total_net_inflow', 0):,.2f} 元
+""")
+        if summary.get('top_youzi'):
+            text_parts.append("\n【活跃游资 TOP10】")
+            for idx, (name, amount) in enumerate(summary['top_youzi'].items(), 1):
+                text_parts.append(f"{idx}. {name}: {amount:,.2f} 元")
+        if summary.get('top_stocks'):
+            text_parts.append("\n【资金净流入 TOP20股票】")
+            for idx, stock in enumerate(summary['top_stocks'], 1):
+                text_parts.append(f"{idx}. {stock['name']}({stock['code']}): {stock['net_inflow']:,.2f} 元")
+        if summary.get('hot_concepts'):
+            text_parts.append("\n【热门概念 TOP20】")
+            for idx, (concept, count) in enumerate(list(summary['hot_concepts'].items())[:20], 1):
+                text_parts.append(f"{idx}. {concept}: {count} 次")
+        text_parts.append("\n【详细交易记录 TOP50】")
+        for idx, row in df.head(50).iterrows():
+            text_parts.append(
+                f"{row.get('游资名称', 'N/A')} |"
+                f"{row.get('股票名称', 'N/A')}({row.get('股票代码', 'N/A')}) |"
+                f"买入:{row.get('买入金额', 0):,.0f}"
+                f"卖出:{row.get('卖出金额', 0):,.0f}"
+                f"净流入:{row.get('净流入金额', 0):,.0f} |"
+                f"日期:{row.get('日期', 'N/A')}"
+            )
+        return "\n".join(text_parts)
+
+class LonghubangAgents:
+    """龙虎榜AI分析师集合 (整合主干引擎)"""
+    def __init__(self):
+        pass # 已复用主程序 call_ai 接口，无需初始化 DeepSeek 客户端
+
+    def youzi_behavior_analyst(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
+        youzi_info = ""
+        if summary.get('top_youzi'):
+            youzi_info = "\n【活跃游资统计】\n"
+            for idx, (name, amount) in enumerate(list(summary['top_youzi'].items())[:15], 1):
+                youzi_info += f"{idx}. {name}: 净流入 {amount:,.2f} 元\n"
+
+        prompt = f"""
+你是一名资深的游资研究专家，擅长从龙虎榜数据中洞察游资意图和操作手法。拥有10年以上的龙虎榜数据分析经验，深谙各路游资的操作风格和盈利模式。
+
+【龙虎榜数据概况】
+记录总数: {summary.get('total_records', 0)}
+涉及股票: {summary.get('total_stocks', 0)} 只
+涉及游资: {summary.get('total_youzi', 0)} 个
+总买入金额: {summary.get('total_buy_amount', 0):,.2f} 元
+总卖出金额: {summary.get('total_sell_amount', 0):,.2f} 元
+净流入金额: {summary.get('total_net_inflow', 0):,.2f} 元
+
+{youzi_info}
+
+{longhubang_data[:8000]}
+
+请基于以上龙虎榜数据，进行深入的游资行为分析：
+1. **活跃游资识别与画像** ⭐ 核心
+   - 识别当前最活跃的5-8个游资席位
+   - 分析每个游资的操作风格（激进型/稳健型/超短型/波段型）
+   - 评估游资的胜率和成功案例
+   - 识别知名"牛散"和"游资大佬"
+2. **游资操作特征分析**
+   - 分析游资的买入特征（追高/低吸/打板/潜伏）
+   - 分析游资的卖出特征（一日游/持有周期/止盈止损）
+   - 识别游资的联合操作和接力特征
+   - 判断游资是否存在抱团现象
+3. **游资目标股票分析**
+   - 分析游资重点关注的股票（前10只）
+   - 识别游资集体看好的股票（多席位介入）
+   - 分析游资选股的共性特征（题材/概念/技术形态）
+   - 评估游资介入股票的后续爆发力
+4. **游资进出节奏**
+   - 判断游资整体是进攻还是防守状态
+   - 分析游资对热点的跟随速度
+   - 识别游资撤退的信号和板块
+   - 评估游资的持续作战能力
+5. **游资与题材的匹配**
+   - 分析游资偏好的题材和概念
+   - 识别游资正在炒作的热点
+   - 判断题材的炒作周期位置
+   - 预判下一个游资可能关注的题材
+6. **风险与机会提示**
+   - 识别游资可能设置的"陷阱"股票
+   - 提示游资一致性过高的风险（容易崩盘）
+   - 发现游资刚开始介入的潜力股
+   - 评估跟随游资的风险收益比
+7. **投资策略建议**
+   - 推荐3-5只游资看好的潜力股票
+   - 提示2-3只游资可能出货的风险股票
+   - 给出跟随游资的操作建议
+   - 提供仓位和止损建议
+
+请给出专业、实战性强的游资行为分析报告。
+"""
+        analysis = call_ai(prompt)
+        return {
+            "agent_name": "游资行为分析师",
+            "agent_role": "分析游资操作特征、意图和目标股票",
+            "analysis": analysis,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def stock_potential_analyst(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
+        stock_info = ""
+        if summary.get('top_stocks'):
+            stock_info = "\n【热门股票统计】\n"
+            for idx, stock in enumerate(summary['top_stocks'][:20], 1):
+                stock_info += f"{idx}. {stock['name']}({stock['code']}): 净流入 {stock['net_inflow']:,.2f} 元\n"
+
+        prompt = f"""
+你是一名资深的个股研究专家和短线交易高手，精通技术分析和资金分析，擅长从龙虎榜中挖掘短期爆发股。
+
+【龙虎榜数据概况】
+记录总数: {summary.get('total_records', 0)}
+涉及股票: {summary.get('total_stocks', 0)} 只
+涉及游资: {summary.get('total_youzi', 0)} 个
+
+{stock_info}
+
+{longhubang_data[:8000]}
+
+请基于以上龙虎榜数据，进行深入的个股潜力分析：
+1. **次日大概率上涨股票挖掘** ⭐⭐⭐ 最核心
+   - 识别5-8只次日大概率上涨的股票
+   - 详细分析每只股票的上涨逻辑（资金面、技术面、题材面）
+   - 评估每只股票的上涨空间和确定性（高/中/低）
+   - 给出具体的买入价位和止损位
+2. **资金流向强度分析**
+   - 识别主力资金大幅流入的股票（净买入前10）
+   - 分析资金流入的集中度和持续性
+   - 识别多席位联合买入的股票（强烈看好信号）
+   - 判断资金流入是真实买入还是诱多
+3. **技术形态评估**
+   - 分析上榜股票的技术位置（突破/回调/整理）
+   - 识别处于启动阶段的股票
+   - 评估股票的技术支撑和阻力
+   - 判断股票的短期走势方向
+4. **题材与概念分析**
+   - 识别当前最热门的题材和概念
+   - 分析题材的持续性和爆发力
+   - 找出题材龙头和低位补涨股
+   - 预判题材的炒作周期
+5. **游资持仓分析**
+   - 识别游资重仓持有的股票
+   - 分析游资的一致性程度
+   - 判断游资是建仓、加仓还是出货
+   - 评估游资持仓的稳定性
+6. **上榜类型分析**
+   - 分析日榜和三日榜的差异
+   - 识别连续上榜的股票（关注度高）
+   - 判断上榜的性质（放量突破/涨停板/异常波动）
+   - 评估不同上榜类型的后续表现概率
+7. **风险股票识别**
+   - 识别3-5只高风险股票（游资可能出货）
+   - 分析卖出金额大于买入金额的股票
+   - 提示游资一日游后撤离的股票
+   - 警示技术面走坏的股票
+8. **操作策略建议**
+   - 推荐5-8只次日重点关注的股票（按优先级排序）
+   - 给出每只股票的买入逻辑、买入价位、目标价位、止损价位
+   - 提供仓位分配建议
+   - 给出持有周期建议（超短/短线/波段）
+
+务必重点分析次日大概率上涨的股票！
+"""
+        analysis = call_ai(prompt)
+        return {
+            "agent_name": "个股潜力分析师",
+            "agent_role": "挖掘次日大概率上涨的潜力股票",
+            "analysis": analysis,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def theme_tracker_analyst(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
+        concept_info = ""
+        if summary.get('hot_concepts'):
+            concept_info = "\n【热门概念统计】\n"
+            for idx, (concept, count) in enumerate(list(summary['hot_concepts'].items())[:20], 1):
+                concept_info += f"{idx}. {concept}: 出现 {count} 次\n"
+
+        prompt = f"""
+你是一名资深的题材研究专家，拥有敏锐的市场嗅觉，擅长从龙虎榜数据中捕捉题材热点和板块轮动机会。
+
+【龙虎榜数据概况】
+记录总数: {summary.get('total_records', 0)}
+涉及股票: {summary.get('total_stocks', 0)} 只
+
+{concept_info}
+
+{longhubang_data[:8000]}
+
+请基于以上龙虎榜数据，进行深入的题材追踪分析：
+1. **热点题材识别** ⭐ 核心
+   - 识别当前最热门的5-8个题材/概念
+   - 分析每个题材的核心逻辑和催化剂
+   - 评估题材的市场关注度和参与度
+   - 判断题材是主流还是伪题材
+2. **题材炒作周期分析**
+   - 判断每个题材所处的炒作周期（萌芽期/爆发期/高潮期/退潮期）
+   - 分析题材的爆发力和持续性
+   - 识别即将启动的新题材（萌芽期）
+   - 提示即将退潮的老题材（高潮期）
+3. **题材龙头与梯队**
+   - 识别每个题材的龙头股（1-2只）
+   - 找出题材的跟风股和补涨股
+   - 分析龙头的地位是否稳固
+   - 判断是否存在龙头切换
+4. **游资对题材的态度**
+   - 分析游资重点炒作的题材
+   - 判断游资对题材的认同度（一致/分歧）
+   - 识别游资集体进攻的题材（强势题材）
+   - 发现游资开始撤离的题材（弱势题材）
+5. **题材轮动特征**
+   - 分析题材之间的轮动关系
+   - 识别强势题材和弱势题材
+   - 判断资金从哪个题材流向哪个题材
+   - 预判下一个可能启动的题材
+6. **题材与市场环境匹配度**
+   - 分析题材是否符合当前市场风格
+   - 评估题材的政策支持度
+   - 判断题材的基本面支撑
+   - 识别纯粹炒作的题材
+7. **题材风险评估**
+   - 识别过度炒作的题材（泡沫风险）
+   - 提示游资分歧加大的题材
+   - 警示题材逻辑破裂的风险
+   - 评估题材的回调风险
+8. **投资策略建议**
+   - 推荐3-5个值得关注的强势题材
+   - 每个题材推荐1-2只最优标的
+   - 提供题材投资的时机选择
+   - 给出题材仓位和持有周期建议
+"""
+        analysis = call_ai(prompt)
+        return {
+            "agent_name": "题材追踪分析师",
+            "agent_role": "识别热点题材，分析炒作周期，预判轮动方向",
+            "analysis": analysis,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def risk_control_specialist(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
+        prompt = f"""
+你是一名资深的风险控制专家和反向思维大师，拥有20年的市场风险管理经验，擅长识别龙虎榜中的风险信号和资金陷阱。
+
+【龙虎榜数据概况】
+记录总数: {summary.get('total_records', 0)}
+涉及股票: {summary.get('total_stocks', 0)} 只
+涉及游资: {summary.get('total_youzi', 0)} 个
+总买入金额: {summary.get('total_buy_amount', 0):,.2f} 元
+总卖出金额: {summary.get('total_sell_amount', 0):,.2f} 元
+净流入金额: {summary.get('total_net_inflow', 0):,.2f} 元
+
+{longhubang_data[:8000]}
+
+请基于以上龙虎榜数据，进行全面的风险分析：
+1. **高风险股票识别** ⭐ 核心
+   - 识别5-8只高风险股票（次日大概率下跌）
+   - 分析每只股票的风险点（游资出货/技术破位/题材退潮）
+   - 评估每只股票的风险等级（高/中/低）
+   - 给出规避建议和止损位
+2. **游资出货信号识别**
+   - 识别卖出金额远大于买入金额的股票
+   - 分析游资"一日游"后撤离的股票
+   - 识别游资集体出货的股票（多席位卖出）
+   - 判断游资出货是正常获利了结还是预期恶化
+3. **资金陷阱识别**
+   - 识别"虚假放量"的股票（实为对倒出货）
+   - 分析"高位放量滞涨"的股票
+   - 识别"拉高出货"的经典手法
+   - 提示"击鼓传花"的末期信号
+4. **题材风险评估**
+   - 识别过度炒作的题材（泡沫严重）
+   - 分析题材逻辑破裂的风险
+   - 提示题材退潮的信号
+   - 评估题材的持续性风险
+5. **技术面风险提示**
+   - 识别技术面走坏的股票（破位/跌破支撑）
+   - 分析高位震荡的股票（出货迹象）
+   - 提示连续上涨后的回调风险
+   - 评估短期超买的股票
+6. **情绪风险评估**
+   - 识别市场情绪过热的信号
+   - 分析游资一致性过高的风险（易崩盘）
+   - 提示跟风盘过多的股票（接盘侠风险）
+   - 评估短期投机氛围的风险
+7. **系统性风险提示**
+   - 分析整体龙虎榜数据反映的市场风险
+   - 评估游资整体是进攻还是防守
+   - 判断市场风险偏好的变化
+   - 提示可能的系统性调整风险
+8. **风险管理建议**
+   - 提供仓位控制建议（重仓/轻仓/空仓）
+   - 给出止损止盈的纪律要求
+   - 建议规避的板块和题材
+   - 提供风险对冲策略
+"""
+        analysis = call_ai(prompt)
+        return {
+            "agent_name": "风险控制专家",
+            "agent_role": "识别高风险股票、游资出货信号和市场陷阱",
+            "analysis": analysis,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    def chief_strategist(self, all_analyses: List[Dict]) -> Dict[str, Any]:
+        analyses_text = ""
+        for analysis in all_analyses:
+            analyses_text += f"\n{'='*60}\n"
+            analyses_text += f"【{analysis['agent_name']}】分析报告\n"
+            analyses_text += f"职责: {analysis['agent_role']}\n"
+            analyses_text += f"{'='*60}\n"
+            analyses_text += analysis['analysis'] + "\n"
+
+        prompt = f"""
+你是一名资深的首席投资策略师，拥有CFA、FRM等专业资格，具有25年的市场实战经验和卓越的综合分析能力。
+你的团队包含4位专业分析师，他们已经从不同维度完成了龙虎榜数据分析：
+以下是各位分析师的详细分析报告：
+
+{analyses_text[:15000]}
+
+请作为首席策略师，综合以上所有分析，给出最终的投资策略报告：
+1. **市场总体研判**
+   - 综合评估当前龙虎榜反映的市场状态
+   - 判断游资整体的进攻或防守态度
+   - 评估短期市场的机会和风险
+   - 给出市场情绪和热度评分（0-100分）
+2. **次日重点推荐股票（TOP5-8）** ⭐⭐⭐ 最核心
+   - 综合4位分析师的意见，筛选出5-8只次日最有潜力的股票
+   - 每只股票必须包含：股票名称和代码、推荐理由、确定性评级、买入价位区间、目标价位、止损价位、持有周期建议
+   - 按推荐优先级排序
+3. **高风险警示股票（TOP3-5）**
+   - 综合识别3-5只高风险股票
+   - 说明风险原因并给出规避建议
+4. **热点题材总结**
+   - 总结当前2-3个最强势题材
+   - 每个题材推荐1-2只最优标的
+5. **操作策略建议**
+   - 仓位管理建议（进攻/平衡/防守）
+   - 选股思路和方向
+   - 买卖时机选择
+   - 风险控制要求
+6. **注意事项**
+   - 提示关键风险点
+   - 强调纪律执行
+   - 给出应对预案
+"""
+        analysis = call_ai(prompt)
+        return {
+            "agent_name": "首席策略师",
+            "agent_role": "综合多维度分析，给出最终投资建议",
+            "analysis": analysis,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+# ==========================================
+# ===================== 新增：主力资金选股整合模块 =====================
+# =====================================================================
+import pywencai
+import sqlite3
+import json
+import re
+
+class MainForceBatchDatabase:
+    """主力选股分析历史数据库管理类"""
+    def __init__(self, db_path="main_force_batch.db"):
+        self.db_path = db_path
+        self._init_database()
+
+    def _init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS batch_analysis_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_date TEXT NOT NULL,
+                batch_count INTEGER NOT NULL,
+                success_count INTEGER NOT NULL,
+                results_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def save_analysis(self, batch_count, success_count, results_json):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        analysis_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute('''
+            INSERT INTO batch_analysis_history 
+            (analysis_date, batch_count, success_count, results_json)
+            VALUES (?, ?, ?, ?)
+        ''', (analysis_date, batch_count, success_count, results_json))
+        conn.commit()
+        conn.close()
+
+class MainForceStockSelector:
+    """主力资金数据获取与清洗类（修复版：问财失败自动切换东财/AKShare）"""
+
+    def _normalize_code(self, val):
+        """把各种来源的股票代码统一成 6 位字符串"""
+        if val is None or pd.isna(val):
+            return ""
+        text = str(val).strip()
+        text = re.sub(r"\D", "", text)
+        if len(text) >= 6:
+            return text[-6:]
+        return text.zfill(6) if text else ""
+
+    def _pick_col(self, df: pd.DataFrame, keywords: List[str], exclude: List[str] | None = None):
+        """按关键词模糊匹配列名"""
+        exclude = exclude or []
+        for col in df.columns:
+            name = str(col)
+            if all(k in name for k in keywords) and not any(e in name for e in exclude):
+                return col
+        return None
+
+    def _safe_wencai_get(self, query: str):
+        """安全调用问财：pywencai 在云端偶发 NoneType.get，这里直接兜住"""
+        try:
+            result = pywencai.get(query=query, loop=True)
+            if result is None:
+                return None, "问财返回 None"
+            if isinstance(result, pd.DataFrame):
+                if result.empty:
+                    return None, "问财返回空表"
+                return result, "问财获取成功"
+            if isinstance(result, list):
+                df = pd.DataFrame(result)
+                if df.empty:
+                    return None, "问财 list 为空"
+                return df, "问财 list 转表成功"
+            if isinstance(result, dict):
+                for key in ["data", "result", "datas", "items"]:
+                    val = result.get(key)
+                    if isinstance(val, list) and val:
+                        df = pd.DataFrame(val)
+                        if not df.empty:
+                            return df, f"问财 dict[{key}] 转表成功"
+                    if isinstance(val, pd.DataFrame) and not val.empty:
+                        return val, f"问财 dict[{key}] 获取成功"
+                try:
+                    df = pd.DataFrame(result)
+                    if not df.empty:
+                        return df, "问财 dict 直接转表成功"
+                except Exception:
+                    pass
+            return None, f"问财返回格式不可识别: {type(result)}"
+        except Exception as e:
+            return None, f"问财接口异常: {e}"
+
+    def _get_spot_table(self):
+        """获取实时行情表，用于补充名称、市值、PE、涨跌幅"""
+        try:
+            spot = ak.stock_zh_a_spot_em()
+            if spot is not None and not spot.empty:
+                spot = spot.copy()
+                if "代码"in spot.columns:
+                    spot["标准代码"] = spot["代码"].apply(self._normalize_code)
+                return spot
+        except Exception as e:
+            if DEBUG_MODE:
+                st.warning(f"实时行情补充失败: {e}")
+        return pd.DataFrame()
+
+    def _fallback_from_akshare(self, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
+        """东财资金流兜底：不依赖问财，避免 NoneType.get 报错"""
+        indicator = "10日"
+        if days_ago is not None:
+            if days_ago <= 1:
+                indicator = "今日"
+            elif days_ago <= 3:
+                indicator = "3日"
+            elif days_ago <= 5:
+                indicator = "5日"
+            else:
+                indicator = "10日"
+
+        try:
+            fund_df = ak.stock_individual_fund_flow_rank(indicator=indicator)
+        except Exception as e:
+            return None, f"AKShare 东财资金流接口异常: {e}"
+
+        if fund_df is None or fund_df.empty:
+            return None, "AKShare 东财资金流返回空数据"
+
+        df = fund_df.copy()
+        code_col = self._pick_col(df, ["代码"]) or self._pick_col(df, ["股票代码"])
+        name_col = self._pick_col(df, ["名称"]) or self._pick_col(df, ["股票名称"])
+        if code_col:
+            df["股票代码"] = df[code_col].apply(self._normalize_code)
+        else:
+            return None, "资金流数据缺少股票代码列"
+        if name_col:
+            df["股票名称"] = df[name_col].astype(str)
+        else:
+            df["股票名称"] ="未知"
+
+        main_amount_col = None
+        for col in df.columns:
+            col_s = str(col)
+            if "主力净流入"in col_s and ("净额"in col_s or"金额"in col_s):
+                main_amount_col = col
+                break
+        if main_amount_col is None:
+            for col in df.columns:
+                col_s = str(col)
+                if "净流入"in col_s and ("净额"in col_s or"金额"in col_s):
+                    main_amount_col = col
+                    break
+        if main_amount_col:
+            df["主力资金净流入"] = pd.to_numeric(df[main_amount_col], errors="coerce")
+        else:
+            df["主力资金净流入"] = 0.0
+
+        pct_col = self._pick_col(df, ["涨跌幅"])
+        if pct_col:
+            df["区间涨跌幅"] = pd.to_numeric(df[pct_col], errors="coerce")
+        else:
+            df["区间涨跌幅"] = pd.NA
+
+        spot = self._get_spot_table()
+        if not spot.empty and "标准代码"in spot.columns:
+            keep_cols = ["标准代码"]
+            for c in ["总市值","市盈率-动态","市净率","所属行业","行业","最新价","涨跌幅"]:
+                if c in spot.columns and c not in keep_cols:
+                    keep_cols.append(c)
+            df = df.merge(spot[keep_cols], left_on="股票代码", right_on="标准代码", how="left")
+            if "总市值"in df.columns:
+                df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce") / 100000000
+            if "市盈率-动态"in df.columns:
+                df["市盈率"] = df["市盈率-动态"]
+            if "所属行业"not in df.columns:
+                df["所属行业"] = df["行业"] if"行业"in df.columns else"未知"
+        else:
+            df["总市值"] = pd.NA
+            df["市盈率"] = pd.NA
+            df["所属行业"] ="未知"
+
+        if "总市值"in df.columns:
+            cap = pd.to_numeric(df["总市值"], errors="coerce")
+            mask = cap.isna() | ((cap >= min_market_cap) & (cap <= max_market_cap))
+            df = df[mask]
+
+        df = df[~df["股票名称"].astype(str).str.contains("ST|退", regex=True, na=False)]
+        df = df[~df["股票代码"].astype(str).str.startswith(("8","4"))]
+        df = df.sort_values("主力资金净流入", ascending=False, na_position="last").reset_index(drop=True)
+        return df, f"问财不可用，已自动切换 AKShare/东财资金流兜底，周期={indicator}，获取{len(df)}只股票"
+
+    def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
+        """优先问财；问财失败或返回异常时，自动切换 AKShare 东财资金流"""
+        if days_ago is None:
+            days_ago = 10
+        if not start_date:
+            date_obj = datetime.now() - timedelta(days=days_ago)
+            start_date = f"{date_obj.year}年{date_obj.month}月{date_obj.day}日"
+
+        query = (
+            f"{start_date}以来主力资金净流入前100名，并计算区间涨跌幅，"
+            f"市值{min_market_cap}-{max_market_cap}亿，非st非科创板，所属行业，总市值，净利润，市盈率"
+        )
+
+        df, msg = self._safe_wencai_get(query)
+        if df is not None and not df.empty:
+            code_col = self._pick_col(df, ["代码"]) or self._pick_col(df, ["股票代码"])
+            name_col = self._pick_col(df, ["名称"]) or self._pick_col(df, ["股票简称"]) or self._pick_col(df, ["股票名称"])
+            df = df.copy()
+            if code_col:
+                df["股票代码"] = df[code_col].apply(self._normalize_code)
+            if name_col and "股票名称"not in df.columns:
+                df["股票名称"] = df[name_col].astype(str)
+            if DEBUG_MODE:
+                st.info(f"问财查询成功: {msg}")
+            return True, df, f"成功获取{len(df)}只股票（问财）"
+
+        fallback_df, fallback_msg = self._fallback_from_akshare(days_ago, min_market_cap, max_market_cap)
+        if fallback_df is not None and not fallback_df.empty:
+            if DEBUG_MODE:
+                st.warning(f"{msg}；{fallback_msg}")
+            return True, fallback_df, fallback_msg
+
+        return False, None, f"问财接口不可用且备用资金流也失败。问财错误：{msg}；备用错误：{fallback_msg}"
+
+    def filter_stocks(self, df: pd.DataFrame, max_range_change: float = 30.0) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        filtered_df = df.copy()
+
+        interval_pct_col = None
+        for col in filtered_df.columns:
+            col_s = str(col)
+            if "区间"in col_s and"涨跌幅"in col_s:
+                interval_pct_col = col
+                break
+        if interval_pct_col is None:
+            interval_pct_col = next((col for col in filtered_df.columns if "涨跌幅"in str(col)), None)
+
+        if interval_pct_col:
+            filtered_df[interval_pct_col] = pd.to_numeric(filtered_df[interval_pct_col], errors="coerce")
+            filtered_df = filtered_df[(filtered_df[interval_pct_col].isna()) | (filtered_df[interval_pct_col] < max_range_change)]
+
+        flow_col = None
+        for col in filtered_df.columns:
+            col_s = str(col)
+            if "主力"in col_s and"净流入"in col_s and ("额"in col_s or"金额"in col_s):
+                flow_col = col
+                break
+        if flow_col is None:
+            flow_col = next((col for col in filtered_df.columns if "净流入"in str(col)), None)
+        if flow_col:
+            filtered_df[flow_col] = pd.to_numeric(filtered_df[flow_col], errors="coerce")
+            filtered_df = filtered_df.sort_values(flow_col, ascending=False, na_position="last")
+
+        return filtered_df.reset_index(drop=True)
+
+class MainForceAnalyzer:
+    """主力选股AI分析引擎 (已接入终端主干 call_ai)"""
+    def __init__(self):
+        self.selector = MainForceStockSelector()
+        self.db = MainForceBatchDatabase()
+
+    def run_full_analysis(self, start_date, days_ago, final_n, max_range_change, min_market_cap, max_market_cap):
+        result = {'success': False, 'final_recommendations': [], 'error': None}
+        
+        # 1. 获取并筛选数据
+        success, raw_data, msg = self.selector.get_main_force_stocks(start_date, days_ago, min_market_cap, max_market_cap)
+        if not success:
+            result['error'] = msg
+            return result
+            
+        filtered_data = self.selector.filter_stocks(raw_data, max_range_change)
+        if filtered_data.empty:
+            result['error'] = "筛选后无符合条件的股票"
+            return result
+
+        self.raw_stocks = filtered_data
+        data_table_str = filtered_data.head(30).to_string(index=False) # 取前30只防止超Token
+        
+        # 2. 调用终端主干 call_ai 进行三大维度分析
+        summary_prompt = f"候选股票总数: {len(filtered_data)}只\n数据明细:\n{data_table_str}"
+        
+        with st.spinner("🤖 资金流向分析师正在评估..."):
+            fund_prompt = f"系统设定: 你是资金面分析专家。\n任务: 基于以下数据分析资金流向特征，识别主力意图，找出资金集中流入的板块和个股。\n{summary_prompt}"
+            self.fund_flow_analysis = call_ai(fund_prompt, temperature=0.3)
+
+        with st.spinner("📊 行业板块分析师正在扫描热点..."):
+            ind_prompt = f"系统设定: 你是行业板块分析专家。\n任务: 分析数据中的热点板块持续性，判断资金轮动方向，并评估各行业的后续基本面支撑。\n{summary_prompt}"
+            self.industry_analysis = call_ai(ind_prompt, temperature=0.3)
+
+        with st.spinner("📈 首席策略官正在进行最终研判并生成 JSON 推荐..."):
+            final_prompt = f"""
+            系统设定: 你是拥有20年经验的首席股票研究员。
+            请综合以下信息，从候选股票中精选出 {final_n} 只最优质标的：
+            【资金面观点】\n{self.fund_flow_analysis}\n
+            【行业面观点】\n{self.industry_analysis}\n
+            【原始数据】\n{data_table_str}\n
+            
+            务必严格按照以下 JSON 格式输出结果（不要输出任何多余的 Markdown 标记或其他文字，仅输出合法 JSON）：
+            {{
+              "recommendations": [
+                {{
+                  "rank": 1,
+                  "symbol": "股票代码",
+                  "name": "股票名称",
+                  "reasons": ["综合推荐理由1","理由2"],
+                  "position": "建议仓位(如20%)",
+                  "risks": "风险提示"
+                }}
+              ]
+            }}
+            """
+            final_resp = call_ai(final_prompt, temperature=0.2)
+            
+            # 解析 JSON
+            try:
+                json_match = re.search(r'```json\s*(\{.*?\})\s*```', final_resp, re.DOTALL)
+                json_str = json_match.group(1) if json_match else final_resp
+                parsed_json = json.loads(json_str)
+                result['final_recommendations'] = parsed_json.get('recommendations', [])
+                result['success'] = True
+                
+                # 存入本地数据库保存历史
+                self.db.save_analysis(len(filtered_data), len(result['final_recommendations']), json.dumps(result['final_recommendations'], ensure_ascii=False))
+            except Exception as e:
+                result['error'] = f"AI 输出 JSON 解析失败: {str(e)}。AI 原始回复: {final_resp[:200]}..."
+                
+        return result
+
+def render_main_force_tab():
+    """主力选股专属 UI 渲染器"""
+    st.markdown("### 🎯 主力资金选股 - 智能筛选与综合推演")
+    st.write("利用 `问财` 抓取海量主力净流入数据，通过AI多空博弈模型，为你精选极具爆发潜力的市场焦点。")
+    st.markdown("---")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        date_option = st.selectbox("监控时间区间", ["最近10天","最近30天","最近3个月"])
+        days_ago = 10 if date_option == "最近10天"else 30 if date_option =="最近30天"else 90
+    with col2:
+        final_n = st.slider("最终精选数量", 2, 10, 5)
+    with col3:
+        max_change = st.number_input("区间最大涨幅限制(%)", value=30.0, step=5.0, help="剔除已经大涨的高位股")
+
+    if st.button("🚀 启动主力追踪引擎", type="primary", width="stretch"):
+        if not api_key:
+            st.error("配置缺失: GROQ_API_KEY")
+            return
+            
+        analyzer = MainForceAnalyzer()
+        result = analyzer.run_full_analysis(
+            start_date=None, days_ago=days_ago, final_n=final_n, 
+            max_range_change=max_change, min_market_cap=30.0, max_market_cap=5000.0
+        )
+        
+        if result['success']:
+            st.success(f"✅ AI 军团测算完成！已为您锁定 {len(result['final_recommendations'])} 只优质标的。")
+            st.markdown("### ⭐ 首席精选标的池")
+            for rec in result['final_recommendations']:
+                with st.expander(f"🏅 TOP {rec.get('rank', '-')} | {rec.get('name', '未知')} ({rec.get('symbol', '未知')})", expanded=True):
+                    st.markdown("**📌 核心逻辑：**")
+                    for r in rec.get('reasons', []): st.write(f"- {r}")
+                    st.markdown(f"**💰 建议仓位：** {rec.get('position', 'N/A')}")
+                    st.markdown(f"**⚠️ 预警提示：** {rec.get('risks', 'N/A')}")
+            
+            st.markdown("---")
+            st.markdown("### 🤖 投研底稿 (AI 分析师原音)")
+            t1, t2 = st.tabs(["💰 资金流向透视","📊 行业格局研判"])
+            with t1: st.write(analyzer.fund_flow_analysis)
+            with t2: st.write(analyzer.industry_analysis)
+        else:
+            st.error(f"❌ 运行失败: {result['error']}")
+# ===================== 主力选股模块结束 =====================
+# ================= 终端全局看板 =================
+st.markdown("### 🌍 宏观市场实时看板")
+pulse_data = get_market_pulse()
+if pulse_data:
+    dash_cols = st.columns(len(pulse_data))
+    for idx, (key, data) in enumerate(pulse_data.items()):
+        with dash_cols[idx]:
+            with st.container(border=True):
+                if "CNH" in key:
+                    st.metric(key, f"{data['price']:.4f}", f"{data['pct']:.2f}%", delta_color="inverse")
+                else:
+                    st.metric(key, f"{data['price']:.2f}", f"{data['pct']:.2f}%")
+else:
+    st.warning("宏观看板数据流建立失败。")
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ================= 终端功能选项卡 =================
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🎯 I. 个股标的解析",
+    "📈 II. 宏观大盘推演",
+    "🔥 III. 资金热点板块",
+    "🦅 IV. 高阶情报终端",
+    "🐉 V. 智瞰龙虎榜解析",
+    "🐋 VI. 主力资金选股"     # 新增这一行
+])
+
+# ================= Tab 1: 个股解析 =================
+with tab1:
+    with st.container(border=True):
+        st.markdown("#### 🔎 个股雷达锁定（多维买卖点测算版）")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            symbol_input = st.text_input("标的代码", placeholder="例：600519")
+            analyze_btn = st.button("启动核心算法", type="primary", width="stretch")
+        if analyze_btn:
+            if not api_key:
+                st.error("配置缺失: GROQ_API_KEY")
+            elif len(symbol_input.strip()) != 6:
+                st.warning("代码规范验证失败")
+            else:
+                with st.spinner("量子计算与数据提取中 (启用四重行情数据引擎 + 多周期分析)..."):
+                    quote = get_stock_quote(symbol_input)
+                    df_kline = get_kline(symbol_input, days=220)
+                    mtf = get_multi_timeframe_analysis(symbol_input)
+                if not quote:
+                    st.error("无法捕获行情资产。")
+                else:
+                    st.markdown("---")
+                    name, price, pct = quote["name"], quote["price"], quote["pct"]
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric(f"{name}", f"{price:.2f}", f"{pct:.2f}%")
+                    c2.metric("总市值(亿)", f"{quote['market_cap']:.1f}")
+                    c3.metric("动态 PE", f"{quote['pe']}")
+                    c4.metric("换手率", f"{quote['turnover']:.2f}%")
+
+                    if df_kline is None or len(df_kline) < 15:
+                        st.warning("获取到的有效 K 线极少，仅能通过最新行情进行轻量化推演。")
+                        with st.spinner("🧠 首席策略官撰写资产评估报告..."):
+                            prompt = f"""
+作为顶级私募经理，请基于股票 {name}({symbol_input}) 当前状态：
+现价 {price}，涨跌幅 {pct}%，市值 {quote['market_cap']} 亿，动态 PE {quote['pe']}，换手率 {quote['turnover']}%。
+【请重点进行以下维度的分析】：
+1. 🏦 基本面诊断与资金意图盲猜
+2. ⚔️ 布局进入与离场推演：
+   - 【短期波段】进入点与离场点建议
+   - 【中长期配置】建仓点位与长线离场目标
+3. 结论定调：[看多 / 观察 / 谨慎 / 偏空]
+"""
+                            st.markdown(call_ai(prompt))
+                    else:
+                        df_kline = add_indicators(df_kline)
+                        tech = summarize_technicals(df_kline)
+                        smc = tech["smc"]
+                        fig = build_price_figure(df_kline)
+                        st.plotly_chart(fig, width="stretch")
+
+                        st.markdown("##### 🔬 核心技术指标与阻力测算")
+                        t1, t2, t3, t4 = st.columns(4)
+                        t1.metric("趋势", tech["trend"])
+                        t2.metric("RSI14", f"{tech['rsi14']:.2f}" if pd.notna(tech["rsi14"]) else "N/A")
+                        t3.metric("ATR14", f"{tech['atr14']:.2f}" if pd.notna(tech["atr14"]) else "N/A")
+                        t4.metric("MACD 状态", tech["macd_state"])
+                        t5, t6, t7, t8 = st.columns(4)
+                        t5.metric("布林状态", tech["bb_state"])
+                        t6.metric("量能状态", tech["vol_state"])
+                        t7.metric("BOS", tech["bos_state"])
+                        t8.metric("流动性扫盘", tech["sweep_state"])
+
+                        st.markdown("##### 🧩 FVG / ICT / SMC 结构信息")
+                        f1, f2 = st.columns(2)
+                        with f1:
+                            bull_fvg = tech["nearest_bull_fvg"]
+                            if bull_fvg:
+                                st.success(f"最近多头 FVG：{bull_fvg['date']} | 区间 {bull_fvg['bottom']:.2f} - {bull_fvg['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显多头 FVG")
+                            if smc["latest_bull_ob"]:
+                                st.success(f"最近多头 OB：{smc['latest_bull_ob']['date']} | 区间 {smc['latest_bull_ob']['bottom']:.2f} - {smc['latest_bull_ob']['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显多头 OB")
+                        with f2:
+                            bear_fvg = tech["nearest_bear_fvg"]
+                            if bear_fvg:
+                                st.error(f"最近空头 FVG：{bear_fvg['date']} | 区间 {bear_fvg['bottom']:.2f} - {bear_fvg['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显空头 FVG")
+                            if smc["latest_bear_ob"]:
+                                st.error(f"最近空头 OB：{smc['latest_bear_ob']['date']} | 区间 {smc['latest_bear_ob']['bottom']:.2f} - {smc['latest_bear_ob']['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显空头 OB")
+
+                        st.markdown("##### 🏗️ 市场结构补充")
+                        s1, s2, s3 = st.columns(3)
+                        eqh_count = len(smc["eqh"]) if smc["eqh"] else 0
+                        eql_count = len(smc["eql"]) if smc["eql"] else 0
+                        pd_zone = smc["pd_zone"]["zone"] if smc["pd_zone"] else "N/A"
+                        s1.metric("MSS", smc["mss"])
+                        s2.metric("EQH / EQL", f"{eqh_count} / {eql_count}")
+                        s3.metric("P/D Zone", pd_zone)
+                        latest_close = tech["latest_close"]
+
+                        support_zone = min(tech["ema_short"], tech["ema_mid"])
+                        pressure_zone = max(tech["ema_short"], tech["ema_mid"])
+                        st.markdown("##### 🎯 动态支撑 / 压力")
+                        z1, z2, z3 = st.columns(3)
+                        z1.metric("最新收盘", f"{latest_close:.2f}")
+                        z2.metric("动态支撑参考", f"{support_zone:.2f}")
+                        z3.metric("动态压力参考", f"{pressure_zone:.2f}")
+
+                    st.markdown("##### ⏱️ 多周期技术分析")
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        tf = mtf["15m"]
+                        st.markdown("**15分钟级别**")
+                        st.metric("偏向", tf["bias"])
+                        st.metric("趋势", tf["trend"])
+                        st.metric("MACD", tf["macd_state"])
+                        if tf["rsi"] is not None:
+                            st.metric("RSI", f"{tf['rsi']:.2f}")
+                        if tf["support"] is not None:
+                            st.caption(f"支撑: {tf['support']:.2f}")
+                        if tf["pressure"] is not None:
+                            st.caption(f"压力: {tf['pressure']:.2f}")
+                    with m2:
+                        tf = mtf["60m"]
+                        st.markdown("**60分钟级别**")
+                        st.metric("偏向", tf["bias"])
+                        st.metric("趋势", tf["trend"])
+                        st.metric("MACD", tf["macd_state"])
+                        if tf["rsi"] is not None:
+                            st.metric("RSI", f"{tf['rsi']:.2f}")
+                        if tf["support"] is not None:
+                            st.caption(f"支撑: {tf['support']:.2f}")
+                        if tf["pressure"] is not None:
+                            st.caption(f"压力: {tf['pressure']:.2f}")
+                    with m3:
+                        tf = mtf["120m"]
+                        st.markdown("**120分钟级别**")
+                        st.metric("偏向", tf["bias"])
+                        st.metric("趋势", tf["trend"])
+                        st.metric("MACD", tf["macd_state"])
+                        if tf["rsi"] is not None:
+                            st.metric("RSI", f"{tf['rsi']:.2f}")
+                        if tf["support"] is not None:
+                            st.caption(f"支撑: {tf['support']:.2f}")
+                        if tf["pressure"] is not None:
+                            st.caption(f"压力: {tf['pressure']:.2f}")
+
+                    st.markdown("##### 🧠 多周期综合结论")
+                    st.info(f"综合结论：**{mtf['final_view']}**")
+
+                    with st.spinner(f"🧠 首席策略官正在使用 {selected_model} 进行多维深度解构..."):
+                        if df_kline is not None and len(df_kline) >= 15:
+                            tech = summarize_technicals(add_indicators(df_kline))
+                            smc = tech["smc"]
+                            ema_mid_val = f"{tech['ema_mid']:.2f}" if pd.notna(tech['ema_mid']) else "数据不足"
+                            ema_long_val = f"{tech['ema_long']:.2f}" if pd.notna(tech['ema_long']) else "数据不足"
+                            prompt = f"""
+你现在是顶级私募基金的操盘手（精通基本面、量价资金博弈、多周期共振）。
+请对股票 {name}({symbol_input}) 做一份极具实战价值的【估值 + 资金流 + 支撑/压力 + 精准买卖点 + 多周期共振】综合研判。
+【基础与资金博弈数据】
+- 现价: {price} (日涨跌幅: {pct}%)
+- 总市值: {quote['market_cap']} 亿 | 动态 PE: {quote['pe']} | 市净率 PB: {quote['pb']}
+- 当日换手率: {quote['turnover']}%
+- 近期量能状态: {tech['vol_state']}
+【核心日线技术与结构数据】
+- 趋势状态: {tech['trend']} | RSI14: {tech['rsi14']}
+- 最新收盘: {tech['latest_close']}
+- 短期生命线 (EMA{ema_short}): {tech['ema_short']}
+- 中长期基准 (EMA{ema_mid}/{ema_long}): {ema_mid_val} / {ema_long_val}
+- 结构特征: BOS({tech['bos_state']}), MSS({smc['mss']})
+- 异常流动性: 扫盘({tech['sweep_state']})
+- 核心磁区 (FVG/OB):
+  近期多头 FVG: {tech['nearest_bull_fvg']}
+  近期空头 FVG: {tech['nearest_bear_fvg']}
+  近期多头 OB: {smc['latest_bull_ob']}
+  近期空头 OB: {smc['latest_bear_ob']}
+【多周期分析】
+- 15分钟: {mtf['15m']}
+- 60分钟: {mtf['60m']}
+- 120分钟: {mtf['120m']}
+- 多周期综合结论: {mtf['final_view']}
+【请务必输出】
+1. 🏦 基本面与估值定位
+2. 🌊 资金面穿透
+3. 🎯 支撑与压力测算
+4. ⚔️ 布局进入与离场推演
+   - 【短期波段】
+   - 【中长期配置】
+5. ⏱️ 多周期共振判断
+   - 15分钟、60分钟、120分钟是否共振
+   - 是适合追涨、低吸、等回踩，还是观望
+6. 最后给出一句明确结论：强势看多 / 偏多观察 / 震荡等待 / 谨慎偏空
+要求：语言要专业、直接、机构化，不能空话，尽量像真正交易员盘前计划。
+"""
+                            st.markdown(call_ai(prompt))
+                        else:
+                            prompt = f"""
+你现在是顶级私募基金操盘手。
+请基于股票 {name}({symbol_input}) 当前基础数据与多周期结论做综合研判。
+【基础数据】
+- 现价: {price}
+- 日涨跌幅: {pct}%
+- 市值: {quote['market_cap']} 亿
+- 动态 PE: {quote['pe']}
+- 市净率 PB: {quote['pb']}
+- 换手率: {quote['turnover']}%
+【多周期分析】
+- 15分钟: {mtf['15m']}
+- 60分钟: {mtf['60m']}
+- 120分钟: {mtf['120m']}
+- 多周期综合结论: {mtf['final_view']}
+请输出：
+1. 当前股性判断
+2. 多周期共振解读
+3. 短线交易建议
+4. 中线观察建议
+5. 最后一行给明确结论：看多 / 观察 / 谨慎 / 偏空
+"""
+                            st.markdown(call_ai(prompt))
+
+# ================= Tab 2: 宏观大盘推演 (已升级为多智能体版本) =================
+with tab2:
+    with st.container(border=True):
+        st.markdown("#### 📊 全局宏观基本面推演")
+        display_macro_analysis_ui()
+
+
+# ================= Tab 3: 热点资金板块 =================
+with tab3:
+    with st.container(border=True):
+        st.markdown("#### 🔥 当日主力资金狂欢地 (附实战标的推荐)")
+        st.write("追踪全天涨幅最猛的行业板块，揪出领涨龙头，识别主线题材，并生成配置标的清单。")
+        if st.button("扫描板块与生成配置推荐", type="primary"):
+            if not api_key:
+                st.error("配置缺失: GROQ_API_KEY")
+            else:
+                with st.spinner("深潜获取东方财富板块异动数据... (若遇熔断将自动切换备用数据源)"):
+                    blocks = get_hot_blocks()
+                    if blocks:
+                        df_blocks = pd.DataFrame(blocks)
+                        st.dataframe(df_blocks, width="stretch", hide_index=True)
+                        with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
+                            blocks_str = "\n".join([f"{b['板块名称']} (涨幅:{b['涨跌幅']}%, 领涨龙头:{b['领涨股票']})"for b in blocks[:5]])
+                            prompt = f"""
+作为顶级游资操盘手，请深度解读今日最强的 5 个板块及其领涨龙头：
+{blocks_str}
+请输出：
+1. 【核心驱动】这些板块背后的底层逻辑或共振政策利好是什么？
+2. 【行情定性】这是存量博弈的一日游情绪宣泄，还是具备中线发酵潜力的主线？
+3. 🎯 【个股配置与实战推荐】：
+   基于上述板块逻辑和领涨股票，为散户推荐 2-3 只可以进行重点配置或埋伏的股票。
+   对于推荐的每一只股票，请务必写明：
+   - 股票名称与行业归属
+   - 核心配置理由
+   - 建议的入场姿势
+"""
+                            st.markdown(call_ai(prompt, temperature=0.4))
+                    else:
+                        st.error("获取板块数据失败，所有接口均处于熔断保护期。")
+
+# ================= Tab 4: 高阶情报终端 =================
+with tab4:
+    st.markdown("#### 📡 机构级事件图谱与智能评级矩阵")
+    st.write("追踪彭博、推特、美联储、特朗普等宏观变量。已深度适配移动端，引入极客量化风控模块。")
+    if st.button("🚨 截获并解析全球突发", type="primary"):
+        if not api_key:
+            st.error("配置缺失: GROQ_API_KEY")
+        else:
+            with st.spinner("监听全网节点并执行深度 NLP 解析..."):
+                global_news = get_global_news()
+                if not global_news:
+                    st.warning("当前信号静默或被防火墙拦截。")
+                else:
+                    news_text = "\n".join(global_news)
+                    with st.expander("🕵️‍♂️ 查看底层监听流 (Raw Data)"):
+                        st.text(news_text)
+                    with st.spinner("🧠 情报官正在生成自适应移动端的情报卡片..."):
+                        prompt = f"""
+你现在是华尔街顶级对冲基金的【首席宏观情报官】与【高阶量化风控专家】。
+我截获了全球金融市场的底层快讯流。请你挑选出最具爆炸性和市场影响力的 5-8 条动态。
+重点寻猎靶标：彭博社 (Bloomberg)、推特 (X)、特朗普 (Trump)、马斯克 (Musk)、美联储，以及任何可能引发流动性危机或资金抱团退潮的事件。
+⚠️ 【排版严令：禁止使用 Markdown 表格】 ⚠️
+为了适配移动端设备的终端显示，你绝对不能使用表格！必须为每一个事件生成一个独立的情报卡片。
+输出格式必须如下：
+### [评级 Emoji] [[信源/人物]] [真实事件标题]
+* ⏰ **时间截获**: [提取对应时间]
+* 📝 **情报简述**: [说明发生了什么]
+* 🎯 **受波及资产**: [指出利好/利空资产]
+* 🧠 **沙盘推演**: [一句话指出实质影响]
+* ☢️ **风控预警**: [一个简短硬核预警]
+---
+评级标准：
+🔴 核心：直接引发巨震的突发、大选级人物强硬表态、黑天鹅事件
+🟡 重要：关键经济数据、行业重磅政策、流动性显著异动
+🔵 一般：常规宏观事件
+底层情报数据流：
+{news_text}
+"""
+                        report = call_ai(prompt, temperature=0.2)
+                        st.markdown("---")
+                        st.markdown(report)
+
+# ================= Tab 5: 智瞰龙虎榜解析 =================
+with tab5:
+    with st.container(border=True):
+        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群")
+        st.write("获取游资动态，挖掘次日爆发潜力股，识别高风险陷阱。")
+
+        col_date, col_btn = st.columns([1, 2])
+        with col_date:
+            lhb_date = st.date_input("选择龙虎榜日期", datetime.now() - timedelta(days=1))
+        with col_btn:
+            st.write("") # 占位用于垂直对齐
+            run_lhb_btn = st.button("🚀 启动智瞰龙虎分析集群", type="primary", width="stretch")
+
+        if run_lhb_btn:
+            if not api_key:
+                st.error("配置缺失: GROQ_API_KEY")
+            else:
+                date_str = lhb_date.strftime('%Y-%m-%d')
+                with st.spinner(f"正在深入节点获取 {date_str} 龙虎榜数据..."):
+                    fetcher = LonghubangDataFetcher()
+                    raw_result = fetcher.get_longhubang_data(date_str)
+
+                if raw_result and raw_result.get('data'):
+                    data_list = raw_result['data']
+                    summary = fetcher.analyze_data_summary(data_list)
+                    formatted_data = fetcher.format_data_for_ai(data_list, summary)
+
+                    st.success(f"✓ 成功获取 {len(data_list)} 条记录！激活AI集群协同计算...")
+
+                    agents = LonghubangAgents()
+                    all_analyses = []
+
+                    # 1. 游资行为分析
+                    with st.spinner("🎯 游资行为分析师正在勾勒画像..."):
+                        yz_res = agents.youzi_behavior_analyst(formatted_data, summary)
+                        all_analyses.append(yz_res)
+                        with st.expander("🎯 游资行为分析报告", expanded=False):
+                            st.markdown(yz_res['analysis'])
+
+                    # 2. 个股潜力分析
+                    with st.spinner("📈 个股潜力分析师正在深度挖掘爆发股..."):
+                        stock_res = agents.stock_potential_analyst(formatted_data, summary)
+                        all_analyses.append(stock_res)
+                        with st.expander("📈 个股潜力分析报告", expanded=False):
+                            st.markdown(stock_res['analysis'])
+
+                    # 3. 题材追踪分析
+                    with st.spinner("🔥 题材追踪分析师正在定位主线轮动..."):
+                        theme_res = agents.theme_tracker_analyst(formatted_data, summary)
+                        all_analyses.append(theme_res)
+                        with st.expander("🔥 题材追踪分析报告", expanded=False):
+                            st.markdown(theme_res['analysis'])
+
+                    # 4. 风险控制分析
+                    with st.spinner("⚠️ 风险控制专家正在排除雷区与资金陷阱..."):
+                        risk_res = agents.risk_control_specialist(formatted_data, summary)
+                        all_analyses.append(risk_res)
+                        with st.expander("⚠️ 风险控制扫描报告", expanded=False):
+                            st.markdown(risk_res['analysis'])
+
+                    # 5. 首席策略师综合评估
+                    with st.spinner("👔 首席策略师正在综合各方情报，生成最终军令状..."):
+                        chief_res = agents.chief_strategist(all_analyses)
+                        st.markdown("### 👔 首席策略师最终研判")
+                        st.markdown(chief_res['analysis'])
+                else:
+                    st.error(f"未能获取到 {date_str} 的龙虎榜数据，该日可能为周末或 API 暂时受限。")
+# ================= Tab 6: 主力资金选股 =================
+with tab6:
+    render_main_force_tab()
