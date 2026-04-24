@@ -1525,7 +1525,13 @@ class LonghubangAgents:
 # ==========================================
 # ===================== 新增：主力资金选股整合模块 =====================
 # =====================================================================
-import pywencai
+# 版本说明：
+# 1. 彻底移除“启动后长期卡住”的高耗时路径：默认不再调用 pywencai，也不再调用 AKShare 的分页资金流接口。
+# 2. 主数据源改为东方财富轻量 clist 接口，一次请求拉取候选池，通常数秒内返回。
+# 3. 即使外部接口失败，也会立刻进入内置观察池，不让页面长时间转圈。
+# 4. AI 分析从原来的三次串行调用压缩为一次调用；先展示量化结果，再生成 AI 解读。
+# 5. JSON 解析失败也不再报错，直接使用量化打分结果兜底。
+
 import sqlite3
 import json
 import re
@@ -1537,60 +1543,74 @@ class MainForceBatchDatabase:
         self._init_database()
 
     def _init_database(self):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS batch_analysis_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                analysis_date TEXT NOT NULL,
-                batch_count INTEGER NOT NULL,
-                success_count INTEGER NOT NULL,
-                results_json TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS batch_analysis_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    analysis_date TEXT NOT NULL,
+                    batch_count INTEGER NOT NULL,
+                    success_count INTEGER NOT NULL,
+                    results_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
     def save_analysis(self, batch_count, success_count, results_json):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        analysis_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute('''
-            INSERT INTO batch_analysis_history 
-            (analysis_date, batch_count, success_count, results_json)
-            VALUES (?, ?, ?, ?)
-        ''', (analysis_date, batch_count, success_count, results_json))
-        conn.commit()
-        conn.close()
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            analysis_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute('''
+                INSERT INTO batch_analysis_history 
+                (analysis_date, batch_count, success_count, results_json)
+                VALUES (?, ?, ?, ?)
+            ''', (analysis_date, batch_count, success_count, results_json))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
 class MainForceStockSelector:
-    """主力资金数据获取与清洗类（稳定版）
+    """主力资金快速选股器。
 
-    修复点：
-    1. 问财接口返回 None 或云端被拦截时，不再直接报错。
-    2. 问财失败后，自动切换 AKShare/东方财富资金流。
-    3. 备用资金流超时后，继续切换 A股实时行情热度池。
-    4. 所有外部数据源都失败时，使用内置观察池兜底，保证页面一定有结果返回。
+    设计目标：宁愿少抓一点数据，也不要让 Streamlit Cloud 一直卡住。
+    数据优先级：
+    1. 东方财富轻量 clist 接口：快，单次请求，适合云端。
+    2. 内置核心观察池：外部接口不稳定时兜底。
     """
 
     DEFAULT_POOL = [
-        {"股票代码": "600519", "股票简称": "贵州茅台", "所属行业": "食品饮料"},
-        {"股票代码": "300750", "股票简称": "宁德时代", "所属行业": "电池"},
-        {"股票代码": "601318", "股票简称": "中国平安", "所属行业": "保险"},
-        {"股票代码": "600036", "股票简称": "招商银行", "所属行业": "银行"},
-        {"股票代码": "300059", "股票简称": "东方财富", "所属行业": "证券"},
-        {"股票代码": "002475", "股票简称": "立讯精密", "所属行业": "消费电子"},
-        {"股票代码": "002371", "股票简称": "北方华创", "所属行业": "半导体"},
-        {"股票代码": "688981", "股票简称": "中芯国际", "所属行业": "半导体"},
-        {"股票代码": "300308", "股票简称": "中际旭创", "所属行业": "算力AI"},
-        {"股票代码": "601138", "股票简称": "工业富联", "所属行业": "算力AI"},
-        {"股票代码": "002594", "股票简称": "比亚迪", "所属行业": "汽车整车"},
-        {"股票代码": "600276", "股票简称": "恒瑞医药", "所属行业": "创新药"},
-        {"股票代码": "601899", "股票简称": "紫金矿业", "所属行业": "有色金属"},
-        {"股票代码": "600547", "股票简称": "山东黄金", "所属行业": "黄金"},
-        {"股票代码": "601888", "股票简称": "中国中免", "所属行业": "旅游零售"},
+        {"股票代码": "600519", "股票简称": "贵州茅台", "所属行业": "食品饮料", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "300750", "股票简称": "宁德时代", "所属行业": "电池", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "601318", "股票简称": "中国平安", "所属行业": "保险", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "600036", "股票简称": "招商银行", "所属行业": "银行", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "300059", "股票简称": "东方财富", "所属行业": "证券", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "002475", "股票简称": "立讯精密", "所属行业": "消费电子", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "002371", "股票简称": "北方华创", "所属行业": "半导体", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "688981", "股票简称": "中芯国际", "所属行业": "半导体", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "300308", "股票简称": "中际旭创", "所属行业": "算力AI", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "601138", "股票简称": "工业富联", "所属行业": "算力AI", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "002594", "股票简称": "比亚迪", "所属行业": "汽车整车", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "600276", "股票简称": "恒瑞医药", "所属行业": "创新药", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "601899", "股票简称": "紫金矿业", "所属行业": "有色金属", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "600547", "股票简称": "山东黄金", "所属行业": "黄金", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
+        {"股票代码": "688523", "股票简称": "航天环宇", "所属行业": "国防军工", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
     ]
+
+    INDUSTRY_HINTS = {
+        "银行": ["银行"], "证券": ["券商", "证券"], "保险": ["保险"],
+        "半导体": ["半导体", "芯片", "集成电路"], "算力AI": ["AI", "算力", "光模块", "服务器"],
+        "电池": ["新能源", "锂电", "电池"], "消费电子": ["消费电子", "苹果", "机器人"],
+        "食品饮料": ["消费", "白酒"], "创新药": ["医药", "创新药"],
+        "有色金属": ["有色", "铜", "铝"], "黄金": ["黄金", "避险"],
+        "汽车整车": ["汽车", "新能源车"], "国防军工": ["军工", "低空经济", "航天"]
+    }
 
     def _normalize_code(self, value):
         if pd.isna(value):
@@ -1599,410 +1619,297 @@ class MainForceStockSelector:
         m = re.search(r"(\d{6})", text)
         return m.group(1) if m else text.zfill(6)[-6:]
 
-    def _find_col(self, df: pd.DataFrame, keywords: List[str], exclude: List[str] | None = None):
-        exclude = exclude or []
-        for col in df.columns:
-            c = str(col)
-            if all(k in c for k in keywords) and not any(e in c for e in exclude):
-                return col
-        return None
-
-    def _standardize_columns(self, df: pd.DataFrame, source: str = "unknown") -> pd.DataFrame:
-        """把不同接口返回的列名统一，避免后续 AI 和筛选层报错。"""
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        out = df.copy()
-        code_col = self._find_col(out, ["代码"]) or self._find_col(out, ["股票代码"]) or self._find_col(out, ["code"])
-        name_col = self._find_col(out, ["名称"]) or self._find_col(out, ["简称"]) or self._find_col(out, ["股票简称"]) or self._find_col(out, ["name"])
-        industry_col = self._find_col(out, ["行业"]) or self._find_col(out, ["所属行业"])
-        pct_col = self._find_col(out, ["涨跌幅"]) or self._find_col(out, ["涨幅"])
-        close_col = self._find_col(out, ["最新价"]) or self._find_col(out, ["收盘"]) or self._find_col(out, ["现价"])
-        amount_col = self._find_col(out, ["成交额"]) or self._find_col(out, ["成交金额"])
-        turnover_col = self._find_col(out, ["换手率"])
-        market_cap_col = self._find_col(out, ["总市值"]) or self._find_col(out, ["市值"])
-        pe_col = self._find_col(out, ["市盈率"], exclude=["静态"])
-
-        # 主力净流入列名差异较大，优先找“主力+净流入”，再找“净额/净流入”。
-        main_net_col = None
-        for col in out.columns:
-            c = str(col)
-            if ("主力" in c and "净" in c) or ("净流入" in c) or ("净额" in c):
-                main_net_col = col
-                break
-
-        std = pd.DataFrame()
-        if code_col:
-            std["股票代码"] = out[code_col].apply(self._normalize_code)
-        else:
-            std["股票代码"] = [f"POOL{i:06d}" for i in range(len(out))]
-
-        std["股票简称"] = out[name_col].astype(str) if name_col else std["股票代码"]
-        std["所属行业"] = out[industry_col].astype(str) if industry_col else "未分类"
-        std["区间涨跌幅"] = pd.to_numeric(out[pct_col], errors="coerce") if pct_col else 0.0
-        std["最新价"] = pd.to_numeric(out[close_col], errors="coerce") if close_col else 0.0
-        std["主力净流入"] = pd.to_numeric(out[main_net_col], errors="coerce") if main_net_col else 0.0
-        std["成交额"] = pd.to_numeric(out[amount_col], errors="coerce") if amount_col else 0.0
-        std["换手率"] = pd.to_numeric(out[turnover_col], errors="coerce") if turnover_col else 0.0
-        std["总市值"] = pd.to_numeric(out[market_cap_col], errors="coerce") if market_cap_col else 0.0
-        std["市盈率"] = out[pe_col] if pe_col else "-"
-        std["数据源"] = source
-
-        # 如果总市值单位看起来是“元”，转成“亿”；如果本来就是亿，则保持。
-        std["总市值"] = pd.to_numeric(std["总市值"], errors="coerce").fillna(0.0)
-        std.loc[std["总市值"] > 1000000, "总市值"] = std.loc[std["总市值"] > 1000000, "总市值"] / 100000000
-
+    def _standardize_numeric(self, df):
         numeric_cols = ["区间涨跌幅", "最新价", "主力净流入", "成交额", "换手率", "总市值"]
         for col in numeric_cols:
-            std[col] = pd.to_numeric(std[col], errors="coerce").fillna(0.0)
+            if col not in df.columns:
+                df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        if "市盈率" not in df.columns:
+            df["市盈率"] = "-"
+        if "所属行业" not in df.columns:
+            df["所属行业"] = "未分类"
+        return df
 
-        std = std[std["股票代码"].astype(str).str.match(r"^\d{6}$", na=False)]
-        std = std.drop_duplicates(subset=["股票代码"]).reset_index(drop=True)
-        return std
+    def _infer_industry(self, name: str):
+        name = str(name)
+        for industry, keys in self.INDUSTRY_HINTS.items():
+            if any(k in name for k in keys):
+                return industry
+        return "未分类"
 
-    def _safe_wencai_get(self, query: str):
+    def _fetch_eastmoney_fast_pool(self, pz=220):
+        """东方财富轻量实时列表。只请求一页，避免 AKShare 多页 tqdm 卡住。"""
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1",
+            "pz": str(pz),
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f6",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f2,f3,f6,f8,f9,f12,f14,f20,f21,f62,f184"
+        }
         try:
-            data = pywencai.get(query=query, loop=True)
-            if data is None:
-                return None, "问财返回空值"
-            if isinstance(data, pd.DataFrame):
-                if data.empty:
-                    return None, "问财返回空表"
-                return data, "问财成功"
-            try:
-                df = pd.DataFrame(data)
-                if df.empty:
-                    return None, "问财返回数据无法转为有效表格"
-                return df, "问财成功"
-            except Exception as exc:
-                return None, f"问财返回结构异常: {exc}"
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Referer": "https://quote.eastmoney.com/center/gridlist.html"
+            }
+            res = SESSION.get(url, params=params, headers=headers, timeout=8)
+            res.raise_for_status()
+            js = res.json()
+            diff = ((js or {}).get("data") or {}).get("diff") or []
+            if not diff:
+                return pd.DataFrame(), "东方财富轻量接口返回空"
+
+            rows = []
+            for item in diff:
+                code = self._normalize_code(item.get("f12", ""))
+                name = str(item.get("f14", ""))
+                if not re.match(r"^\d{6}$", code):
+                    continue
+                if "ST" in name or "退" in name:
+                    continue
+                amount = safe_float(item.get("f6"))
+                pct = safe_float(item.get("f3"))
+                turnover = safe_float(item.get("f8"))
+                market_cap = safe_float(item.get("f20")) / 100000000 if safe_float(item.get("f20")) > 1000000 else safe_float(item.get("f20"))
+                main_net = safe_float(item.get("f62"))
+                if main_net == 0:
+                    main_net = amount * (max(min(pct, 10), -10) / 100.0)
+                rows.append({
+                    "股票代码": code,
+                    "股票简称": name,
+                    "所属行业": self._infer_industry(name),
+                    "区间涨跌幅": pct,
+                    "最新价": safe_float(item.get("f2")),
+                    "主力净流入": main_net,
+                    "成交额": amount,
+                    "换手率": turnover,
+                    "总市值": market_cap,
+                    "市盈率": item.get("f9", "-"),
+                    "资金热度分": 0.0,
+                    "数据源": "东方财富轻量实时池"
+                })
+            df = pd.DataFrame(rows)
+            if df.empty:
+                return pd.DataFrame(), "东方财富轻量接口无有效股票"
+            return self._score_candidates(df), f"东方财富轻量接口成功获取{len(df)}只候选股票"
         except Exception as exc:
-            return None, f"问财接口异常: {exc}"
-
-    def _fetch_wencai(self, start_date, min_market_cap, max_market_cap):
-        query = (
-            f"{start_date}以来主力资金净流入前100名，并计算区间涨跌幅，"
-            f"市值{min_market_cap}-{max_market_cap}亿，非ST，所属行业，总市值，市盈率"
-        )
-        raw, msg = self._safe_wencai_get(query)
-        if raw is None:
-            return pd.DataFrame(), msg
-        df = self._standardize_columns(raw, source="问财")
-        return df, f"问财成功获取{len(df)}只股票"
-
-    def _fetch_ak_fund_flow(self):
-        """AKShare 东方财富资金流排行。可能在云端超时，所以只作为一个来源，不作为唯一来源。"""
-        errors = []
-        for func_name, kwargs in [
-            ("stock_individual_fund_flow_rank", {"indicator": "今日"}),
-            ("stock_individual_fund_flow_rank", {"indicator": "5日"}),
-            ("stock_individual_fund_flow_rank", {"indicator": "10日"}),
-        ]:
-            try:
-                func = getattr(ak, func_name)
-                df = func(**kwargs)
-                std = self._standardize_columns(df, source=f"AKShare资金流-{kwargs.get('indicator')}")
-                if not std.empty:
-                    return std, f"AKShare资金流成功获取{len(std)}只股票"
-            except Exception as exc:
-                errors.append(str(exc))
-                continue
-        return pd.DataFrame(), "AKShare资金流不可用: " + "；".join(errors[-2:])
-
-    def _fetch_spot_hot_pool(self):
-        """行情热度池兜底：不要求主力净流入字段，用成交额、涨幅、换手率构造资金热度。"""
-        try:
-            spot = ak.stock_zh_a_spot_em()
-            std = self._standardize_columns(spot, source="AKShare实时行情热度池")
-            if std.empty:
-                return pd.DataFrame(), "实时行情热度池为空"
-            # 剔除极端无效值，构造一个资金热度分。
-            std = std[(std["最新价"] > 0) & (~std["股票简称"].str.contains("ST|退", na=False))].copy()
-            std["资金热度分"] = (
-                std["成交额"].rank(pct=True).fillna(0) * 45
-                + std["换手率"].rank(pct=True).fillna(0) * 25
-                + std["区间涨跌幅"].rank(pct=True).fillna(0) * 20
-                + std["总市值"].rank(pct=True).fillna(0) * 10
-            )
-            # 没有主力净流入时，用成交额方向性近似，避免后续为空。
-            std["主力净流入"] = std["成交额"] * (std["区间涨跌幅"].clip(lower=-10, upper=10) / 100)
-            std = std.sort_values("资金热度分", ascending=False).head(120)
-            return std, f"实时行情热度池成功获取{len(std)}只候选股票"
-        except Exception as exc:
-            return pd.DataFrame(), f"实时行情热度池异常: {exc}"
+            return pd.DataFrame(), f"东方财富轻量接口异常: {exc}"
 
     def _fetch_static_pool(self):
-        df = pd.DataFrame(self.DEFAULT_POOL)
-        std = self._standardize_columns(df, source="内置兜底观察池")
-        # 尽量补充实时行情，补不到也不影响输出。
+        df = pd.DataFrame(self.DEFAULT_POOL).copy()
+        df["数据源"] = "内置兜底观察池"
+        df = self._standardize_numeric(df)
         rows = []
-        for _, row in std.iterrows():
+        # 只补前 8 只，避免挨个请求导致卡顿。
+        for idx, row in df.iterrows():
             item = row.to_dict()
-            try:
-                q = get_stock_quote(item["股票代码"])
-                if q:
-                    item["最新价"] = q.get("price", item.get("最新价", 0))
-                    item["区间涨跌幅"] = q.get("pct", item.get("区间涨跌幅", 0))
-                    item["总市值"] = q.get("market_cap", item.get("总市值", 0))
-                    item["市盈率"] = q.get("pe", item.get("市盈率", "-"))
-                    item["换手率"] = q.get("turnover", item.get("换手率", 0))
-            except Exception:
-                pass
+            if idx < 8:
+                try:
+                    q = get_stock_quote(item["股票代码"])
+                    if q:
+                        item["最新价"] = q.get("price", item.get("最新价", 0))
+                        item["区间涨跌幅"] = q.get("pct", item.get("区间涨跌幅", 0))
+                        item["总市值"] = q.get("market_cap", item.get("总市值", 0))
+                        item["市盈率"] = q.get("pe", item.get("市盈率", "-"))
+                        item["换手率"] = q.get("turnover", item.get("换手率", 0))
+                except Exception:
+                    pass
             rows.append(item)
         final_df = pd.DataFrame(rows)
-        final_df["资金热度分"] = 60
-        return final_df, f"外部资金流接口均不可用，已启用内置观察池{len(final_df)}只"
+        return self._score_candidates(final_df), f"已启用内置观察池{len(final_df)}只"
+
+    def _score_candidates(self, df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        df = self._standardize_numeric(df)
+        df["股票代码"] = df["股票代码"].apply(self._normalize_code)
+        df = df[df["股票代码"].astype(str).str.match(r"^\d{6}$", na=False)]
+        df = df.drop_duplicates(subset=["股票代码"]).reset_index(drop=True)
+        if df.empty:
+            return df
+
+        # 热度评分：不用等待精确资金流，快速给出可排序结果。
+        df["成交额_rank"] = df["成交额"].rank(pct=True).fillna(0)
+        df["换手率_rank"] = df["换手率"].rank(pct=True).fillna(0)
+        df["涨幅_rank"] = df["区间涨跌幅"].rank(pct=True).fillna(0)
+        df["净流入_rank"] = df["主力净流入"].rank(pct=True).fillna(0)
+        df["资金热度分"] = (
+            df["成交额_rank"] * 35
+            + df["换手率_rank"] * 25
+            + df["净流入_rank"] * 25
+            + df["涨幅_rank"] * 15
+        ).round(2)
+        return df.drop(columns=["成交额_rank", "换手率_rank", "涨幅_rank", "净流入_rank"], errors="ignore")
 
     def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
-        messages = []
-        try:
-            if not start_date:
-                date_obj = datetime.now() - timedelta(days=days_ago or 10)
-                start_date = f"{date_obj.year}年{date_obj.month}月{date_obj.day}日"
+        # 只走快速路径，不再调用 pywencai/AKShare分页资金流，避免长时间转圈。
+        df, msg = self._fetch_eastmoney_fast_pool(pz=220)
+        if df.empty:
+            df, msg2 = self._fetch_static_pool()
+            msg = f"{msg}；{msg2}"
+        if df.empty:
+            return False, pd.DataFrame(), "所有快速数据源均为空"
+        return True, df, msg
 
-            # 1. 问财
-            df, msg = self._fetch_wencai(start_date, min_market_cap, max_market_cap)
-            messages.append(msg)
-            if df is not None and not df.empty:
-                return True, df, "；".join(messages)
-
-            # 2. AKShare/东财资金流
-            df, msg = self._fetch_ak_fund_flow()
-            messages.append(msg)
-            if df is not None and not df.empty:
-                return True, df, "；".join(messages)
-
-            # 3. 实时行情热度池
-            df, msg = self._fetch_spot_hot_pool()
-            messages.append(msg)
-            if df is not None and not df.empty:
-                return True, df, "；".join(messages)
-
-            # 4. 内置观察池兜底：保证模块不因外部接口不可用而失败
-            df, msg = self._fetch_static_pool()
-            messages.append(msg)
-            return True, df, "；".join(messages)
-
-        except Exception as exc:
-            # 最后一层防崩：任何未知异常都启用内置观察池
-            df, msg = self._fetch_static_pool()
-            messages.append(f"未知异常: {exc}")
-            messages.append(msg)
-            return True, df, "；".join(messages)
-
-    def filter_stocks(self, df: pd.DataFrame, max_range_change: float = 30.0) -> pd.DataFrame:
+    def filter_stocks(self, df: pd.DataFrame, max_range_change=30.0, min_market_cap=10.0, max_market_cap=5000.0):
         if df is None or df.empty:
             return pd.DataFrame()
         filtered_df = df.copy()
-
+        filtered_df = self._standardize_numeric(filtered_df)
+        filtered_df = filtered_df[~filtered_df["股票简称"].astype(str).str.contains("ST|退", na=False)]
         if "区间涨跌幅" in filtered_df.columns:
-            filtered_df["区间涨跌幅"] = pd.to_numeric(filtered_df["区间涨跌幅"], errors="coerce").fillna(0)
-            # 只剔除明显过热高位，不剔除下跌股，保留低位资金回流机会。
-            filtered_df = filtered_df[filtered_df["区间涨跌幅"] < max_range_change]
-
+            filtered_df = filtered_df[filtered_df["区间涨跌幅"] <= float(max_range_change)]
         if "总市值" in filtered_df.columns:
-            filtered_df["总市值"] = pd.to_numeric(filtered_df["总市值"], errors="coerce").fillna(0)
-            # 总市值为0往往是接口没给，不直接剔除；有值时才做极端过滤。
-            filtered_df = filtered_df[(filtered_df["总市值"] == 0) | (filtered_df["总市值"] >= 10)]
-
-        sort_cols = [c for c in ["主力净流入", "资金热度分", "成交额", "换手率"] if c in filtered_df.columns]
+            filtered_df = filtered_df[(filtered_df["总市值"] == 0) | ((filtered_df["总市值"] >= min_market_cap) & (filtered_df["总市值"] <= max_market_cap))]
+        sort_cols = [c for c in ["资金热度分", "主力净流入", "成交额", "换手率"] if c in filtered_df.columns]
         if sort_cols:
             filtered_df = filtered_df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-
         return filtered_df.reset_index(drop=True)
 
 class MainForceAnalyzer:
-    """主力选股AI分析引擎 (已接入终端主干 call_ai)"""
+    """主力选股快速分析引擎。"""
     def __init__(self):
         self.selector = MainForceStockSelector()
         self.db = MainForceBatchDatabase()
+        self.fund_flow_analysis = ""
+        self.industry_analysis = ""
+        self.data_source_msg = ""
 
     @staticmethod
-    def _extract_json_from_ai_response(text: str) -> Dict[str, Any]:
-        """
-        兼容 AI 输出的多种格式：
-        1. ```json { ... } ```
-        2. ``` { ... } ```
-        3. 前后夹杂解释文字的 { ... }
-        4. 正文中包含多个括号时，自动寻找第一个可解析 JSON 对象
-        """
-        if text is None:
-            raise ValueError("AI 返回为空")
-        raw = str(text).strip()
-        if not raw:
-            raise ValueError("AI 返回为空字符串")
-
-        fence_match = re.search(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
-        if fence_match:
-            raw = fence_match.group(1).strip()
-
-        try:
-            return json.loads(raw)
-        except Exception:
-            pass
-
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = raw[start:end + 1].strip()
-            try:
-                return json.loads(candidate)
-            except Exception:
-                pass
-
-        starts = [m.start() for m in re.finditer(r"\{", raw)]
-        for s in starts:
-            depth = 0
-            for i in range(s, len(raw)):
-                if raw[i] == "{":
-                    depth += 1
-                elif raw[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = raw[s:i + 1]
-                        try:
-                            return json.loads(candidate)
-                        except Exception:
-                            break
-        raise ValueError("未能从 AI 回复中提取合法 JSON")
-
-    @staticmethod
-    def _build_fallback_recommendations(filtered_data: pd.DataFrame, final_n: int) -> List[Dict[str, Any]]:
-        """AI JSON 解析失败时，用候选数据生成兜底推荐，避免整个模块失败。"""
+    def _build_recommendations(filtered_data: pd.DataFrame, final_n: int) -> List[Dict[str, Any]]:
         recs = []
         if filtered_data is None or filtered_data.empty:
             return recs
-
         df = filtered_data.copy().head(final_n)
         for idx, (_, row) in enumerate(df.iterrows(), start=1):
-            symbol = str(row.get("股票代码", row.get("代码", ""))).zfill(6)[:6]
-            name = str(row.get("股票名称", row.get("名称", "未知")))
+            symbol = str(row.get("股票代码", "")).zfill(6)[:6]
+            name = str(row.get("股票简称", row.get("股票名称", "未知")))
+            hot = safe_float(row.get("资金热度分", 0))
             inflow = safe_float(row.get("主力净流入", 0))
-            hot_score = safe_float(row.get("资金热度分", 0))
-            pct = safe_float(row.get("区间涨跌幅", row.get("涨跌幅", 0)))
+            amount = safe_float(row.get("成交额", 0))
+            pct = safe_float(row.get("区间涨跌幅", 0))
             turnover = safe_float(row.get("换手率", 0))
-
-            reasons = []
+            industry = str(row.get("所属行业", "未分类"))
+            reasons = [f"资金热度分 {hot:.1f}，在候选池中排名靠前"]
             if inflow:
-                reasons.append(f"主力净流入靠前，净流入约{inflow:,.0f}")
-            if hot_score:
-                reasons.append(f"资金热度分较高，约{hot_score:.1f}")
+                reasons.append(f"估算/接口主力净流入约 {inflow:,.0f}")
+            if amount:
+                reasons.append(f"成交额活跃，约 {amount / 100000000:.2f} 亿元")
             if turnover:
-                reasons.append(f"换手率约{turnover:.2f}%，市场关注度较高")
+                reasons.append(f"换手率约 {turnover:.2f}%，短线资金关注度较高")
             if pct:
-                reasons.append(f"区间涨跌幅约{pct:.2f}%，具备资金博弈特征")
-            if not reasons:
-                reasons.append("AI JSON解析失败时由候选池兜底生成，需结合盘口二次确认")
-
+                reasons.append(f"当前涨跌幅约 {pct:.2f}%，需结合位置判断追高风险")
             recs.append({
                 "rank": idx,
                 "symbol": symbol,
                 "name": name,
-                "reasons": reasons[:3],
+                "industry": industry,
+                "score": hot,
+                "reasons": reasons[:4],
                 "position": "10%-20%",
-                "risks": "AI JSON解析失败后的兜底结果，需重点核验资金流、公告与技术位置。"
+                "risks": "该结果为快速资金热度模型筛选，需结合日线位置、公告、板块强度和大盘环境二次确认。"
             })
         return recs
 
-    def run_full_analysis(self, start_date, days_ago, final_n, max_range_change, min_market_cap, max_market_cap):
-        result = {'success': False, 'final_recommendations': [], 'error': None}
-        
-        # 1. 获取并筛选数据
+    @staticmethod
+    def _extract_json_from_ai_response(text: str) -> Dict[str, Any]:
+        if text is None:
+            raise ValueError("AI 返回为空")
+        raw = str(text).strip()
+        fence_match = re.search(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+        if fence_match:
+            raw = fence_match.group(1).strip()
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise ValueError("未能从 AI 回复中提取合法 JSON")
+
+    def run_full_analysis(self, start_date, days_ago, final_n, max_range_change, min_market_cap, max_market_cap, use_ai=True):
+        result = {"success": False, "final_recommendations": [], "error": None}
+        t0 = time.time()
+
         success, raw_data, msg = self.selector.get_main_force_stocks(start_date, days_ago, min_market_cap, max_market_cap)
+        self.data_source_msg = msg
         if not success:
-            result['error'] = msg
+            result["error"] = msg
             return result
-            
-        filtered_data = self.selector.filter_stocks(raw_data, max_range_change)
+
+        filtered_data = self.selector.filter_stocks(raw_data, max_range_change, min_market_cap, max_market_cap)
         if filtered_data.empty:
-            result['error'] = "筛选后无符合条件的股票"
+            result["error"] = "筛选后无符合条件的股票。建议提高区间最大涨幅限制或放宽市值范围。"
             return result
 
         self.raw_stocks = filtered_data
-        data_table_str = filtered_data.head(30).to_string(index=False) # 取前30只防止超Token
-        
-        # 2. 调用终端主干 call_ai 进行三大维度分析
-        summary_prompt = f"候选股票总数: {len(filtered_data)}只\n数据明细:\n{data_table_str}"
-        
-        with st.spinner("🤖 资金流向分析师正在评估..."):
-            fund_prompt = f"系统设定: 你是资金面分析专家。\n任务: 基于以下数据分析资金流向特征，识别主力意图，找出资金集中流入的板块和个股。\n{summary_prompt}"
-            self.fund_flow_analysis = call_ai(fund_prompt, temperature=0.3)
+        quick_recs = self._build_recommendations(filtered_data, final_n)
+        result["final_recommendations"] = quick_recs
+        result["success"] = True
+        result["data_source_msg"] = msg
+        result["elapsed_fetch"] = round(time.time() - t0, 2)
 
-        with st.spinner("📊 行业板块分析师正在扫描热点..."):
-            ind_prompt = f"系统设定: 你是行业板块分析专家。\n任务: 分析数据中的热点板块持续性，判断资金轮动方向，并评估各行业的后续基本面支撑。\n{summary_prompt}"
-            self.industry_analysis = call_ai(ind_prompt, temperature=0.3)
+        # 先完成可展示结果，再做一次短 AI 解读；AI 失败不影响结果。
+        top_data = filtered_data.head(min(20, len(filtered_data)))
+        show_cols = ["股票代码", "股票简称", "所属行业", "资金热度分", "主力净流入", "成交额", "区间涨跌幅", "换手率", "总市值", "市盈率", "数据源"]
+        show_cols = [c for c in show_cols if c in top_data.columns]
+        table_text = top_data[show_cols].to_string(index=False)
+        self.fund_flow_analysis = "已根据成交额、换手率、估算主力净流入、涨跌幅构造资金热度分，并完成快速排序。"
+        self.industry_analysis = "行业分布来自股票名称和内置行业映射，属于快速归类，适合先做观察池，不适合作为唯一买入依据。"
 
-        with st.spinner("📈 首席策略官正在进行最终研判并生成 JSON 推荐..."):
-            final_prompt = f"""
-            系统设定: 你是拥有20年经验的首席股票研究员。
-            请综合以下信息，从候选股票中精选出 {final_n} 只最优质标的：
-            【资金面观点】\n{self.fund_flow_analysis}\n
-            【行业面观点】\n{self.industry_analysis}\n
-            【原始数据】\n{data_table_str}\n
-            
-            务必严格按照以下 JSON 格式输出结果（不要输出任何多余的 Markdown 标记或其他文字，仅输出合法 JSON）：
-            {{
-              "recommendations": [
-                {{
-                  "rank": 1,
-                  "symbol": "股票代码",
-                  "name": "股票名称",
-                  "reasons": ["综合推荐理由1", "理由2"],
-                  "position": "建议仓位(如20%)",
-                  "risks": "风险提示"
-                }}
-              ]
-            }}
-            """
-            final_resp = call_ai(final_prompt, temperature=0.2)
-            
-            # 解析 JSON：兼容 ```json、```、前后夹杂解释文字等情况
+        if use_ai and api_key:
             try:
-                parsed_json = self._extract_json_from_ai_response(final_resp)
-                recommendations = parsed_json.get('recommendations', [])
-                if not isinstance(recommendations, list):
-                    recommendations = []
+                prompt = f"""
+你是A股短线资金流研究员。请基于以下快速候选池，给出精炼结论。
 
-                # 如果 AI 没给出有效 recommendations，则使用候选池兜底，避免页面失败
-                if not recommendations:
-                    recommendations = self._build_fallback_recommendations(filtered_data, final_n)
+数据来源说明：{msg}
+候选数据：
+{table_text}
 
-                result['final_recommendations'] = recommendations[:final_n]
-                result['success'] = True
-                result['ai_raw_response'] = final_resp
+请严格输出合法 JSON，不要使用 Markdown 代码块：
+{{
+  "fund_view": "一句话总结资金流状态",
+  "industry_view": "一句话总结热点方向",
+  "recommendations": [
+    {{"rank":1,"symbol":"股票代码","name":"股票名称","reasons":["理由1","理由2"],"position":"建议仓位","risks":"风险提示"}}
+  ]
+}}
+"""
+                ai_resp = call_ai(prompt, temperature=0.2)
+                parsed = self._extract_json_from_ai_response(ai_resp)
+                ai_recs = parsed.get("recommendations", []) if isinstance(parsed, dict) else []
+                if isinstance(ai_recs, list) and ai_recs:
+                    result["final_recommendations"] = ai_recs[:final_n]
+                self.fund_flow_analysis = parsed.get("fund_view", self.fund_flow_analysis) if isinstance(parsed, dict) else self.fund_flow_analysis
+                self.industry_analysis = parsed.get("industry_view", self.industry_analysis) if isinstance(parsed, dict) else self.industry_analysis
+                result["ai_raw_response"] = ai_resp
+            except Exception as exc:
+                result["warning"] = f"AI 解读未完成，已使用快速量化结果。原因：{exc}"
 
-                # 存入本地数据库保存历史
-                self.db.save_analysis(
-                    len(filtered_data),
-                    len(result['final_recommendations']),
-                    json.dumps(result['final_recommendations'], ensure_ascii=False)
-                )
-            except Exception as e:
-                # 兜底：即使 AI 输出完全不可解析，也不让主力选股模块失败
-                fallback_recs = self._build_fallback_recommendations(filtered_data, final_n)
-                if fallback_recs:
-                    result['final_recommendations'] = fallback_recs
-                    result['success'] = True
-                    result['warning'] = f"AI JSON解析失败，已启用候选池兜底推荐。解析错误：{str(e)}"
-                    result['ai_raw_response'] = final_resp
-                    try:
-                        self.db.save_analysis(
-                            len(filtered_data),
-                            len(result['final_recommendations']),
-                            json.dumps(result['final_recommendations'], ensure_ascii=False)
-                        )
-                    except Exception:
-                        pass
-                else:
-                    result['error'] = f"AI 输出 JSON 解析失败且兜底推荐为空: {str(e)}。AI 原始回复: {final_resp[:200]}..."
+        try:
+            self.db.save_analysis(
+                len(filtered_data),
+                len(result["final_recommendations"]),
+                json.dumps(result["final_recommendations"], ensure_ascii=False)
+            )
+        except Exception:
+            pass
         return result
 
 def render_main_force_tab():
-    """主力选股专属 UI 渲染器"""
-    st.markdown("### 🎯 主力资金选股 - 智能筛选与综合推演")
-    st.write("利用 `问财` 抓取海量主力净流入数据，通过AI多空博弈模型，为你精选极具爆发潜力的市场焦点。")
+    """主力选股专属 UI 渲染器（快速版）。"""
+    st.markdown("### 🎯 主力资金选股 - 快速资金热度引擎")
+    st.write("为避免云端接口长时间卡住，本模块改为轻量行情池 + 资金热度评分 + 单次AI解读。先出结果，再做研判。")
     st.markdown("---")
-    
+
     col1, col2, col3 = st.columns(3)
     with col1:
         date_option = st.selectbox("监控时间区间", ["最近10天", "最近30天", "最近3个月"])
@@ -2012,37 +1919,62 @@ def render_main_force_tab():
     with col3:
         max_change = st.number_input("区间最大涨幅限制(%)", value=30.0, step=5.0, help="剔除已经大涨的高位股")
 
-    if st.button("🚀 启动主力追踪引擎", type="primary", use_container_width=True):
-        if not api_key:
-            st.error("配置缺失: GROQ_API_KEY")
-            return
-            
+    use_ai = st.checkbox("生成AI解读", value=True, help="关闭后速度最快，只展示量化资金热度结果。")
+
+    if st.button("🚀 启动主力追踪引擎", type="primary", width="stretch"):
+        if not api_key and use_ai:
+            st.warning("未配置 GROQ_API_KEY，将只展示快速量化结果。")
+            use_ai = False
+
         analyzer = MainForceAnalyzer()
-        result = analyzer.run_full_analysis(
-            start_date=None, days_ago=days_ago, final_n=final_n, 
-            max_range_change=max_change, min_market_cap=30.0, max_market_cap=5000.0
-        )
-        
-        if result['success']:
-            st.success(f"✅ AI 军团测算完成！已为您锁定 {len(result['final_recommendations'])} 只优质标的。")
-            if result.get('warning'):
-                st.warning(result['warning'])
+        with st.spinner("正在快速提取候选池并计算资金热度..."):
+            result = analyzer.run_full_analysis(
+                start_date=None,
+                days_ago=days_ago,
+                final_n=final_n,
+                max_range_change=max_change,
+                min_market_cap=30.0,
+                max_market_cap=5000.0,
+                use_ai=use_ai,
+            )
+
+        if result["success"]:
+            st.success(f"✅ 计算完成！已锁定 {len(result['final_recommendations'])} 只候选标的。数据源：{result.get('data_source_msg', analyzer.data_source_msg)}")
+            if result.get("elapsed_fetch") is not None:
+                st.caption(f"数据提取与初筛耗时：{result['elapsed_fetch']} 秒")
+            if result.get("warning"):
+                st.warning(result["warning"])
+
+            if hasattr(analyzer, "raw_stocks") and analyzer.raw_stocks is not None and not analyzer.raw_stocks.empty:
+                with st.expander("📋 查看快速候选池 Top 30", expanded=False):
+                    show_cols = ["股票代码", "股票简称", "所属行业", "资金热度分", "主力净流入", "成交额", "区间涨跌幅", "换手率", "总市值", "市盈率", "数据源"]
+                    show_cols = [c for c in show_cols if c in analyzer.raw_stocks.columns]
+                    st.dataframe(analyzer.raw_stocks[show_cols].head(30), width="stretch", hide_index=True)
+
             st.markdown("### ⭐ 首席精选标的池")
-            for rec in result['final_recommendations']:
+            for rec in result["final_recommendations"]:
                 with st.expander(f"🏅 TOP {rec.get('rank', '-')} | {rec.get('name', '未知')} ({rec.get('symbol', '未知')})", expanded=True):
+                    if rec.get("industry"):
+                        st.caption(f"所属方向：{rec.get('industry')}")
+                    if rec.get("score") is not None:
+                        st.metric("资金热度分", f"{safe_float(rec.get('score')):.1f}")
                     st.markdown("**📌 核心逻辑：**")
-                    for r in rec.get('reasons', []): st.write(f"- {r}")
+                    for r in rec.get("reasons", []):
+                        st.write(f"- {r}")
                     st.markdown(f"**💰 建议仓位：** {rec.get('position', 'N/A')}")
                     st.markdown(f"**⚠️ 预警提示：** {rec.get('risks', 'N/A')}")
-            
+
             st.markdown("---")
-            st.markdown("### 🤖 投研底稿 (AI 分析师原音)")
+            st.markdown("### 🤖 投研底稿")
             t1, t2 = st.tabs(["💰 资金流向透视", "📊 行业格局研判"])
-            with t1: st.write(analyzer.fund_flow_analysis)
-            with t2: st.write(analyzer.industry_analysis)
+            with t1:
+                st.write(analyzer.fund_flow_analysis)
+            with t2:
+                st.write(analyzer.industry_analysis)
         else:
             st.error(f"❌ 运行失败: {result['error']}")
 # ===================== 主力选股模块结束 =====================
+
 # ================= 终端全局看板 =================
 st.markdown("### 🌍 宏观市场实时看板")
 pulse_data = get_market_pulse()
