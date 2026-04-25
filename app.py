@@ -60,7 +60,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.4.1 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.3-LHB-NO-STOCKAPI | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -3205,8 +3205,8 @@ with tab4:
 # ================= Tab 5: 智瞰龙虎榜解析 =================
 with tab5:
     with st.container(border=True):
-        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 2.0")
-        st.write("整合龙虎榜数据采集、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。")
+        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 3.0")
+        st.write("整合优化版龙虎榜数据采集、自动回溯、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。已移除 StockAPI 相关依赖。")
 
         col_date, col_lookback, col_depth = st.columns([1, 1, 1])
         with col_date:
