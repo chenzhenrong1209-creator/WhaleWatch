@@ -60,7 +60,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.4.1 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.3-LHB-NO-STOCKAPI | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -1120,19 +1120,122 @@ def get_global_news():
                 news.append(f"[{item.get('create_time', '')}] {text}")
     return news
 
-@st.cache_data(ttl=60)
+def _normalize_market_price(value, prefer_scale=None):
+    """指数/汇率价格归一化，兼容东财不同接口偶发的放大倍数。"""
+    price = safe_float(value, default=0.0)
+    if price <= 0:
+        return 0.0
+    if prefer_scale:
+        return price / prefer_scale
+    # 指数常见区间 500-10000；东财有时返回 306422 这种扩大100倍的值
+    if price > 100000:
+        return price / 100
+    if price > 20000:
+        return price / 100
+    return price
+
+
+def _build_pulse_item(price=0.0, pct=0.0, source="", status="正常"):
+    return {
+        "price": safe_float(price, 0.0),
+        "pct": safe_float(pct, 0.0),
+        "source": source,
+        "status": status,
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def get_market_pulse():
+    """
+    宏观看板极速稳定版。
+    设计原则：
+    1. 首页不能被宏观接口拖死；
+    2. 不在首页调用 AKShare 这类可能分页/慢加载的数据源；
+    3. 东方财富实时接口失败时，立即返回可展示的占位卡片；
+    4. 任何异常都不影响下方功能模块。
+    """
+    targets = [
+        {"name": "上证指数", "secid": "1.000001", "fallback": 0.0},
+        {"name": "深证成指", "secid": "0.399001", "fallback": 0.0},
+        {"name": "创业板指", "secid": "0.399006", "fallback": 0.0},
+        {"name": "沪深300", "secid": "1.000300", "fallback": 0.0},
+        {"name": "科创50", "secid": "1.000688", "fallback": 0.0},
+    ]
+
     pulse = {}
-    indices = {"上证指数": "1.000001", "深证成指": "0.399001", "创业板指": "0.399006"}
-    for name, code in indices.items():
-        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={code}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
-        res = fetch_json(url)
-        if res and res.get("data"):
-            pulse[name] = {"price": safe_float(res["data"].get("f43")), "pct": safe_float(res["data"].get("f170"))}
-    cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
-    cnh_res = fetch_json(cnh_url)
-    if cnh_res and cnh_res.get("data"):
-        pulse["USD/CNH(离岸)"] = {"price": safe_float(cnh_res["data"].get("f43")), "pct": safe_float(cnh_res["data"].get("f170"))}
+
+    for item in targets:
+        name = item["name"]
+        try:
+            url = (
+                "https://push2.eastmoney.com/api/qt/stock/get?"
+                f"secid={item['secid']}&ut=fa5fd1943c7b386f172d6893dbfba10b"
+                "&fltt=2&invt=2&fields=f43,f170,f60"
+            )
+            # 宏观看板必须快；这里故意设置短超时，失败就降级。
+            res = fetch_json(url, timeout=2)
+            data = res.get("data") if isinstance(res, dict) else None
+            if data:
+                raw_price = safe_float(data.get("f43"), 0.0)
+                prev_close = safe_float(data.get("f60"), 0.0)
+                price = normalize_em_price(raw_price, prev_close)
+                pct = safe_float(data.get("f170"), 0.0)
+                if price > 0:
+                    pulse[name] = {
+                        "price": price,
+                        "pct": pct,
+                        "source": "东方财富",
+                        "status": "正常",
+                        "available": True,
+                    }
+                    continue
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"{name} 宏观看板实时源失败：{e}")
+
+        pulse[name] = {
+            "price": item.get("fallback", 0.0),
+            "pct": 0.0,
+            "source": "极速占位",
+            "status": "实时源暂不可用",
+            "available": False,
+        }
+
+    # USD/CNH 单独处理。失败只影响这一张卡，不影响整个看板。
+    try:
+        cnh_url = (
+            "https://push2.eastmoney.com/api/qt/stock/get?"
+            "secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b"
+            "&fltt=2&invt=2&fields=f43,f170"
+        )
+        cnh_res = fetch_json(cnh_url, timeout=2)
+        cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
+        if cnh_data:
+            cnh_price = safe_float(cnh_data.get("f43"), 0.0)
+            cnh_pct = safe_float(cnh_data.get("f170"), 0.0)
+            if cnh_price > 0:
+                pulse["USD/CNH(离岸)"] = {
+                    "price": cnh_price,
+                    "pct": cnh_pct,
+                    "source": "东方财富",
+                    "status": "正常",
+                    "available": True,
+                }
+            else:
+                raise ValueError("CNH price empty")
+        else:
+            raise ValueError("CNH data empty")
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"USD/CNH 宏观看板实时源失败：{e}")
+        pulse["USD/CNH(离岸)"] = {
+            "price": 0.0,
+            "pct": 0.0,
+            "source": "极速占位",
+            "status": "实时源暂不可用",
+            "available": False,
+        }
+
     return pulse
 
 @st.cache_data(ttl=300)
@@ -2834,18 +2937,55 @@ def render_high_end_news_terminal():
 # ================= 高端新闻情报终端模块结束 =================
 
 st.markdown("### 🌍 宏观市场实时看板")
-pulse_data = get_market_pulse()
-if pulse_data:
-    dash_cols = st.columns(len(pulse_data))
-    for idx, (key, data) in enumerate(pulse_data.items()):
-        with dash_cols[idx]:
-            with st.container(border=True):
-                if "CNH" in key:
-                    st.metric(key, f"{data['price']:.4f}", f"{data['pct']:.2f}%", delta_color="inverse")
-                else:
-                    st.metric(key, f"{data['price']:.2f}", f"{data['pct']:.2f}%")
+
+# 宏观看板必须独立、轻量、可降级；任何接口失败都不能影响主程序。
+try:
+    pulse_data = get_market_pulse()
+except Exception as e:
+    if DEBUG_MODE:
+        st.warning(f"宏观看板函数异常，已启用本地占位：{e}")
+    pulse_data = {
+        "上证指数": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
+        "深证成指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
+        "创业板指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
+        "沪深300": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
+        "USD/CNH(离岸)": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
+    }
+
+if not pulse_data:
+    pulse_data = {
+        "上证指数": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
+        "深证成指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
+        "创业板指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
+        "沪深300": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
+        "USD/CNH(离岸)": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
+    }
+
+available_count = sum(1 for v in pulse_data.values() if isinstance(v, dict) and v.get("available"))
+if available_count == 0:
+    st.caption("宏观看板：实时源暂不可用，已启用占位卡片；不影响下方个股、龙虎榜、主力资金和新闻情报模块。")
 else:
-    st.warning("宏观看板数据流建立失败。")
+    st.caption(f"宏观看板：已同步 {available_count}/{len(pulse_data)} 项实时数据。")
+
+cols = st.columns(min(len(pulse_data), 6))
+for idx, (key, data) in enumerate(pulse_data.items()):
+    with cols[idx % len(cols)]:
+        with st.container(border=True):
+            data = data if isinstance(data, dict) else {}
+            price = safe_float(data.get("price"), 0.0)
+            pct = safe_float(data.get("pct"), 0.0)
+            source = data.get("source", "-")
+            status = data.get("status", "-")
+            available = bool(data.get("available", False))
+            if available and price > 0:
+                if "CNH" in key:
+                    st.metric(key, f"{price:.4f}", f"{pct:.2f}%", delta_color="inverse")
+                else:
+                    st.metric(key, f"{price:.2f}", f"{pct:.2f}%")
+            else:
+                st.metric(key, "待同步", "--")
+            st.caption(f"{source} · {status}")
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ================= 终端功能选项卡 =================
@@ -3205,8 +3345,8 @@ with tab4:
 # ================= Tab 5: 智瞰龙虎榜解析 =================
 with tab5:
     with st.container(border=True):
-        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 2.0")
-        st.write("整合龙虎榜数据采集、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。")
+        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 3.0")
+        st.write("整合优化版龙虎榜数据采集、自动回溯、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。已移除 StockAPI 相关依赖。")
 
         col_date, col_lookback, col_depth = st.columns([1, 1, 1])
         with col_date:
