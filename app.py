@@ -2386,7 +2386,453 @@ def render_main_force_tab():
             st.error(f"❌ 运行失败: {result['error']}")
 # ===================== 主力选股模块结束 =====================
 
-# ================= 终端全局看板 =================
+
+# ================= 高端新闻情报终端模块 =================
+# 整合思路来源：news_announcement_data / news_flow_data / news_flow_agents / news_flow_engine / news_flow_db / news_flow_ui
+# 采用单文件内嵌方式，避免 Streamlit Cloud 因外部模块缺失导致部署失败。
+
+NEWS_KEYWORD_SECTOR_MAP = {
+    "AI": ["人工智能", "算力", "CPO", "数据中心", "机器人"],
+    "算力": ["算力", "CPO", "光模块", "服务器", "液冷", "数据中心"],
+    "半导体": ["芯片", "半导体", "存储", "先进封装", "光刻机", "国产替代"],
+    "新能源车": ["新能源车", "汽车", "智能驾驶", "固态电池", "锂电", "充电桩"],
+    "机器人": ["机器人", "人形机器人", "减速器", "伺服", "传感器"],
+    "低空经济": ["低空", "飞行汽车", "eVTOL", "无人机", "通航"],
+    "医药": ["创新药", "医药", "医疗", "减肥药", "CXO"],
+    "消费": ["消费", "白酒", "旅游", "餐饮", "家电", "零售"],
+    "金融": ["银行", "券商", "保险", "并购重组", "资本市场"],
+    "地产链": ["房地产", "地产", "城中村", "家居", "建材"],
+    "军工": ["军工", "航天", "卫星", "商业航天", "低轨"],
+    "黄金有色": ["黄金", "铜", "铝", "稀土", "有色", "贵金属"],
+}
+
+NEWS_SECTOR_STOCK_POOL = {
+    "AI": [{"code": "300308", "name": "中际旭创"}, {"code": "601138", "name": "工业富联"}, {"code": "000977", "name": "浪潮信息"}],
+    "算力": [{"code": "300308", "name": "中际旭创"}, {"code": "300502", "name": "新易盛"}, {"code": "601138", "name": "工业富联"}],
+    "半导体": [{"code": "002371", "name": "北方华创"}, {"code": "688981", "name": "中芯国际"}, {"code": "688256", "name": "寒武纪"}],
+    "新能源车": [{"code": "300750", "name": "宁德时代"}, {"code": "002594", "name": "比亚迪"}, {"code": "601689", "name": "拓普集团"}],
+    "机器人": [{"code": "300124", "name": "汇川技术"}, {"code": "002050", "name": "三花智控"}, {"code": "002472", "name": "双环传动"}],
+    "低空经济": [{"code": "002085", "name": "万丰奥威"}, {"code": "600879", "name": "航天电子"}, {"code": "300159", "name": "新研股份"}],
+    "医药": [{"code": "600276", "name": "恒瑞医药"}, {"code": "300760", "name": "迈瑞医疗"}, {"code": "688235", "name": "百济神州"}],
+    "消费": [{"code": "600519", "name": "贵州茅台"}, {"code": "000858", "name": "五粮液"}, {"code": "000333", "name": "美的集团"}],
+    "金融": [{"code": "600030", "name": "中信证券"}, {"code": "600036", "name": "招商银行"}, {"code": "300059", "name": "东方财富"}],
+    "地产链": [{"code": "600048", "name": "保利发展"}, {"code": "000002", "name": "万科A"}, {"code": "000651", "name": "格力电器"}],
+    "军工": [{"code": "600760", "name": "中航沈飞"}, {"code": "000768", "name": "中航西飞"}, {"code": "002179", "name": "中航光电"}],
+    "黄金有色": [{"code": "600547", "name": "山东黄金"}, {"code": "601899", "name": "紫金矿业"}, {"code": "600111", "name": "北方稀土"}],
+}
+
+class HighEndNewsDB:
+    """轻量情报缓存库。优先写入本地 sqlite；失败时不影响主流程。"""
+    def __init__(self, db_path="news_terminal_cache.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS news_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT,
+                    mode TEXT,
+                    stock_code TEXT,
+                    score REAL,
+                    summary TEXT
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def save_run(self, mode, stock_code, score, summary):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO news_runs(ts, mode, stock_code, score, summary) VALUES (?, ?, ?, ?, ?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mode, stock_code or "", safe_float(score), str(summary)[:2000])
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def recent_runs(self, limit=10):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            df = pd.read_sql_query("SELECT * FROM news_runs ORDER BY id DESC LIMIT ?", conn, params=(limit,))
+            conn.close()
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+class HighEndNewsFetcher:
+    """高端情报数据采集器：全网快讯 + 财经新闻 + 个股新闻公告。"""
+    def __init__(self, max_items=60):
+        self.max_items = max_items
+        self.errors = []
+
+    def collect(self, stock_code="", max_items=60, include_wencai=False):
+        items = []
+        self.errors = []
+        items.extend(self._fetch_sina_live(max_items=max_items))
+        items.extend(self._fetch_em_global(max_items=max_items))
+        items.extend(self._fetch_em_announcements(max_items=max_items))
+        if stock_code:
+            items.extend(self._fetch_stock_announcements_em(stock_code, max_items=max_items))
+            if include_wencai:
+                items.extend(self._fetch_wencai_stock_news(stock_code, max_items=min(15, max_items)))
+
+        seen = set()
+        cleaned = []
+        for item in items:
+            title = str(item.get("title") or item.get("summary") or "").strip()
+            if not title:
+                continue
+            key = re.sub(r"\s+", "", title)[:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            item["title"] = title
+            item["impact_score"] = self._score_item(item)
+            item["matched_sectors"] = self._match_sectors(title + " " + str(item.get("summary", "")))
+            cleaned.append(item)
+
+        cleaned = sorted(cleaned, key=lambda x: (safe_float(x.get("impact_score")), str(x.get("time", ""))), reverse=True)
+        return {"items": cleaned[:max_items], "errors": self.errors, "count": len(cleaned[:max_items])}
+
+    def _fetch_sina_live(self, max_items=60):
+        url = "https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size=80&zhibo_id=152&tag_id=0&dire=f&dpc=1"
+        res = fetch_json(url, timeout=6, extra_headers={"Referer": "https://finance.sina.com.cn/"})
+        out = []
+        try:
+            rows = res.get("result", {}).get("data", {}).get("feed", {}).get("list", []) if res else []
+            for row in rows[:max_items]:
+                text = re.sub(r"<[^>]+>", "", str(row.get("rich_text", "")).strip())
+                if len(text) >= 10:
+                    out.append({"source": "新浪财经直播", "platform": "财经快讯", "title": text, "summary": text, "time": row.get("create_time", "")})
+        except Exception as e:
+            self.errors.append(f"新浪财经直播失败: {e}")
+        return out
+
+    def _fetch_em_global(self, max_items=60):
+        out = []
+        try:
+            df = ak.stock_info_global_em()
+            if df is not None and not df.empty:
+                for _, row in df.head(max_items).iterrows():
+                    title = str(row.get("标题") or row.get("title") or "")
+                    if title:
+                        out.append({"source": "东方财富全球财经", "platform": "财经新闻", "title": title, "summary": str(row.get("摘要", "")), "time": str(row.get("发布时间", ""))})
+        except Exception as e:
+            self.errors.append(f"东方财富全球财经失败: {e}")
+        return out
+
+    def _fetch_em_announcements(self, max_items=60):
+        url = "https://np-anotice-stock.eastmoney.com/api/security/ann?page_size=30&page_index=1&ann_type=A"
+        res = fetch_json(url, timeout=6, extra_headers={"Referer": "https://data.eastmoney.com/"})
+        out = []
+        try:
+            rows = res.get("data", {}).get("list", []) if res else []
+            for row in rows[:max_items]:
+                title = str(row.get("title") or row.get("art_code") or "")
+                if title:
+                    out.append({"source": "东方财富公告", "platform": "公告", "title": title, "summary": str(row.get("columns", "")), "time": str(row.get("notice_date", ""))})
+        except Exception as e:
+            self.errors.append(f"东方财富公告失败: {e}")
+        return out
+
+    def _fetch_stock_announcements_em(self, stock_code, max_items=30):
+        out = []
+        try:
+            # 尝试 AKShare 个股公告接口；不同版本字段不完全一致，所以做宽松解析。
+            if hasattr(ak, "stock_notice_report"):
+                df = ak.stock_notice_report(symbol="全部")
+                if df is not None and not df.empty:
+                    code_cols = [c for c in df.columns if "代码" in str(c)]
+                    if code_cols:
+                        df = df[df[code_cols[0]].astype(str).str.contains(str(stock_code), na=False)]
+                    for _, row in df.head(max_items).iterrows():
+                        title = str(row.get("公告标题") or row.get("标题") or row.get("公告名称") or row.to_dict())
+                        out.append({"source": "AKShare个股公告", "platform": "个股公告", "title": title, "summary": str(row.to_dict())[:600], "time": str(row.get("公告日期", row.get("日期", "")))})
+        except Exception as e:
+            self.errors.append(f"个股公告备用源失败: {e}")
+        return out
+
+    def _fetch_wencai_stock_news(self, stock_code, max_items=15):
+        out = []
+        try:
+            for query_type in ["新闻", "公告"]:
+                try:
+                    result = pywencai.get(query=f"{stock_code}{query_type}", loop=False)
+                except Exception as e:
+                    self.errors.append(f"问财{query_type}失败: {e}")
+                    continue
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    df = result.head(max_items)
+                elif isinstance(result, dict):
+                    df = pd.DataFrame([result])
+                else:
+                    continue
+                for _, row in df.iterrows():
+                    vals = [str(v) for v in row.to_dict().values() if str(v) not in ["nan", "None", ""]]
+                    title = " | ".join(vals[:3])[:300]
+                    if title:
+                        out.append({"source": f"问财{query_type}", "platform": "问财", "title": title, "summary": " | ".join(vals)[:800], "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        except Exception as e:
+            self.errors.append(f"问财新闻公告总失败: {e}")
+        return out
+
+    def _match_sectors(self, text):
+        matched = []
+        for sector, kws in NEWS_KEYWORD_SECTOR_MAP.items():
+            if any(k.lower() in text.lower() for k in kws):
+                matched.append(sector)
+        return matched
+
+    def _score_item(self, item):
+        text = f"{item.get('title','')} {item.get('summary','')}"
+        high_words = ["重磅", "突发", "大涨", "暴涨", "涨停", "政策", "央行", "国务院", "并购", "重组", "制裁", "降息", "关税", "突破", "新高"]
+        risk_words = ["下跌", "暴跌", "风险", "处罚", "立案", "减持", "亏损", "退市", "监管", "调查"]
+        score = 30
+        score += sum(8 for w in high_words if w in text)
+        score += sum(6 for w in risk_words if w in text)
+        score += 8 * len(self._match_sectors(text))
+        if item.get("platform") == "公告":
+            score += 8
+        return min(100, score)
+
+class HighEndNewsAnalyzer:
+    """高端新闻流分析器：热点抽取、流量评分、板块映射、AI 投研。"""
+    def __init__(self):
+        pass
+
+    def analyze(self, items, stock_code="", use_ai=True, mode="标准"):
+        topics = self.extract_topics(items)
+        sector_view = self.build_sector_view(items, topics)
+        flow = self.calc_flow_score(items, topics)
+        risk = self.calc_risk(items, flow)
+        candidate_stocks = self.build_candidate_stocks(sector_view)
+        ai_report = {}
+        if use_ai and api_key:
+            ai_report = self.run_ai_agents(items, topics, sector_view, flow, risk, candidate_stocks, stock_code, mode)
+        else:
+            ai_report = self.fallback_ai_report(sector_view, flow, risk, candidate_stocks)
+        return {"topics": topics, "sector_view": sector_view, "flow": flow, "risk": risk, "candidate_stocks": candidate_stocks, "ai_report": ai_report}
+
+    def extract_topics(self, items):
+        counter = Counter()
+        for item in items:
+            text = f"{item.get('title','')} {item.get('summary','')}"
+            for sector, kws in NEWS_KEYWORD_SECTOR_MAP.items():
+                for kw in kws:
+                    if kw.lower() in text.lower():
+                        counter[kw] += 1
+        topics = []
+        for kw, cnt in counter.most_common(15):
+            topics.append({"topic": kw, "heat": cnt * 10, "cross_platform": self._count_platform_for_kw(items, kw)})
+        return topics
+
+    def _count_platform_for_kw(self, items, kw):
+        return len(set([i.get("platform", "未知") for i in items if kw.lower() in f"{i.get('title','')} {i.get('summary','')}".lower()]))
+
+    def build_sector_view(self, items, topics):
+        sector_counter = Counter()
+        sector_sources = {}
+        for item in items:
+            for sec in item.get("matched_sectors", []):
+                sector_counter[sec] += max(1, int(safe_float(item.get("impact_score")) // 20))
+                sector_sources.setdefault(sec, []).append(item.get("title", "")[:80])
+        rows = []
+        for sec, val in sector_counter.most_common(12):
+            rows.append({
+                "板块": sec,
+                "热度分": min(100, val * 8),
+                "影响方向": "偏利好" if val >= 2 else "观察",
+                "核心线索": "；".join(sector_sources.get(sec, [])[:3]),
+                "候选标的": "、".join([s["name"] for s in NEWS_SECTOR_STOCK_POOL.get(sec, [])[:3]])
+            })
+        return rows
+
+    def calc_flow_score(self, items, topics):
+        source_count = len(set([i.get("platform", "未知") for i in items]))
+        avg_impact = sum([safe_float(i.get("impact_score")) for i in items]) / max(1, len(items))
+        topic_heat = sum([safe_float(t.get("heat")) for t in topics[:5]])
+        score = min(100, int(avg_impact * 0.45 + source_count * 8 + topic_heat * 0.35))
+        if score >= 80:
+            level = "高热度"
+            stage = "高潮扩散期"
+        elif score >= 60:
+            level = "中高热度"
+            stage = "发酵加速期"
+        elif score >= 40:
+            level = "中性热度"
+            stage = "观察酝酿期"
+        else:
+            level = "低热度"
+            stage = "低位潜伏期"
+        return {"score": score, "level": level, "stage": stage, "source_count": source_count, "item_count": len(items)}
+
+    def calc_risk(self, items, flow):
+        risk_words = ["减持", "立案", "处罚", "亏损", "退市", "监管", "暴跌", "调查", "风险", "澄清"]
+        risk_hits = []
+        for item in items:
+            text = f"{item.get('title','')} {item.get('summary','')}"
+            if any(w in text for w in risk_words):
+                risk_hits.append(item.get("title", ""))
+        risk_score = min(100, len(risk_hits) * 12 + (20 if flow.get("stage") == "高潮扩散期" else 0))
+        level = "高" if risk_score >= 65 else "中" if risk_score >= 35 else "低"
+        return {"risk_score": risk_score, "risk_level": level, "risk_factors": risk_hits[:8]}
+
+    def build_candidate_stocks(self, sector_view):
+        out = []
+        rank = 1
+        for row in sector_view[:5]:
+            sec = row.get("板块")
+            for stock in NEWS_SECTOR_STOCK_POOL.get(sec, [])[:2]:
+                out.append({"rank": rank, "code": stock["code"], "name": stock["name"], "sector": sec, "reason": f"新闻流量映射到{sec}，板块热度分{row.get('热度分')}"})
+                rank += 1
+        return out[:10]
+
+    def run_ai_agents(self, items, topics, sector_view, flow, risk, candidate_stocks, stock_code, mode):
+        compact_news = "\n".join([f"- [{i.get('platform')}/{i.get('source')}] {i.get('title')}" for i in items[:35]])
+        topics_text = json.dumps(topics[:12], ensure_ascii=False)
+        sectors_text = json.dumps(sector_view[:10], ensure_ascii=False)
+        stocks_text = json.dumps(candidate_stocks[:10], ensure_ascii=False)
+        risk_text = json.dumps(risk, ensure_ascii=False)
+        prompt = f"""
+你是顶级对冲基金的A股新闻流情报官。请基于以下数据生成【高端情报终端报告】。
+
+【分析模式】{mode}
+【关注个股】{stock_code or '无'}
+【流量状态】{json.dumps(flow, ensure_ascii=False)}
+【热点话题】{topics_text}
+【板块映射】{sectors_text}
+【候选股票】{stocks_text}
+【风险信号】{risk_text}
+【新闻流】
+{compact_news}
+
+请按以下结构输出，禁止空话：
+1. 📡 情报总览：今天新闻流的主线是什么，处于潜伏/发酵/高潮/退潮哪个阶段。
+2. 🔥 题材与板块映射：列出3-5条最可能影响A股的题材链条。
+3. 🎯 重点股票观察池：从候选股里筛5只，写清催化剂、观察点、风险。
+4. ⚠️ 风险雷达：哪些新闻可能造成高位兑现、监管、业绩或情绪风险。
+5. 🧭 次日操作计划：追涨、低吸、观望、回避分别适用什么条件。
+6. 最后给一句明确结论：进攻 / 轻仓试错 / 观望 / 防守。
+"""
+        report = call_ai(prompt, temperature=0.25)
+        return {"chief_report": report}
+
+    def fallback_ai_report(self, sector_view, flow, risk, candidate_stocks):
+        lines = [f"当前新闻流量等级：{flow.get('level')}，阶段：{flow.get('stage')}，风险等级：{risk.get('risk_level')}。"]
+        if sector_view:
+            lines.append("重点关注板块：" + "、".join([x.get("板块", "") for x in sector_view[:5]]))
+        if candidate_stocks:
+            lines.append("候选股票：" + "、".join([f"{x['name']}({x['code']})" for x in candidate_stocks[:6]]))
+        return {"chief_report": "\n\n".join(lines)}
+
+def render_high_end_news_terminal():
+    st.markdown("#### 🛰️ 高端情报终端 Pro")
+    st.write("整合全网快讯、公告、个股新闻、题材映射、风险雷达与 AI 多智能体研判，用来判断新闻流对 A 股板块和个股的影响。")
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        stock_code = st.text_input("关注个股代码（可选）", placeholder="例如：300750", key="news_stock_code")
+    with c2:
+        max_items = st.slider("情报数量", 20, 120, 60, 10)
+    with c3:
+        mode = st.selectbox("情报模式", ["标准", "深度", "极速"], index=0)
+
+    c4, c5 = st.columns([1, 1])
+    with c4:
+        include_wencai = st.checkbox("启用问财个股新闻/公告（可能较慢）", value=False)
+    with c5:
+        use_ai_news = st.checkbox("生成 AI 情报报告", value=True)
+
+    if st.button("🚀 启动高端情报扫描", type="primary", width="stretch"):
+        if use_ai_news and not api_key:
+            st.warning("未配置 GROQ_API_KEY，将只展示规则引擎分析。")
+            use_ai_news = False
+
+        with st.spinner("正在抓取新闻流、公告流与财经快讯..."):
+            fetcher = HighEndNewsFetcher(max_items=max_items)
+            raw = fetcher.collect(stock_code=stock_code.strip(), max_items=max_items, include_wencai=include_wencai)
+            items = raw.get("items", [])
+
+        if not items:
+            st.error("未获取到有效新闻数据。可能是云端接口受限，请稍后再试或关闭问财选项。")
+            if raw.get("errors"):
+                with st.expander("查看错误详情"):
+                    st.write(raw.get("errors"))
+            return
+
+        analyzer = HighEndNewsAnalyzer()
+        with st.spinner("正在进行题材识别、板块映射与风险雷达计算..."):
+            res = analyzer.analyze(items, stock_code=stock_code.strip(), use_ai=use_ai_news, mode=mode)
+
+        flow = res.get("flow", {})
+        risk = res.get("risk", {})
+        st.success(f"情报扫描完成：共获取 {len(items)} 条有效信息。")
+        if raw.get("errors"):
+            with st.expander("数据源提示 / 失败记录", expanded=False):
+                st.write("\n".join(raw.get("errors", [])[-20:]))
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("新闻流量分", f"{flow.get('score', 0)}")
+        m2.metric("流量阶段", flow.get("stage", "未知"))
+        m3.metric("风险等级", risk.get("risk_level", "未知"), f"{risk.get('risk_score', 0)}")
+        m4.metric("数据源数量", f"{flow.get('source_count', 0)}")
+
+        tab_a, tab_b, tab_c, tab_d, tab_e, tab_f = st.tabs(["📌 首席结论", "🔥 热点话题", "🏭 板块映射", "🎯 股票观察池", "⚠️ 风险雷达", "🧾 原始情报"])
+        with tab_a:
+            st.markdown(res.get("ai_report", {}).get("chief_report", "暂无报告"))
+            try:
+                HighEndNewsDB().save_run(mode, stock_code, flow.get("score", 0), res.get("ai_report", {}).get("chief_report", ""))
+            except Exception:
+                pass
+        with tab_b:
+            topics = res.get("topics", [])
+            if topics:
+                st.dataframe(pd.DataFrame(topics), width="stretch", hide_index=True)
+            else:
+                st.info("暂未识别出明确热点话题。")
+        with tab_c:
+            sector_view = res.get("sector_view", [])
+            if sector_view:
+                st.dataframe(pd.DataFrame(sector_view), width="stretch", hide_index=True)
+            else:
+                st.info("暂未形成明确板块映射。")
+        with tab_d:
+            cands = res.get("candidate_stocks", [])
+            if cands:
+                st.dataframe(pd.DataFrame(cands), width="stretch", hide_index=True)
+            else:
+                st.info("暂无候选股票。")
+        with tab_e:
+            factors = risk.get("risk_factors", [])
+            if factors:
+                for x in factors:
+                    st.warning(x)
+            else:
+                st.success("暂未识别到明显高风险新闻词。")
+        with tab_f:
+            show_cols = ["time", "platform", "source", "title", "impact_score", "matched_sectors"]
+            df_items = pd.DataFrame(items)
+            show_cols = [c for c in show_cols if c in df_items.columns]
+            st.dataframe(df_items[show_cols], width="stretch", hide_index=True)
+
+    with st.expander("📚 查看最近情报运行记录", expanded=False):
+        hist = HighEndNewsDB().recent_runs(10)
+        if hist is not None and not hist.empty:
+            st.dataframe(hist, width="stretch", hide_index=True)
+        else:
+            st.info("暂无历史记录。")
+
+# ================= 高端新闻情报终端模块结束 =================
+
 st.markdown("### 🌍 宏观市场实时看板")
 pulse_data = get_market_pulse()
 if pulse_data:
@@ -2403,13 +2849,14 @@ else:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ================= 终端功能选项卡 =================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 I. 个股标的解析",
     "📈 II. 宏观大盘推演",
     "🔥 III. 资金热点板块",
     "🦅 IV. 高阶情报终端",
     "🐉 V. 智瞰龙虎榜解析",
-    "🐋 VI. 主力资金选股"     # 新增这一行
+    "🐋 VI. 主力资金选股",
+    "🛰️ VII. 高端情报终端"
 ])
 
 # ================= Tab 1: 个股解析 =================
@@ -2894,3 +3341,8 @@ with tab5:
 
 with tab6:
     render_main_force_tab()
+
+# ================= Tab 7: 高端情报终端 Pro =================
+with tab7:
+    with st.container(border=True):
+        render_high_end_news_terminal()
