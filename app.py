@@ -144,6 +144,22 @@ def fetch_json(url, timeout=5, extra_headers=None):
         if DEBUG_MODE:
             st.error(f"Feed Error: {e}")
         return None
+def fast_fetch_json(url, timeout=2.5, extra_headers=None):
+    """首页/看板专用极速请求：不走重试器，避免一个接口拖住整个页面。"""
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": "https://finance.eastmoney.com/",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        res = requests.get(url, headers=headers, timeout=timeout)
+        if res.status_code != 200:
+            return None
+        return res.json()
+    except Exception:
+        return None
 
 # ================= 价格归一化修复 =================
 def normalize_em_price(raw_price, prev_close=None):
@@ -548,6 +564,7 @@ def fetch_em_minute_df(symbol: str, klt: int = 15, lmt: int = 600):
         return None
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def get_intraday_by_period(symbol: str, period: str, max_rows=320):
     """多源获取分钟 K 线：AKShare 优先，东方财富兜底。"""
     period = str(period)
@@ -1147,33 +1164,65 @@ def _build_pulse_item(price=0.0, pct=0.0, source="", status="正常"):
 @st.cache_data(ttl=30, show_spinner=False)
 def get_market_pulse():
     """
-    宏观看板极速稳定版。
-    设计原则：
-    1. 首页不能被宏观接口拖死；
-    2. 不在首页调用 AKShare 这类可能分页/慢加载的数据源；
-    3. 东方财富实时接口失败时，立即返回可展示的占位卡片；
-    4. 任何异常都不影响下方功能模块。
+    宏观看板极速稳定版 2.0：
+    - 首页只使用轻量批量接口，一次请求多个指数，避免逐个请求拖慢；
+    - 不在首页调用 AKShare 等重数据源；
+    - 任一接口失败立即降级为“待同步”，不影响其他模块；
+    - 成功数据写入 session_state，接口临时失败时可回显上一次成功数据。
     """
     targets = [
-        {"name": "上证指数", "secid": "1.000001", "fallback": 0.0},
-        {"name": "深证成指", "secid": "0.399001", "fallback": 0.0},
-        {"name": "创业板指", "secid": "0.399006", "fallback": 0.0},
-        {"name": "沪深300", "secid": "1.000300", "fallback": 0.0},
-        {"name": "科创50", "secid": "1.000688", "fallback": 0.0},
+        {"name": "上证指数", "secid": "1.000001"},
+        {"name": "深证成指", "secid": "0.399001"},
+        {"name": "创业板指", "secid": "0.399006"},
+        {"name": "沪深300", "secid": "1.000300"},
+        {"name": "科创50", "secid": "1.000688"},
     ]
 
     pulse = {}
+    secids = ",".join([x["secid"] for x in targets])
 
+    # 1）东方财富批量轻量接口：比逐个 get 快很多
+    try:
+        url = (
+            "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+            f"secids={secids}&fltt=2&invt=2"
+            "&fields=f12,f14,f2,f3,f4,f6,f104,f105,f106"
+        )
+        res = fast_fetch_json(url, timeout=2.8)
+        data = res.get("data", {}) if isinstance(res, dict) else {}
+        diff = data.get("diff", []) if isinstance(data, dict) else []
+        code_to_name = {x["secid"].split(".")[-1]: x["name"] for x in targets}
+        for row in diff:
+            code = str(row.get("f12", ""))
+            name = code_to_name.get(code) or row.get("f14")
+            if not name:
+                continue
+            price = safe_float(row.get("f2"), 0.0)
+            pct = safe_float(row.get("f3"), 0.0)
+            if price > 0:
+                pulse[name] = {
+                    "price": price,
+                    "pct": pct,
+                    "source": "东方财富批量",
+                    "status": "正常",
+                    "available": True,
+                }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"宏观看板批量接口失败：{e}")
+
+    # 2）如果批量接口漏项，用单项轻量接口补一次，但每项超时很短
     for item in targets:
         name = item["name"]
+        if name in pulse:
+            continue
         try:
             url = (
                 "https://push2.eastmoney.com/api/qt/stock/get?"
                 f"secid={item['secid']}&ut=fa5fd1943c7b386f172d6893dbfba10b"
                 "&fltt=2&invt=2&fields=f43,f170,f60"
             )
-            # 宏观看板必须快；这里故意设置短超时，失败就降级。
-            res = fetch_json(url, timeout=2)
+            res = fast_fetch_json(url, timeout=1.6)
             data = res.get("data") if isinstance(res, dict) else None
             if data:
                 raw_price = safe_float(data.get("f43"), 0.0)
@@ -1188,27 +1237,17 @@ def get_market_pulse():
                         "status": "正常",
                         "available": True,
                     }
-                    continue
-        except Exception as e:
-            if DEBUG_MODE:
-                st.caption(f"{name} 宏观看板实时源失败：{e}")
+        except Exception:
+            pass
 
-        pulse[name] = {
-            "price": item.get("fallback", 0.0),
-            "pct": 0.0,
-            "source": "极速占位",
-            "status": "实时源暂不可用",
-            "available": False,
-        }
-
-    # USD/CNH 单独处理。失败只影响这一张卡，不影响整个看板。
+    # 3）离岸人民币，失败不影响指数看板
     try:
         cnh_url = (
             "https://push2.eastmoney.com/api/qt/stock/get?"
             "secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b"
             "&fltt=2&invt=2&fields=f43,f170"
         )
-        cnh_res = fetch_json(cnh_url, timeout=2)
+        cnh_res = fast_fetch_json(cnh_url, timeout=1.6)
         cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
         if cnh_data:
             cnh_price = safe_float(cnh_data.get("f43"), 0.0)
@@ -1221,17 +1260,45 @@ def get_market_pulse():
                     "status": "正常",
                     "available": True,
                 }
-            else:
-                raise ValueError("CNH price empty")
-        else:
-            raise ValueError("CNH data empty")
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"USD/CNH 宏观看板实时源失败：{e}")
+    except Exception:
+        pass
+
+    # 4）上次成功数据回显：避免页面刷新后全部空白
+    last_good = st.session_state.get("_last_good_market_pulse", {})
+    for name, data in list(pulse.items()):
+        if isinstance(data, dict) and data.get("available") and safe_float(data.get("price"), 0) > 0:
+            last_good[name] = data
+    st.session_state["_last_good_market_pulse"] = last_good
+
+    for item in targets:
+        name = item["name"]
+        if name not in pulse and name in last_good:
+            old = dict(last_good[name])
+            old["status"] = "缓存回显"
+            old["source"] = old.get("source", "上次成功")
+            pulse[name] = old
+
+    if "USD/CNH(离岸)" not in pulse and "USD/CNH(离岸)" in last_good:
+        old = dict(last_good["USD/CNH(离岸)"])
+        old["status"] = "缓存回显"
+        pulse["USD/CNH(离岸)"] = old
+
+    # 5）最终占位：保证首页永不空白
+    for item in targets:
+        if item["name"] not in pulse:
+            pulse[item["name"]] = {
+                "price": 0.0,
+                "pct": 0.0,
+                "source": "待同步",
+                "status": "实时源暂不可用",
+                "available": False,
+            }
+
+    if "USD/CNH(离岸)" not in pulse:
         pulse["USD/CNH(离岸)"] = {
             "price": 0.0,
             "pct": 0.0,
-            "source": "极速占位",
+            "source": "待同步",
             "status": "实时源暂不可用",
             "available": False,
         }
@@ -1257,11 +1324,47 @@ def get_hot_blocks():
         pass
     return None
 
+@st.cache_data(ttl=30, show_spinner=False)
 def get_stock_quote(symbol):
+    """
+    个股实时行情极速版：
+    先走东方财富单股轻量接口，避免每次查询都拉取全市场 AKShare 实时列表；
+    东方财富失败后，再用 AKShare 兜底。
+    """
+    symbol = str(symbol).strip()
+    market = "1" if symbol.startswith(("6", "9", "5", "7")) else "0"
+
+    # 1）东方财富单股轻量接口：速度最快
+    try:
+        url = (
+            "https://push2.eastmoney.com/api/qt/stock/get?"
+            f"secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b"
+            "&fltt=2&invt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167"
+        )
+        res = fetch_json(url, timeout=4)
+        if res and res.get("data"):
+            d = res["data"]
+            prev_close = safe_float(d.get("f60"))
+            price = normalize_em_price(d.get("f43"), prev_close)
+            if price > 0:
+                return {
+                    "name": d.get("f58", "未知"),
+                    "price": price,
+                    "pct": safe_float(d.get("f170")),
+                    "market_cap": safe_float(d.get("f116")) / 100000000,
+                    "pe": d.get("f162", "-"),
+                    "pb": d.get("f167", "-"),
+                    "turnover": safe_float(d.get("f168")),
+                }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f"东方财富实时行情失败，回退 AKShare: {e}")
+
+    # 2）AKShare 全市场实时列表兜底
     try:
         spot_df = ak.stock_zh_a_spot_em()
         if spot_df is not None and not spot_df.empty:
-            row = spot_df[spot_df["代码"].astype(str) == str(symbol)]
+            row = spot_df[spot_df["代码"].astype(str).str.zfill(6) == symbol.zfill(6)]
             if not row.empty:
                 row = row.iloc[0]
                 return {
@@ -1271,29 +1374,15 @@ def get_stock_quote(symbol):
                     "market_cap": safe_float(row.get("总市值")) / 100000000,
                     "pe": row.get("市盈率-动态", "-"),
                     "pb": row.get("市净率", "-"),
-                    "turnover": safe_float(row.get("换手率"))
+                    "turnover": safe_float(row.get("换手率")),
                 }
     except Exception as e:
         if DEBUG_MODE:
-            st.warning(f"AKShare 实时行情失败，回退东财: {e}")
-    market = "1" if str(symbol).startswith(("6", "9", "5", "7")) else "0"
-    url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167"
-    res = fetch_json(url)
-    if res and res.get("data"):
-        d = res["data"]
-        prev_close = safe_float(d.get("f60"))
-        price = normalize_em_price(d.get("f43"), prev_close)
-        return {
-            "name": d.get("f58", "未知"),
-            "price": price,
-            "pct": safe_float(d.get("f170")),
-            "market_cap": safe_float(d.get("f116")) / 100000000,
-            "pe": d.get("f162", "-"),
-            "pb": d.get("f167", "-"),
-            "turnover": safe_float(d.get("f168"))
-        }
+            st.warning(f"AKShare 实时行情兜底失败: {e}")
+
     return None
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_kline(symbol, days=220):
     end_date = datetime.now()
     start_date = end_date - pd.Timedelta(days=days + 150)
@@ -1602,7 +1691,7 @@ class MacroAnalysisEngine:
 # ====== 宏观 UI 渲染函数 ======
 def display_macro_analysis_ui():
     st.info("本板块通过国家统计局官方接口抓取最新宏观经济数据，并联动 AI 多智能体进行 A 股大势研判与行业映射。")
-    if st.button("🚀 启动全局宏观深度推演", type="primary", use_container_width=True):
+    if st.button("🚀 启动全局宏观深度推演", type="primary", width="stretch"):
         if not api_key:
             st.error("配置缺失: GROQ_API_KEY")
             return
@@ -1628,7 +1717,7 @@ def display_macro_analysis_ui():
                 snap = res["raw_data"].get("macro_snapshot", {})
                 if snap:
                     df_snap = pd.DataFrame([{"指标": v["label"], "最新值": f"{v['value']}{v['unit']}", "发布期": v["period_label"], "环比/同比变动": f"{v['change']:+.2f}{v['unit']}" if v.get("change") else "-"} for k,v in snap.items()])
-                    st.dataframe(df_snap, use_container_width=True, hide_index=True)
+                    st.dataframe(df_snap, width="stretch", hide_index=True)
             with mt3:
                 st.markdown(res["agents_analysis"]["sector"]["analysis"])
             with mt4:
@@ -3006,7 +3095,7 @@ with tab1:
         col1, col2 = st.columns([1, 1])
         with col1:
             symbol_input = st.text_input("标的代码", placeholder="例：600519")
-            analyze_btn = st.button("启动核心算法", type="primary", use_container_width=True)
+            analyze_btn = st.button("启动核心算法", type="primary", width="stretch")
         if analyze_btn:
             if not api_key:
                 st.error("配置缺失: GROQ_API_KEY")
@@ -3052,7 +3141,7 @@ with tab1:
                         tech = summarize_technicals(df_kline)
                         smc = tech["smc"]
                         fig = build_price_figure(df_kline)
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                         st.markdown("##### 🔬 核心技术指标与阻力测算")
                         t1, t2, t3, t4 = st.columns(4)
@@ -3280,7 +3369,7 @@ with tab3:
                     blocks = get_hot_blocks()
                     if blocks:
                         df_blocks = pd.DataFrame(blocks)
-                        st.dataframe(df_blocks, use_container_width=True, hide_index=True)
+                        st.dataframe(df_blocks, width="stretch", hide_index=True)
                         with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
                             blocks_str = "\n".join([f"{b['板块名称']} (涨幅:{b['涨跌幅']}%, 领涨龙头:{b['领涨股票']})" for b in blocks[:5]])
                             prompt = f"""
@@ -3346,7 +3435,7 @@ with tab4:
 with tab5:
     with st.container(border=True):
         st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 3.0")
-        st.write("整合优化版龙虎榜数据采集、自动回溯、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。已移除 StockAPI 相关依赖。")
+        st.write("整合优化版龙虎榜数据采集、自动回溯、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。已移除外部付费数据源依赖。")
 
         col_date, col_lookback, col_depth = st.columns([1, 1, 1])
         with col_date:
