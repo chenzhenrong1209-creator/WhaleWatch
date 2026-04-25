@@ -808,6 +808,305 @@ def render_tf_card(tf: dict, title: str):
         st.caption(f"目标1: {tf['target_1']:.2f}")
     st.info(tf.get("advice", "等待确认"))
 
+
+# ================= 个股评分、交易计划、自选池扫描增强 =================
+def _clamp(value, low=0, high=20):
+    try:
+        return max(low, min(high, float(value)))
+    except Exception:
+        return low
+
+
+def _score_label(total_score: float) -> str:
+    if total_score >= 82:
+        return "强势观察"
+    if total_score >= 70:
+        return "偏多观察"
+    if total_score >= 58:
+        return "震荡观察"
+    if total_score >= 45:
+        return "谨慎等待"
+    return "暂不参与"
+
+
+def _action_suggestion(total_score: float, mtf_view: str, rr: float) -> str:
+    if total_score >= 82 and rr >= 1.5:
+        return "强势票，优先等回踩低吸或放量突破确认"
+    if total_score >= 70:
+        return "偏多，但不追高；等分时回踩支撑后再判断"
+    if "偏空" in str(mtf_view) or total_score < 45:
+        return "先回避，等重新站回关键均线或多周期转强"
+    return "观察为主，等待15分钟与60分钟同向"
+
+
+def build_trade_plan_from_inputs(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) -> dict:
+    price = safe_float(quote.get("price"), mtf.get("current_close") or 0)
+    key_support = mtf.get("key_support")
+    key_pressure = mtf.get("key_pressure")
+    atr = None
+    recent_low = None
+    recent_high = None
+    if df_kline is not None and not df_kline.empty:
+        try:
+            tmp = add_indicators(df_kline.copy())
+            last = tmp.iloc[-1]
+            atr = safe_float(last.get("atr14"), 0)
+            recent_low = float(tmp.tail(min(30, len(tmp)))["low"].min())
+            recent_high = float(tmp.tail(min(30, len(tmp)))["high"].max())
+        except Exception:
+            pass
+    if not key_support:
+        key_support = recent_low or price * 0.94
+    if not key_pressure:
+        key_pressure = recent_high or price * 1.08
+    atr = atr if atr and atr > 0 else max(price * 0.025, (key_pressure - key_support) / 6 if key_pressure > key_support else price * 0.025)
+
+    aggressive_entry = round(price, 2)
+    steady_low = round(max(key_support, price - atr * 1.2), 2)
+    steady_high = round(max(key_support, price - atr * 0.35), 2)
+    breakout_price = round(key_pressure * 1.01, 2)
+    stop_loss = round(max(0.01, min(key_support - atr * 0.35, price * 0.93)), 2)
+    target_1 = round(max(key_pressure, price + atr * 1.2), 2)
+    risk = max(price - stop_loss, price * 0.01)
+    target_2 = round(price + risk * 2.0, 2)
+    rr = round(max(target_1 - price, 0) / risk, 2) if risk > 0 else 0
+
+    invalidation = "跌破风控位且无法快速收回；或放量跌破60分钟支撑"
+    if mtf.get("final_view") and "偏空" in mtf.get("final_view"):
+        invalidation = "多周期仍偏空，未重新站上15/60分钟关键压力前不主动进攻"
+
+    return {
+        "current_price": round(price, 2),
+        "aggressive_entry": aggressive_entry,
+        "steady_entry_zone": f"{steady_low:.2f} - {steady_high:.2f}",
+        "breakout_price": breakout_price,
+        "stop_loss": stop_loss,
+        "target_1": target_1,
+        "target_2": target_2,
+        "rr": rr,
+        "invalidation": invalidation,
+        "position_advice": "观察仓10%-20%" if rr < 1.2 else "试探仓20%-30%" if rr < 2 else "趋势确认后可提高至30%-40%",
+    }
+
+
+def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) -> dict:
+    turnover = safe_float(quote.get("turnover"), 0)
+    pct = safe_float(quote.get("pct"), 0)
+    pe = safe_float(quote.get("pe"), 0)
+    market_cap = safe_float(quote.get("market_cap"), 0)
+
+    tech_score = 8
+    volume_score = 8
+    position_score = 8
+    risk_score = 10
+    tech_summary = {}
+
+    if df_kline is not None and not df_kline.empty and len(df_kline) >= 15:
+        try:
+            tmp = add_indicators(df_kline.copy())
+            tech = summarize_technicals(tmp)
+            latest = tmp.iloc[-1]
+            high_60 = float(tmp.tail(min(60, len(tmp)))["high"].max())
+            low_60 = float(tmp.tail(min(60, len(tmp)))["low"].min())
+            loc = (float(latest["close"]) - low_60) / (high_60 - low_60) if high_60 > low_60 else 0.5
+
+            tech_score = 10
+            if tech.get("trend") == "多头趋势":
+                tech_score += 5
+            elif tech.get("trend") == "空头趋势":
+                tech_score -= 4
+            if tech.get("macd_state") == "金叉后增强":
+                tech_score += 3
+            elif tech.get("macd_state") == "死叉后走弱":
+                tech_score -= 3
+            if pd.notna(tech.get("rsi14")):
+                rsi = float(tech.get("rsi14"))
+                if 52 <= rsi <= 68:
+                    tech_score += 2
+                elif rsi >= 78 or rsi <= 35:
+                    tech_score -= 2
+            if "向上" in str(tech.get("bos_state")):
+                tech_score += 2
+            if "向下" in str(tech.get("bos_state")):
+                tech_score -= 2
+            if "向下扫流动性后收回" in str(tech.get("sweep_state")):
+                tech_score += 1
+            if "向上扫流动性后回落" in str(tech.get("sweep_state")):
+                tech_score -= 1
+
+            volume_score = 8
+            if tech.get("vol_state") == "显著放量" and pct >= 0:
+                volume_score += 6
+            elif tech.get("vol_state") == "显著放量" and pct < 0:
+                volume_score -= 4
+            elif tech.get("vol_state") == "明显缩量":
+                volume_score -= 1
+            if turnover >= 8:
+                volume_score += 4
+            elif turnover >= 3:
+                volume_score += 2
+            if pct >= 5:
+                volume_score += 2
+            elif pct <= -4:
+                volume_score -= 3
+
+            if loc <= 0.25:
+                position_score = 15
+            elif loc <= 0.55:
+                position_score = 18
+            elif loc <= 0.78:
+                position_score = 14
+            else:
+                position_score = 9
+            if float(latest["close"]) > float(latest.get("ema_short", latest["close"])):
+                position_score += 2
+            if float(latest["close"]) < float(latest.get("ema_mid", latest["close"])):
+                position_score -= 3
+
+            risk_score = 12
+            if pe and pe > 120:
+                risk_score -= 4
+            elif pe and 0 < pe < 35:
+                risk_score += 2
+            if market_cap and market_cap < 80:
+                risk_score -= 1
+            if loc > 0.85 and pct > 5:
+                risk_score -= 4
+            if turnover > 18:
+                risk_score -= 2
+            tech_summary = tech
+        except Exception as e:
+            if DEBUG_MODE:
+                st.warning(f"评分计算降级: {e}")
+
+    mtf_score_raw = safe_float(mtf.get("score"), 0)
+    mtf_score = 10 + mtf_score_raw * 1.6
+    if "强共振偏多" in str(mtf.get("final_view")):
+        mtf_score += 4
+    elif "偏多" in str(mtf.get("final_view")):
+        mtf_score += 2
+    elif "偏空" in str(mtf.get("final_view")):
+        mtf_score -= 4
+    elif "分歧" in str(mtf.get("final_view")):
+        mtf_score -= 1
+
+    detail_scores = {
+        "趋势结构": round(_clamp(tech_score), 1),
+        "多周期共振": round(_clamp(mtf_score), 1),
+        "量能资金": round(_clamp(volume_score), 1),
+        "位置舒适度": round(_clamp(position_score), 1),
+        "风险控制": round(_clamp(risk_score), 1),
+    }
+    total = round(sum(detail_scores.values()), 1)
+    plan = build_trade_plan_from_inputs(quote, df_kline, mtf)
+    label = _score_label(total)
+    action = _action_suggestion(total, mtf.get("final_view", ""), safe_float(plan.get("rr"), 0))
+
+    return {
+        "total_score": total,
+        "label": label,
+        "action": action,
+        "detail_scores": detail_scores,
+        "plan": plan,
+        "tech_summary": tech_summary,
+    }
+
+
+def render_score_panel(assessment: dict):
+    st.markdown("##### 🧮 个股评分系统（新增）")
+    total = assessment.get("total_score", 0)
+    label = assessment.get("label", "-")
+    a1, a2 = st.columns([1, 2])
+    with a1:
+        st.metric("综合评分", f"{total:.1f}/100", label)
+    with a2:
+        st.info(f"执行建议：**{assessment.get('action', '等待确认')}**")
+    score_df = pd.DataFrame([
+        {"维度": k, "得分": v, "满分": 20} for k, v in assessment.get("detail_scores", {}).items()
+    ])
+    st.dataframe(score_df, width="stretch", hide_index=True)
+
+
+def render_trade_plan_card(assessment: dict):
+    st.markdown("##### 🧾 买卖计划卡片（新增）")
+    plan = assessment.get("plan", {})
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("当前参考价", f"{plan.get('current_price', 0):.2f}")
+    p2.metric("激进介入", f"{plan.get('aggressive_entry', 0):.2f}")
+    p3.metric("止损位", f"{plan.get('stop_loss', 0):.2f}")
+    p4.metric("盈亏比", f"{plan.get('rr', 0):.2f}")
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("稳健低吸区", str(plan.get("steady_entry_zone", "-")))
+    q2.metric("突破确认价", f"{plan.get('breakout_price', 0):.2f}")
+    q3.metric("目标一", f"{plan.get('target_1', 0):.2f}")
+    q4.metric("目标二", f"{plan.get('target_2', 0):.2f}")
+    st.caption(f"仓位建议：{plan.get('position_advice', '-')}｜失效条件：{plan.get('invalidation', '-')}")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def analyze_stock_for_watchlist(symbol: str) -> dict:
+    symbol = str(symbol).strip()
+    quote = get_stock_quote(symbol)
+    if not quote:
+        return {"代码": symbol, "名称": "无法获取", "评分": 0, "状态": "无数据", "操作": "跳过"}
+    df_kline = get_kline(symbol, days=160)
+    mtf = get_multi_timeframe_analysis(symbol)
+    assessment = score_stock_analysis(quote, df_kline, mtf)
+    plan = assessment.get("plan", {})
+    return {
+        "代码": symbol,
+        "名称": quote.get("name", "未知"),
+        "现价": round(safe_float(quote.get("price")), 2),
+        "涨跌幅%": round(safe_float(quote.get("pct")), 2),
+        "换手率%": round(safe_float(quote.get("turnover")), 2),
+        "评分": assessment.get("total_score", 0),
+        "状态": assessment.get("label", "-"),
+        "多周期": mtf.get("final_view", "-"),
+        "低吸区": plan.get("steady_entry_zone", "-"),
+        "突破价": plan.get("breakout_price", "-"),
+        "止损": plan.get("stop_loss", "-"),
+        "目标一": plan.get("target_1", "-"),
+        "操作": assessment.get("action", "等待确认"),
+    }
+
+
+def render_watchlist_scanner():
+    st.markdown("#### 📋 自选股池批量扫描（新增）")
+    st.caption("一次扫描多只股票，自动给出评分、状态、低吸区、突破价、止损位和操作建议。建议一次 5-10 只，云端更稳定。")
+    default_pool = "688523,300750,600276,002371,300308,601138"
+    pool_text = st.text_area("输入自选股代码，用逗号、空格或换行分隔", value=default_pool, height=90)
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        max_scan = st.slider("本次最多扫描", 3, 20, 8)
+    with c2:
+        min_score = st.slider("最低显示评分", 0, 100, 0)
+    with c3:
+        run_scan = st.button("🚀 批量扫描自选股", type="primary", width="stretch")
+    if run_scan:
+        codes = [x.strip() for x in re.split(r"[，,\s]+", pool_text) if x.strip()]
+        codes = [c for c in codes if re.fullmatch(r"\d{6}", c)]
+        codes = list(dict.fromkeys(codes))[:max_scan]
+        if not codes:
+            st.warning("请至少输入一个 6 位股票代码。")
+            return
+        progress = st.progress(0)
+        rows = []
+        for i, code in enumerate(codes, start=1):
+            progress.progress(i / len(codes), text=f"正在扫描 {code} ({i}/{len(codes)})")
+            try:
+                rows.append(analyze_stock_for_watchlist(code))
+            except Exception as e:
+                rows.append({"代码": code, "名称": "扫描失败", "评分": 0, "状态": "异常", "操作": str(e)[:60]})
+        progress.empty()
+        df_scan = pd.DataFrame(rows)
+        if "评分" in df_scan.columns:
+            df_scan = df_scan[df_scan["评分"] >= min_score].sort_values("评分", ascending=False)
+        st.success(f"扫描完成：共 {len(codes)} 只，显示 {len(df_scan)} 只。")
+        st.dataframe(df_scan, width="stretch", hide_index=True)
+        if not df_scan.empty:
+            top = df_scan.iloc[0]
+            st.info(f"当前评分最高：**{top.get('名称')}({top.get('代码')})**，评分 **{top.get('评分')}**，操作建议：{top.get('操作')}")
+
 # ================= 核心数据流 =================
 @st.cache_data(ttl=60)
 def get_global_news():
@@ -2194,6 +2493,11 @@ with tab1:
                     c3.metric("动态 PE", f"{quote['pe']}")
                     c4.metric("换手率", f"{quote['turnover']:.2f}%")
 
+                    # 新增：先给出结构化评分和交易计划，再进入详细技术图与 AI 解读
+                    assessment = score_stock_analysis(quote, df_kline, mtf)
+                    render_score_panel(assessment)
+                    render_trade_plan_card(assessment)
+
                     if df_kline is None or len(df_kline) < 15:
                         st.warning("获取到的有效 K 线极少，仅能通过最新行情进行轻量化推演。")
                         with st.spinner("🧠 首席策略官撰写资产评估报告..."):
@@ -2416,6 +2720,10 @@ with tab1:
 5. 最后一行给明确结论：看多 / 观察 / 谨慎 / 偏空
 """
                             st.markdown(call_ai(prompt))
+
+    st.markdown("---")
+    with st.container(border=True):
+        render_watchlist_scanner()
 
 # ================= Tab 2: 宏观大盘推演 (已升级为多智能体版本) =================
 with tab2:
