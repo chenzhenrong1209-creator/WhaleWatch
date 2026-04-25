@@ -60,7 +60,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.4.3-LHB-NO-STOCKAPI | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.1 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -143,22 +143,6 @@ def fetch_json(url, timeout=5, extra_headers=None):
     except Exception as e:
         if DEBUG_MODE:
             st.error(f"Feed Error: {e}")
-        return None
-def fast_fetch_json(url, timeout=2.5, extra_headers=None):
-    """首页/看板专用极速请求：不走重试器，避免一个接口拖住整个页面。"""
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Referer": "https://finance.eastmoney.com/",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-    try:
-        res = requests.get(url, headers=headers, timeout=timeout)
-        if res.status_code != 200:
-            return None
-        return res.json()
-    except Exception:
         return None
 
 # ================= 价格归一化修复 =================
@@ -564,7 +548,6 @@ def fetch_em_minute_df(symbol: str, klt: int = 15, lmt: int = 600):
         return None
 
 
-@st.cache_data(ttl=120, show_spinner=False)
 def get_intraday_by_period(symbol: str, period: str, max_rows=320):
     """多源获取分钟 K 线：AKShare 优先，东方财富兜底。"""
     period = str(period)
@@ -1137,172 +1120,19 @@ def get_global_news():
                 news.append(f"[{item.get('create_time', '')}] {text}")
     return news
 
-def _normalize_market_price(value, prefer_scale=None):
-    """指数/汇率价格归一化，兼容东财不同接口偶发的放大倍数。"""
-    price = safe_float(value, default=0.0)
-    if price <= 0:
-        return 0.0
-    if prefer_scale:
-        return price / prefer_scale
-    # 指数常见区间 500-10000；东财有时返回 306422 这种扩大100倍的值
-    if price > 100000:
-        return price / 100
-    if price > 20000:
-        return price / 100
-    return price
-
-
-def _build_pulse_item(price=0.0, pct=0.0, source="", status="正常"):
-    return {
-        "price": safe_float(price, 0.0),
-        "pct": safe_float(pct, 0.0),
-        "source": source,
-        "status": status,
-    }
-
-
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=60)
 def get_market_pulse():
-    """
-    宏观看板极速稳定版 2.0：
-    - 首页只使用轻量批量接口，一次请求多个指数，避免逐个请求拖慢；
-    - 不在首页调用 AKShare 等重数据源；
-    - 任一接口失败立即降级为“待同步”，不影响其他模块；
-    - 成功数据写入 session_state，接口临时失败时可回显上一次成功数据。
-    """
-    targets = [
-        {"name": "上证指数", "secid": "1.000001"},
-        {"name": "深证成指", "secid": "0.399001"},
-        {"name": "创业板指", "secid": "0.399006"},
-        {"name": "沪深300", "secid": "1.000300"},
-        {"name": "科创50", "secid": "1.000688"},
-    ]
-
     pulse = {}
-    secids = ",".join([x["secid"] for x in targets])
-
-    # 1）东方财富批量轻量接口：比逐个 get 快很多
-    try:
-        url = (
-            "https://push2.eastmoney.com/api/qt/ulist.np/get?"
-            f"secids={secids}&fltt=2&invt=2"
-            "&fields=f12,f14,f2,f3,f4,f6,f104,f105,f106"
-        )
-        res = fast_fetch_json(url, timeout=2.8)
-        data = res.get("data", {}) if isinstance(res, dict) else {}
-        diff = data.get("diff", []) if isinstance(data, dict) else []
-        code_to_name = {x["secid"].split(".")[-1]: x["name"] for x in targets}
-        for row in diff:
-            code = str(row.get("f12", ""))
-            name = code_to_name.get(code) or row.get("f14")
-            if not name:
-                continue
-            price = safe_float(row.get("f2"), 0.0)
-            pct = safe_float(row.get("f3"), 0.0)
-            if price > 0:
-                pulse[name] = {
-                    "price": price,
-                    "pct": pct,
-                    "source": "东方财富批量",
-                    "status": "正常",
-                    "available": True,
-                }
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"宏观看板批量接口失败：{e}")
-
-    # 2）如果批量接口漏项，用单项轻量接口补一次，但每项超时很短
-    for item in targets:
-        name = item["name"]
-        if name in pulse:
-            continue
-        try:
-            url = (
-                "https://push2.eastmoney.com/api/qt/stock/get?"
-                f"secid={item['secid']}&ut=fa5fd1943c7b386f172d6893dbfba10b"
-                "&fltt=2&invt=2&fields=f43,f170,f60"
-            )
-            res = fast_fetch_json(url, timeout=1.6)
-            data = res.get("data") if isinstance(res, dict) else None
-            if data:
-                raw_price = safe_float(data.get("f43"), 0.0)
-                prev_close = safe_float(data.get("f60"), 0.0)
-                price = normalize_em_price(raw_price, prev_close)
-                pct = safe_float(data.get("f170"), 0.0)
-                if price > 0:
-                    pulse[name] = {
-                        "price": price,
-                        "pct": pct,
-                        "source": "东方财富",
-                        "status": "正常",
-                        "available": True,
-                    }
-        except Exception:
-            pass
-
-    # 3）离岸人民币，失败不影响指数看板
-    try:
-        cnh_url = (
-            "https://push2.eastmoney.com/api/qt/stock/get?"
-            "secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b"
-            "&fltt=2&invt=2&fields=f43,f170"
-        )
-        cnh_res = fast_fetch_json(cnh_url, timeout=1.6)
-        cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
-        if cnh_data:
-            cnh_price = safe_float(cnh_data.get("f43"), 0.0)
-            cnh_pct = safe_float(cnh_data.get("f170"), 0.0)
-            if cnh_price > 0:
-                pulse["USD/CNH(离岸)"] = {
-                    "price": cnh_price,
-                    "pct": cnh_pct,
-                    "source": "东方财富",
-                    "status": "正常",
-                    "available": True,
-                }
-    except Exception:
-        pass
-
-    # 4）上次成功数据回显：避免页面刷新后全部空白
-    last_good = st.session_state.get("_last_good_market_pulse", {})
-    for name, data in list(pulse.items()):
-        if isinstance(data, dict) and data.get("available") and safe_float(data.get("price"), 0) > 0:
-            last_good[name] = data
-    st.session_state["_last_good_market_pulse"] = last_good
-
-    for item in targets:
-        name = item["name"]
-        if name not in pulse and name in last_good:
-            old = dict(last_good[name])
-            old["status"] = "缓存回显"
-            old["source"] = old.get("source", "上次成功")
-            pulse[name] = old
-
-    if "USD/CNH(离岸)" not in pulse and "USD/CNH(离岸)" in last_good:
-        old = dict(last_good["USD/CNH(离岸)"])
-        old["status"] = "缓存回显"
-        pulse["USD/CNH(离岸)"] = old
-
-    # 5）最终占位：保证首页永不空白
-    for item in targets:
-        if item["name"] not in pulse:
-            pulse[item["name"]] = {
-                "price": 0.0,
-                "pct": 0.0,
-                "source": "待同步",
-                "status": "实时源暂不可用",
-                "available": False,
-            }
-
-    if "USD/CNH(离岸)" not in pulse:
-        pulse["USD/CNH(离岸)"] = {
-            "price": 0.0,
-            "pct": 0.0,
-            "source": "待同步",
-            "status": "实时源暂不可用",
-            "available": False,
-        }
-
+    indices = {"上证指数": "1.000001", "深证成指": "0.399001", "创业板指": "0.399006"}
+    for name, code in indices.items():
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={code}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
+        res = fetch_json(url)
+        if res and res.get("data"):
+            pulse[name] = {"price": safe_float(res["data"].get("f43")), "pct": safe_float(res["data"].get("f170"))}
+    cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
+    cnh_res = fetch_json(cnh_url)
+    if cnh_res and cnh_res.get("data"):
+        pulse["USD/CNH(离岸)"] = {"price": safe_float(cnh_res["data"].get("f43")), "pct": safe_float(cnh_res["data"].get("f170"))}
     return pulse
 
 @st.cache_data(ttl=300)
@@ -1324,47 +1154,11 @@ def get_hot_blocks():
         pass
     return None
 
-@st.cache_data(ttl=30, show_spinner=False)
 def get_stock_quote(symbol):
-    """
-    个股实时行情极速版：
-    先走东方财富单股轻量接口，避免每次查询都拉取全市场 AKShare 实时列表；
-    东方财富失败后，再用 AKShare 兜底。
-    """
-    symbol = str(symbol).strip()
-    market = "1" if symbol.startswith(("6", "9", "5", "7")) else "0"
-
-    # 1）东方财富单股轻量接口：速度最快
-    try:
-        url = (
-            "https://push2.eastmoney.com/api/qt/stock/get?"
-            f"secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b"
-            "&fltt=2&invt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167"
-        )
-        res = fetch_json(url, timeout=4)
-        if res and res.get("data"):
-            d = res["data"]
-            prev_close = safe_float(d.get("f60"))
-            price = normalize_em_price(d.get("f43"), prev_close)
-            if price > 0:
-                return {
-                    "name": d.get("f58", "未知"),
-                    "price": price,
-                    "pct": safe_float(d.get("f170")),
-                    "market_cap": safe_float(d.get("f116")) / 100000000,
-                    "pe": d.get("f162", "-"),
-                    "pb": d.get("f167", "-"),
-                    "turnover": safe_float(d.get("f168")),
-                }
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f"东方财富实时行情失败，回退 AKShare: {e}")
-
-    # 2）AKShare 全市场实时列表兜底
     try:
         spot_df = ak.stock_zh_a_spot_em()
         if spot_df is not None and not spot_df.empty:
-            row = spot_df[spot_df["代码"].astype(str).str.zfill(6) == symbol.zfill(6)]
+            row = spot_df[spot_df["代码"].astype(str) == str(symbol)]
             if not row.empty:
                 row = row.iloc[0]
                 return {
@@ -1374,15 +1168,29 @@ def get_stock_quote(symbol):
                     "market_cap": safe_float(row.get("总市值")) / 100000000,
                     "pe": row.get("市盈率-动态", "-"),
                     "pb": row.get("市净率", "-"),
-                    "turnover": safe_float(row.get("换手率")),
+                    "turnover": safe_float(row.get("换手率"))
                 }
     except Exception as e:
         if DEBUG_MODE:
-            st.warning(f"AKShare 实时行情兜底失败: {e}")
-
+            st.warning(f"AKShare 实时行情失败，回退东财: {e}")
+    market = "1" if str(symbol).startswith(("6", "9", "5", "7")) else "0"
+    url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167"
+    res = fetch_json(url)
+    if res and res.get("data"):
+        d = res["data"]
+        prev_close = safe_float(d.get("f60"))
+        price = normalize_em_price(d.get("f43"), prev_close)
+        return {
+            "name": d.get("f58", "未知"),
+            "price": price,
+            "pct": safe_float(d.get("f170")),
+            "market_cap": safe_float(d.get("f116")) / 100000000,
+            "pe": d.get("f162", "-"),
+            "pb": d.get("f167", "-"),
+            "turnover": safe_float(d.get("f168"))
+        }
     return None
 
-@st.cache_data(ttl=300, show_spinner=False)
 def get_kline(symbol, days=220):
     end_date = datetime.now()
     start_date = end_date - pd.Timedelta(days=days + 150)
@@ -1482,254 +1290,6 @@ def get_kline(symbol, days=220):
         if DEBUG_MODE:
             st.warning(f"Tushare 兜底失败: {e}")
     return None
-
-
-# ================= 行情可靠性增强层 v7.0 =================
-# 说明：前一版为了提速，把个股行情过度依赖“单股极速接口”。
-# 这一层改成“多源完整数据优先”：东方财富单股 → AKShare 实时 → 东方财富K线 → AKShare日K → Baostock/Tushare。
-# 即使实时行情源失败，也会用最近日K构造可分析 quote，避免批量扫描全是“无法获取”。
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def get_stock_name(symbol: str) -> str:
-    symbol = str(symbol).strip().zfill(6)
-    try:
-        code_name_df = ak.stock_info_a_code_name()
-        if code_name_df is not None and not code_name_df.empty:
-            cols = list(code_name_df.columns)
-            code_col = 'code' if 'code' in cols else '证券代码' if '证券代码' in cols else '代码' if '代码' in cols else cols[0]
-            name_col = 'name' if 'name' in cols else '证券简称' if '证券简称' in cols else '名称' if '名称' in cols else cols[1]
-            row = code_name_df[code_name_df[code_col].astype(str).str.zfill(6) == symbol]
-            if not row.empty:
-                return str(row.iloc[0][name_col])
-    except Exception:
-        pass
-    return symbol
-
-
-def _normalize_daily_kline_df(df: pd.DataFrame) -> pd.DataFrame | None:
-    if df is None or df.empty:
-        return None
-    df = df.copy()
-    rename_map = {
-        '日期': 'date', '时间': 'date', 'trade_date': 'date',
-        '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
-        '成交量': 'volume', '成交额': 'amount', '换手率': 'turnover_rate',
-        'vol': 'volume', 'turnover': 'turnover_rate'
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-    need = ['date', 'open', 'high', 'low', 'close', 'volume']
-    if not all(c in df.columns for c in need):
-        return None
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    if 'turnover_rate' in df.columns:
-        df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
-    else:
-        df['turnover_rate'] = 0.0
-    df = df.dropna(subset=need).sort_values('date').reset_index(drop=True)
-    if df.empty:
-        return None
-    return df[['date', 'open', 'high', 'low', 'close', 'volume', 'turnover_rate']]
-
-
-def fetch_em_daily_kline(symbol: str, days: int = 220) -> pd.DataFrame | None:
-    """东方财富日K兜底源。相比 AKShare 包装层，这里直接请求轻量K线接口。"""
-    symbol = str(symbol).strip().zfill(6)
-    market = '1' if symbol.startswith(('6', '9', '5', '7')) else '0'
-    url = (
-        'https://push2his.eastmoney.com/api/qt/stock/kline/get?'
-        f'secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b'
-        '&fields1=f1,f2,f3,f4,f5,f6'
-        '&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'
-        f'&klt=101&fqt=1&end=20500101&lmt={max(days + 80, 260)}'
-    )
-    try:
-        res = fetch_json(url, timeout=8)
-        klines = res.get('data', {}).get('klines', []) if isinstance(res, dict) else []
-        rows = []
-        for item in klines:
-            p = str(item).split(',')
-            if len(p) >= 11:
-                rows.append({
-                    'date': p[0], 'open': p[1], 'close': p[2], 'high': p[3], 'low': p[4],
-                    'volume': p[5], 'amount': p[6], 'amplitude': p[7], 'pct': p[8],
-                    'change': p[9], 'turnover_rate': p[10]
-                })
-        out = _normalize_daily_kline_df(pd.DataFrame(rows)) if rows else None
-        if out is not None and not out.empty:
-            return out.tail(days).reset_index(drop=True)
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'东方财富日K兜底失败: {e}')
-    return None
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_kline(symbol, days=220):
-    """完整优先的多源日K：东方财富直连 → AKShare qfq/raw → Baostock → Tushare。"""
-    symbol = str(symbol).strip().zfill(6)
-    end_date = datetime.now()
-    start_date = end_date - pd.Timedelta(days=days + 220)
-    start_str = start_date.strftime('%Y%m%d')
-    end_str = end_date.strftime('%Y%m%d')
-    start_str_bs = start_date.strftime('%Y-%m-%d')
-    end_str_bs = end_date.strftime('%Y-%m-%d')
-
-    df = fetch_em_daily_kline(symbol, days=days)
-    if df is not None and not df.empty:
-        return df
-
-    try:
-        df = ak.stock_zh_a_hist(symbol=symbol, period='daily', start_date=start_str, end_date=end_str, adjust='qfq')
-        df = _normalize_daily_kline_df(df)
-        if df is not None and not df.empty:
-            return df.tail(days).reset_index(drop=True)
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'AKShare qfq 降级失败: {e}')
-
-    try:
-        df = ak.stock_zh_a_hist(symbol=symbol, period='daily', start_date=start_str, end_date=end_str, adjust='')
-        df = _normalize_daily_kline_df(df)
-        if df is not None and not df.empty:
-            return df.tail(days).reset_index(drop=True)
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'AKShare raw 降级失败: {e}')
-
-    try:
-        bs.login()
-        bs_code = f"sh.{symbol}" if symbol.startswith(('6', '9', '5', '7')) else f"sz.{symbol}"
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            'date,open,high,low,close,volume',
-            start_date=start_str_bs,
-            end_date=end_str_bs,
-            frequency='d',
-            adjustflag='2'
-        )
-        data_list = []
-        while (rs.error_code == '0') and rs.next():
-            data_list.append(rs.get_row_data())
-        try:
-            bs.logout()
-        except Exception:
-            pass
-        if data_list:
-            df = pd.DataFrame(data_list, columns=rs.fields)
-            df = _normalize_daily_kline_df(df)
-            if df is not None and not df.empty:
-                return df.tail(days).reset_index(drop=True)
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'Baostock 降级失败: {e}')
-        try:
-            bs.logout()
-        except Exception:
-            pass
-
-    try:
-        if ts_token:
-            pro = ts.pro_api()
-            market = '.SH' if symbol.startswith(('6', '9', '5', '7')) else '.SZ'
-            ts_code = f'{symbol}{market}'
-            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
-            df = _normalize_daily_kline_df(df)
-            if df is not None and not df.empty:
-                return df.tail(days).reset_index(drop=True)
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'Tushare 兜底失败: {e}')
-
-    return None
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_stock_quote(symbol):
-    """完整优先的个股行情：实时源失败时，用日K构造quote，保证分析链路可继续。"""
-    symbol = str(symbol).strip().zfill(6)
-    market = '1' if symbol.startswith(('6', '9', '5', '7')) else '0'
-
-    try:
-        url = (
-            'https://push2.eastmoney.com/api/qt/stock/get?'
-            f'secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b'
-            '&fltt=2&invt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167'
-        )
-        res = fetch_json(url, timeout=6)
-        if isinstance(res, dict) and res.get('data'):
-            d = res['data']
-            prev_close = safe_float(d.get('f60'))
-            price = normalize_em_price(d.get('f43'), prev_close)
-            name = d.get('f58') or get_stock_name(symbol)
-            if price > 0:
-                return {
-                    'name': name,
-                    'price': price,
-                    'pct': safe_float(d.get('f170')),
-                    'market_cap': safe_float(d.get('f116')) / 100000000,
-                    'pe': d.get('f162', '-'),
-                    'pb': d.get('f167', '-'),
-                    'turnover': safe_float(d.get('f168')),
-                    'source': '东方财富实时'
-                }
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'东方财富实时行情失败: {e}')
-
-    try:
-        spot_df = ak.stock_zh_a_spot_em()
-        if spot_df is not None and not spot_df.empty:
-            row = spot_df[spot_df['代码'].astype(str).str.zfill(6) == symbol]
-            if not row.empty:
-                row = row.iloc[0]
-                price = safe_float(row.get('最新价'))
-                if price > 0:
-                    return {
-                        'name': row.get('名称', get_stock_name(symbol)),
-                        'price': price,
-                        'pct': safe_float(row.get('涨跌幅')),
-                        'market_cap': safe_float(row.get('总市值')) / 100000000,
-                        'pe': row.get('市盈率-动态', '-'),
-                        'pb': row.get('市净率', '-'),
-                        'turnover': safe_float(row.get('换手率')),
-                        'source': 'AKShare实时'
-                    }
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'AKShare 实时行情兜底失败: {e}')
-
-    try:
-        df = get_kline(symbol, days=10)
-        if df is not None and len(df) >= 1:
-            latest = df.iloc[-1]
-            prev = df.iloc[-2] if len(df) >= 2 else latest
-            price = safe_float(latest.get('close'))
-            prev_close = safe_float(prev.get('close'))
-            pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
-            return {
-                'name': get_stock_name(symbol),
-                'price': price,
-                'pct': pct,
-                'market_cap': 0.0,
-                'pe': '-',
-                'pb': '-',
-                'turnover': safe_float(latest.get('turnover_rate')),
-                'source': '日K兜底'
-            }
-    except Exception as e:
-        if DEBUG_MODE:
-            st.warning(f'日K构造实时行情失败: {e}')
-
-    return None
-
-
-def is_quote_usable(quote: dict | None) -> bool:
-    if not quote:
-        return False
-    return safe_float(quote.get('price'), 0) > 0
-
 
 # ================= AI 计算核心 =================
 def call_ai(prompt, model=None, temperature=0.3):
@@ -1939,7 +1499,7 @@ class MacroAnalysisEngine:
 # ====== 宏观 UI 渲染函数 ======
 def display_macro_analysis_ui():
     st.info("本板块通过国家统计局官方接口抓取最新宏观经济数据，并联动 AI 多智能体进行 A 股大势研判与行业映射。")
-    if st.button("🚀 启动全局宏观深度推演", type="primary", width="stretch"):
+    if st.button("🚀 启动全局宏观深度推演", type="primary", use_container_width=True):
         if not api_key:
             st.error("配置缺失: GROQ_API_KEY")
             return
@@ -1965,7 +1525,7 @@ def display_macro_analysis_ui():
                 snap = res["raw_data"].get("macro_snapshot", {})
                 if snap:
                     df_snap = pd.DataFrame([{"指标": v["label"], "最新值": f"{v['value']}{v['unit']}", "发布期": v["period_label"], "环比/同比变动": f"{v['change']:+.2f}{v['unit']}" if v.get("change") else "-"} for k,v in snap.items()])
-                    st.dataframe(df_snap, width="stretch", hide_index=True)
+                    st.dataframe(df_snap, use_container_width=True, hide_index=True)
             with mt3:
                 st.markdown(res["agents_analysis"]["sector"]["analysis"])
             with mt4:
@@ -3274,55 +2834,18 @@ def render_high_end_news_terminal():
 # ================= 高端新闻情报终端模块结束 =================
 
 st.markdown("### 🌍 宏观市场实时看板")
-
-# 宏观看板必须独立、轻量、可降级；任何接口失败都不能影响主程序。
-try:
-    pulse_data = get_market_pulse()
-except Exception as e:
-    if DEBUG_MODE:
-        st.warning(f"宏观看板函数异常，已启用本地占位：{e}")
-    pulse_data = {
-        "上证指数": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
-        "深证成指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
-        "创业板指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
-        "沪深300": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
-        "USD/CNH(离岸)": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "函数异常", "available": False},
-    }
-
-if not pulse_data:
-    pulse_data = {
-        "上证指数": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
-        "深证成指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
-        "创业板指": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
-        "沪深300": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
-        "USD/CNH(离岸)": {"price": 0.0, "pct": 0.0, "source": "本地占位", "status": "空数据", "available": False},
-    }
-
-available_count = sum(1 for v in pulse_data.values() if isinstance(v, dict) and v.get("available"))
-if available_count == 0:
-    st.caption("宏观看板：实时源暂不可用，已启用占位卡片；不影响下方个股、龙虎榜、主力资金和新闻情报模块。")
-else:
-    st.caption(f"宏观看板：已同步 {available_count}/{len(pulse_data)} 项实时数据。")
-
-cols = st.columns(min(len(pulse_data), 6))
-for idx, (key, data) in enumerate(pulse_data.items()):
-    with cols[idx % len(cols)]:
-        with st.container(border=True):
-            data = data if isinstance(data, dict) else {}
-            price = safe_float(data.get("price"), 0.0)
-            pct = safe_float(data.get("pct"), 0.0)
-            source = data.get("source", "-")
-            status = data.get("status", "-")
-            available = bool(data.get("available", False))
-            if available and price > 0:
+pulse_data = get_market_pulse()
+if pulse_data:
+    dash_cols = st.columns(len(pulse_data))
+    for idx, (key, data) in enumerate(pulse_data.items()):
+        with dash_cols[idx]:
+            with st.container(border=True):
                 if "CNH" in key:
-                    st.metric(key, f"{price:.4f}", f"{pct:.2f}%", delta_color="inverse")
+                    st.metric(key, f"{data['price']:.4f}", f"{data['pct']:.2f}%", delta_color="inverse")
                 else:
-                    st.metric(key, f"{price:.2f}", f"{pct:.2f}%")
-            else:
-                st.metric(key, "待同步", "--")
-            st.caption(f"{source} · {status}")
-
+                    st.metric(key, f"{data['price']:.2f}", f"{data['pct']:.2f}%")
+else:
+    st.warning("宏观看板数据流建立失败。")
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ================= 终端功能选项卡 =================
@@ -3343,7 +2866,7 @@ with tab1:
         col1, col2 = st.columns([1, 1])
         with col1:
             symbol_input = st.text_input("标的代码", placeholder="例：600519")
-            analyze_btn = st.button("启动核心算法", type="primary", width="stretch")
+            analyze_btn = st.button("启动核心算法", type="primary", use_container_width=True)
         if analyze_btn:
             if not api_key:
                 st.error("配置缺失: GROQ_API_KEY")
@@ -3389,7 +2912,7 @@ with tab1:
                         tech = summarize_technicals(df_kline)
                         smc = tech["smc"]
                         fig = build_price_figure(df_kline)
-                        st.plotly_chart(fig, width="stretch")
+                        st.plotly_chart(fig, use_container_width=True)
 
                         st.markdown("##### 🔬 核心技术指标与阻力测算")
                         t1, t2, t3, t4 = st.columns(4)
@@ -3617,7 +3140,7 @@ with tab3:
                     blocks = get_hot_blocks()
                     if blocks:
                         df_blocks = pd.DataFrame(blocks)
-                        st.dataframe(df_blocks, width="stretch", hide_index=True)
+                        st.dataframe(df_blocks, use_container_width=True, hide_index=True)
                         with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
                             blocks_str = "\n".join([f"{b['板块名称']} (涨幅:{b['涨跌幅']}%, 领涨龙头:{b['领涨股票']})" for b in blocks[:5]])
                             prompt = f"""
@@ -3682,8 +3205,8 @@ with tab4:
 # ================= Tab 5: 智瞰龙虎榜解析 =================
 with tab5:
     with st.container(border=True):
-        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 3.0")
-        st.write("整合优化版龙虎榜数据采集、自动回溯、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。已移除外部付费数据源依赖。")
+        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 2.0")
+        st.write("整合龙虎榜数据采集、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。")
 
         col_date, col_lookback, col_depth = st.columns([1, 1, 1])
         with col_date:
