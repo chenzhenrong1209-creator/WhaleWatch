@@ -1483,6 +1483,254 @@ def get_kline(symbol, days=220):
             st.warning(f"Tushare 兜底失败: {e}")
     return None
 
+
+# ================= 行情可靠性增强层 v7.0 =================
+# 说明：前一版为了提速，把个股行情过度依赖“单股极速接口”。
+# 这一层改成“多源完整数据优先”：东方财富单股 → AKShare 实时 → 东方财富K线 → AKShare日K → Baostock/Tushare。
+# 即使实时行情源失败，也会用最近日K构造可分析 quote，避免批量扫描全是“无法获取”。
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_stock_name(symbol: str) -> str:
+    symbol = str(symbol).strip().zfill(6)
+    try:
+        code_name_df = ak.stock_info_a_code_name()
+        if code_name_df is not None and not code_name_df.empty:
+            cols = list(code_name_df.columns)
+            code_col = 'code' if 'code' in cols else '证券代码' if '证券代码' in cols else '代码' if '代码' in cols else cols[0]
+            name_col = 'name' if 'name' in cols else '证券简称' if '证券简称' in cols else '名称' if '名称' in cols else cols[1]
+            row = code_name_df[code_name_df[code_col].astype(str).str.zfill(6) == symbol]
+            if not row.empty:
+                return str(row.iloc[0][name_col])
+    except Exception:
+        pass
+    return symbol
+
+
+def _normalize_daily_kline_df(df: pd.DataFrame) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    rename_map = {
+        '日期': 'date', '时间': 'date', 'trade_date': 'date',
+        '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low',
+        '成交量': 'volume', '成交额': 'amount', '换手率': 'turnover_rate',
+        'vol': 'volume', 'turnover': 'turnover_rate'
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    need = ['date', 'open', 'high', 'low', 'close', 'volume']
+    if not all(c in df.columns for c in need):
+        return None
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    if 'turnover_rate' in df.columns:
+        df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
+    else:
+        df['turnover_rate'] = 0.0
+    df = df.dropna(subset=need).sort_values('date').reset_index(drop=True)
+    if df.empty:
+        return None
+    return df[['date', 'open', 'high', 'low', 'close', 'volume', 'turnover_rate']]
+
+
+def fetch_em_daily_kline(symbol: str, days: int = 220) -> pd.DataFrame | None:
+    """东方财富日K兜底源。相比 AKShare 包装层，这里直接请求轻量K线接口。"""
+    symbol = str(symbol).strip().zfill(6)
+    market = '1' if symbol.startswith(('6', '9', '5', '7')) else '0'
+    url = (
+        'https://push2his.eastmoney.com/api/qt/stock/kline/get?'
+        f'secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b'
+        '&fields1=f1,f2,f3,f4,f5,f6'
+        '&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'
+        f'&klt=101&fqt=1&end=20500101&lmt={max(days + 80, 260)}'
+    )
+    try:
+        res = fetch_json(url, timeout=8)
+        klines = res.get('data', {}).get('klines', []) if isinstance(res, dict) else []
+        rows = []
+        for item in klines:
+            p = str(item).split(',')
+            if len(p) >= 11:
+                rows.append({
+                    'date': p[0], 'open': p[1], 'close': p[2], 'high': p[3], 'low': p[4],
+                    'volume': p[5], 'amount': p[6], 'amplitude': p[7], 'pct': p[8],
+                    'change': p[9], 'turnover_rate': p[10]
+                })
+        out = _normalize_daily_kline_df(pd.DataFrame(rows)) if rows else None
+        if out is not None and not out.empty:
+            return out.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'东方财富日K兜底失败: {e}')
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_kline(symbol, days=220):
+    """完整优先的多源日K：东方财富直连 → AKShare qfq/raw → Baostock → Tushare。"""
+    symbol = str(symbol).strip().zfill(6)
+    end_date = datetime.now()
+    start_date = end_date - pd.Timedelta(days=days + 220)
+    start_str = start_date.strftime('%Y%m%d')
+    end_str = end_date.strftime('%Y%m%d')
+    start_str_bs = start_date.strftime('%Y-%m-%d')
+    end_str_bs = end_date.strftime('%Y-%m-%d')
+
+    df = fetch_em_daily_kline(symbol, days=days)
+    if df is not None and not df.empty:
+        return df
+
+    try:
+        df = ak.stock_zh_a_hist(symbol=symbol, period='daily', start_date=start_str, end_date=end_str, adjust='qfq')
+        df = _normalize_daily_kline_df(df)
+        if df is not None and not df.empty:
+            return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'AKShare qfq 降级失败: {e}')
+
+    try:
+        df = ak.stock_zh_a_hist(symbol=symbol, period='daily', start_date=start_str, end_date=end_str, adjust='')
+        df = _normalize_daily_kline_df(df)
+        if df is not None and not df.empty:
+            return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'AKShare raw 降级失败: {e}')
+
+    try:
+        bs.login()
+        bs_code = f"sh.{symbol}" if symbol.startswith(('6', '9', '5', '7')) else f"sz.{symbol}"
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            'date,open,high,low,close,volume',
+            start_date=start_str_bs,
+            end_date=end_str_bs,
+            frequency='d',
+            adjustflag='2'
+        )
+        data_list = []
+        while (rs.error_code == '0') and rs.next():
+            data_list.append(rs.get_row_data())
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if data_list:
+            df = pd.DataFrame(data_list, columns=rs.fields)
+            df = _normalize_daily_kline_df(df)
+            if df is not None and not df.empty:
+                return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'Baostock 降级失败: {e}')
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+    try:
+        if ts_token:
+            pro = ts.pro_api()
+            market = '.SH' if symbol.startswith(('6', '9', '5', '7')) else '.SZ'
+            ts_code = f'{symbol}{market}'
+            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+            df = _normalize_daily_kline_df(df)
+            if df is not None and not df.empty:
+                return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'Tushare 兜底失败: {e}')
+
+    return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_stock_quote(symbol):
+    """完整优先的个股行情：实时源失败时，用日K构造quote，保证分析链路可继续。"""
+    symbol = str(symbol).strip().zfill(6)
+    market = '1' if symbol.startswith(('6', '9', '5', '7')) else '0'
+
+    try:
+        url = (
+            'https://push2.eastmoney.com/api/qt/stock/get?'
+            f'secid={market}.{symbol}&ut=fa5fd1943c7b386f172d6893dbfba10b'
+            '&fltt=2&invt=2&fields=f58,f43,f60,f170,f116,f162,f168,f167'
+        )
+        res = fetch_json(url, timeout=6)
+        if isinstance(res, dict) and res.get('data'):
+            d = res['data']
+            prev_close = safe_float(d.get('f60'))
+            price = normalize_em_price(d.get('f43'), prev_close)
+            name = d.get('f58') or get_stock_name(symbol)
+            if price > 0:
+                return {
+                    'name': name,
+                    'price': price,
+                    'pct': safe_float(d.get('f170')),
+                    'market_cap': safe_float(d.get('f116')) / 100000000,
+                    'pe': d.get('f162', '-'),
+                    'pb': d.get('f167', '-'),
+                    'turnover': safe_float(d.get('f168')),
+                    'source': '东方财富实时'
+                }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'东方财富实时行情失败: {e}')
+
+    try:
+        spot_df = ak.stock_zh_a_spot_em()
+        if spot_df is not None and not spot_df.empty:
+            row = spot_df[spot_df['代码'].astype(str).str.zfill(6) == symbol]
+            if not row.empty:
+                row = row.iloc[0]
+                price = safe_float(row.get('最新价'))
+                if price > 0:
+                    return {
+                        'name': row.get('名称', get_stock_name(symbol)),
+                        'price': price,
+                        'pct': safe_float(row.get('涨跌幅')),
+                        'market_cap': safe_float(row.get('总市值')) / 100000000,
+                        'pe': row.get('市盈率-动态', '-'),
+                        'pb': row.get('市净率', '-'),
+                        'turnover': safe_float(row.get('换手率')),
+                        'source': 'AKShare实时'
+                    }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'AKShare 实时行情兜底失败: {e}')
+
+    try:
+        df = get_kline(symbol, days=10)
+        if df is not None and len(df) >= 1:
+            latest = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) >= 2 else latest
+            price = safe_float(latest.get('close'))
+            prev_close = safe_float(prev.get('close'))
+            pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
+            return {
+                'name': get_stock_name(symbol),
+                'price': price,
+                'pct': pct,
+                'market_cap': 0.0,
+                'pe': '-',
+                'pb': '-',
+                'turnover': safe_float(latest.get('turnover_rate')),
+                'source': '日K兜底'
+            }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.warning(f'日K构造实时行情失败: {e}')
+
+    return None
+
+
+def is_quote_usable(quote: dict | None) -> bool:
+    if not quote:
+        return False
+    return safe_float(quote.get('price'), 0) > 0
+
+
 # ================= AI 计算核心 =================
 def call_ai(prompt, model=None, temperature=0.3):
     try:
