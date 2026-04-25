@@ -1098,6 +1098,8 @@ def render_watchlist_scanner():
         for i, code in enumerate(codes, start=1):
             progress.progress(i / len(codes), text=f"正在扫描 {code} ({i}/{len(codes)})")
             try:
+                # 优化: 增加轻微延时，防止连续扫描触发底层数据源限流熔断
+                time.sleep(0.5) 
                 rows.append(analyze_stock_for_watchlist(code))
             except Exception as e:
                 rows.append({"代码": code, "名称": "扫描失败", "评分": 0, "状态": "异常", "操作": str(e)[:60]})
