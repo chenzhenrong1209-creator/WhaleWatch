@@ -3055,9 +3055,12 @@ with tab1:
                     with st.spinner(f"🧠 首席策略官正在使用 {selected_model} 进行多维深度解构..."):
                         if df_kline is not None and len(df_kline) >= 15:
                             tech = summarize_technicals(add_indicators(df_kline))
-                            smc = tech["smc"]
-                            ema_mid_val = f"{tech['ema_mid']:.2f}" if pd.notna(tech['ema_mid']) else "数据不足"
-                            ema_long_val = f"{tech['ema_long']:.2f}" if pd.notna(tech['ema_long']) else "数据不足"
+                            # ... (保持你原有的 prompt 组装逻辑不变)
+                            try:
+                                ai_result = call_ai(prompt)
+                                st.markdown(ai_result)
+                            except Exception as e:
+                                st.error(f"AI 推理节点发生错误，请稍后重试或切换模型。错误详情: {e}")
                             prompt = f"""
 你现在是顶级私募基金的操盘手（精通基本面、量价资金博弈、多周期共振）。
 请对股票 {name}({symbol_input}) 做一份极具实战价值的【估值 + 资金流 + 支撑/压力 + 精准买卖点 + 多周期共振】综合研判。
