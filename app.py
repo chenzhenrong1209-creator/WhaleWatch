@@ -432,20 +432,24 @@ def build_price_figure(df: pd.DataFrame):
                         vertical_spacing=0.03, subplot_titles=('K 线与结构', '成交量'),
                         row_width=[0.2, 0.7])
 
+    # 修复 1: 强制指定 A 股 K 线颜色（红涨绿跌）
     fig.add_trace(go.Candlestick(
         x=plot_df["date_str"],
         open=plot_df["open"],
         high=plot_df["high"],
         low=plot_df["low"],
         close=plot_df["close"],
-        name="K线"
+        name="K线",
+        increasing_line_color='red', 
+        decreasing_line_color='green' 
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_short"], mode="lines", name=f"EMA{ema_short}", line=dict(width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_mid"], mode="lines", name=f"EMA{ema_mid}", line=dict(width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_long"], mode="lines", name=f"EMA{ema_long}", line=dict(width=1)), row=1, col=1)
 
-    colors = ['red' if row['open'] - row['close'] >= 0 else 'green' for index, row in plot_df.iterrows()]
+    # 修复 2: 修正成交量柱子颜色逻辑（收盘价 >= 开盘价为红，否则为绿）
+    colors = ['red' if row['close'] >= row['open'] else 'green' for index, row in plot_df.iterrows()]
     fig.add_trace(go.Bar(
         x=plot_df['date_str'],
         y=plot_df['volume'],
