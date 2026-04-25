@@ -60,7 +60,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.4.3-LHB-NO-STOCKAPI | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.1 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -1120,120 +1120,19 @@ def get_global_news():
                 news.append(f"[{item.get('create_time', '')}] {text}")
     return news
 
-def _normalize_market_price(value, prefer_scale=None):
-    """指数/汇率价格归一化，兼容东财不同接口偶发的放大倍数。"""
-    price = safe_float(value, default=0.0)
-    if price <= 0:
-        return 0.0
-    if prefer_scale:
-        return price / prefer_scale
-    # 指数常见区间 500-10000；东财有时返回 306422 这种扩大100倍的值
-    if price > 100000:
-        return price / 100
-    if price > 20000:
-        return price / 100
-    return price
-
-
-def _build_pulse_item(price=0.0, pct=0.0, source="", status="正常"):
-    return {
-        "price": safe_float(price, 0.0),
-        "pct": safe_float(pct, 0.0),
-        "source": source,
-        "status": status,
-    }
-
-
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=60)
 def get_market_pulse():
-    """
-    宏观看板多源兜底版。
-    优先：东方财富轻量接口；
-    备用：AKShare 指数实时行情；
-    最后：返回占位数据，避免首页直接显示“数据流建立失败”。
-    """
     pulse = {}
-
-    index_targets = {
-        "上证指数": {"secid": "1.000001", "ak_code": "000001"},
-        "深证成指": {"secid": "0.399001", "ak_code": "399001"},
-        "创业板指": {"secid": "0.399006", "ak_code": "399006"},
-    }
-
-    # 1）东方财富轻量接口，速度最快，但云端偶尔会被拦或超时
-    for name, meta in index_targets.items():
-        try:
-            url = (
-                "https://push2.eastmoney.com/api/qt/stock/get?"
-                f"secid={meta['secid']}&ut=fa5fd1943c7b386f172d6893dbfba10b"
-                "&fltt=2&invt=2&fields=f43,f170,f60"
-            )
-            res = fetch_json(url, timeout=4)
-            data = res.get("data") if isinstance(res, dict) else None
-            if data:
-                raw_price = safe_float(data.get("f43"), 0.0)
-                prev_close = safe_float(data.get("f60"), 0.0)
-                price = normalize_em_price(raw_price, prev_close) if "normalize_em_price" in globals() else _normalize_market_price(raw_price)
-                pct = safe_float(data.get("f170"), 0.0)
-                if price > 0:
-                    pulse[name] = _build_pulse_item(price, pct, "东方财富", "正常")
-        except Exception as e:
-            if DEBUG_MODE:
-                st.caption(f"{name} 东方财富指数数据失败：{e}")
-
-    # 2）AKShare 指数实时行情兜底
-    missing = [name for name in index_targets if name not in pulse]
-    if missing:
-        try:
-            ak_idx = ak.stock_zh_index_spot_em()
-            if ak_idx is not None and not ak_idx.empty:
-                code_col = "代码" if "代码" in ak_idx.columns else None
-                name_col = "名称" if "名称" in ak_idx.columns else None
-                price_col = "最新价" if "最新价" in ak_idx.columns else None
-                pct_col = "涨跌幅" if "涨跌幅" in ak_idx.columns else None
-                for name in missing:
-                    meta = index_targets[name]
-                    row = pd.DataFrame()
-                    if code_col:
-                        row = ak_idx[ak_idx[code_col].astype(str).str.zfill(6) == meta["ak_code"]]
-                    if row.empty and name_col:
-                        row = ak_idx[ak_idx[name_col].astype(str).str.contains(name[:2], na=False)]
-                    if not row.empty:
-                        r = row.iloc[0]
-                        price = safe_float(r.get(price_col), 0.0) if price_col else 0.0
-                        pct = safe_float(r.get(pct_col), 0.0) if pct_col else 0.0
-                        if price > 0:
-                            pulse[name] = _build_pulse_item(price, pct, "AKShare指数", "备用")
-        except Exception as e:
-            if DEBUG_MODE:
-                st.caption(f"AKShare 指数兜底失败：{e}")
-
-    # 3）离岸人民币，优先东财；失败则占位，不影响首页其他模块
-    try:
-        cnh_url = (
-            "https://push2.eastmoney.com/api/qt/stock/get?"
-            "secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b"
-            "&fltt=2&invt=2&fields=f43,f170"
-        )
-        cnh_res = fetch_json(cnh_url, timeout=4)
-        cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
-        if cnh_data:
-            cnh_price = safe_float(cnh_data.get("f43"), 0.0)
-            cnh_pct = safe_float(cnh_data.get("f170"), 0.0)
-            if cnh_price > 0:
-                pulse["USD/CNH(离岸)"] = _build_pulse_item(cnh_price, cnh_pct, "东方财富", "正常")
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"离岸人民币数据失败：{e}")
-
-    if "USD/CNH(离岸)" not in pulse:
-        pulse["USD/CNH(离岸)"] = _build_pulse_item(0.0, 0.0, "待同步", "数据源暂不可用")
-
-    # 4）最终占位：避免云端接口临时不可用时，整个宏观看板消失
-    for name in index_targets:
-        if name not in pulse:
-            pulse[name] = _build_pulse_item(0.0, 0.0, "待同步", "数据源暂不可用")
-
+    indices = {"上证指数": "1.000001", "深证成指": "0.399001", "创业板指": "0.399006"}
+    for name, code in indices.items():
+        url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={code}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
+        res = fetch_json(url)
+        if res and res.get("data"):
+            pulse[name] = {"price": safe_float(res["data"].get("f43")), "pct": safe_float(res["data"].get("f170"))}
+    cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&fields=f43,f170"
+    cnh_res = fetch_json(cnh_url)
+    if cnh_res and cnh_res.get("data"):
+        pulse["USD/CNH(离岸)"] = {"price": safe_float(cnh_res["data"].get("f43")), "pct": safe_float(cnh_res["data"].get("f170"))}
     return pulse
 
 @st.cache_data(ttl=300)
@@ -2941,21 +2840,12 @@ if pulse_data:
     for idx, (key, data) in enumerate(pulse_data.items()):
         with dash_cols[idx]:
             with st.container(border=True):
-                price = safe_float(data.get("price"), 0.0) if isinstance(data, dict) else 0.0
-                pct = safe_float(data.get("pct"), 0.0) if isinstance(data, dict) else 0.0
-                status = data.get("status", "") if isinstance(data, dict) else ""
-                source = data.get("source", "") if isinstance(data, dict) else ""
-                if price > 0:
-                    if "CNH" in key:
-                        st.metric(key, f"{price:.4f}", f"{pct:.2f}%", delta_color="inverse")
-                    else:
-                        st.metric(key, f"{price:.2f}", f"{pct:.2f}%")
+                if "CNH" in key:
+                    st.metric(key, f"{data['price']:.4f}", f"{data['pct']:.2f}%", delta_color="inverse")
                 else:
-                    st.metric(key, "待同步", "--")
-                if source or status:
-                    st.caption(f"{source} · {status}".strip(" ·"))
+                    st.metric(key, f"{data['price']:.2f}", f"{data['pct']:.2f}%")
 else:
-    st.info("宏观看板暂无实时数据，但不影响下方功能模块使用。")
+    st.warning("宏观看板数据流建立失败。")
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ================= 终端功能选项卡 =================
@@ -3315,8 +3205,8 @@ with tab4:
 # ================= Tab 5: 智瞰龙虎榜解析 =================
 with tab5:
     with st.container(border=True):
-        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 3.0")
-        st.write("整合优化版龙虎榜数据采集、自动回溯、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。已移除 StockAPI 相关依赖。")
+        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 2.0")
+        st.write("整合龙虎榜数据采集、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。")
 
         col_date, col_lookback, col_depth = st.columns([1, 1, 1])
         with col_date:
