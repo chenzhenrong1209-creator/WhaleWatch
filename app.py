@@ -60,7 +60,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.4.0 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.1 | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -1571,6 +1571,77 @@ class LonghubangDataFetcher:
         params = {'date': date}
         return self._safe_request(url, params)
 
+
+    def _extract_data_list(self, raw_result):
+        """兼容不同 API 返回结构，安全提取龙虎榜列表。"""
+        if not raw_result:
+            return []
+        if isinstance(raw_result, list):
+            return raw_result
+        if not isinstance(raw_result, dict):
+            return []
+        payload = raw_result.get("data")
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in ["list", "items", "records", "data", "rows"]:
+                val = payload.get(key)
+                if isinstance(val, list):
+                    return val
+        return []
+
+    def get_longhubang_data_akshare(self, date):
+        """备用源：AKShare 东方财富龙虎榜详情。返回统一字段列表。"""
+        date_ymd = str(date).replace("-", "")
+        try:
+            df = ak.stock_lhb_detail_em(start_date=date_ymd, end_date=date_ymd)
+            if df is None or df.empty:
+                return []
+            records = []
+            for _, row in df.iterrows():
+                code = str(row.get("代码", row.get("股票代码", ""))).strip()
+                m = re.search(r"(\d{6})", code)
+                code = m.group(1) if m else code
+                name = str(row.get("名称", row.get("股票简称", ""))).strip()
+                records.append({
+                    "yzmc": "龙虎榜汇总",
+                    "yyb": str(row.get("上榜原因", row.get("解读", ""))),
+                    "sblx": str(row.get("上榜原因", "龙虎榜")),
+                    "gpdm": code,
+                    "gpmc": name,
+                    "mrje": safe_float(row.get("龙虎榜买入额", row.get("买入额", 0))),
+                    "mcje": safe_float(row.get("龙虎榜卖出额", row.get("卖出额", 0))),
+                    "jlrje": safe_float(row.get("龙虎榜净买额", row.get("净买额", row.get("净流入金额", 0)))),
+                    "rq": str(row.get("上榜日", date)),
+                    "gl": str(row.get("解读", row.get("上榜原因", "")))
+                })
+            return [r for r in records if r.get("gpdm") or r.get("gpmc")]
+        except Exception as e:
+            if DEBUG_MODE:
+                st.warning(f"AKShare 龙虎榜备用源失败: {e}")
+            return []
+
+    def get_longhubang_data_auto(self, date, lookback_days=10):
+        """自动寻找最近可用龙虎榜数据。"""
+        errors = []
+        base_date = pd.to_datetime(date).date()
+        for offset in range(0, lookback_days + 1):
+            current_date = base_date - timedelta(days=offset)
+            date_str = current_date.strftime("%Y-%m-%d")
+
+            raw = self.get_longhubang_data(date_str)
+            data_list = self._extract_data_list(raw)
+            if data_list:
+                return {"success": True, "requested_date": str(date), "used_date": date_str, "source": "ws4 龙虎榜接口", "data": data_list, "errors": errors}
+            errors.append(f"{date_str} ws4 无数据或受限")
+
+            ak_data = self.get_longhubang_data_akshare(date_str)
+            if ak_data:
+                return {"success": True, "requested_date": str(date), "used_date": date_str, "source": "AKShare 东方财富龙虎榜详情", "data": ak_data, "errors": errors}
+            errors.append(f"{date_str} AKShare 无数据或受限")
+
+        return {"success": False, "requested_date": str(date), "used_date": None, "source": "无可用源", "data": [], "errors": errors}
+
     def parse_to_dataframe(self, data_list):
         if not data_list:
             return pd.DataFrame()
@@ -2825,16 +2896,24 @@ with tab5:
                 st.error("配置缺失: GROQ_API_KEY")
             else:
                 date_str = lhb_date.strftime('%Y-%m-%d')
-                with st.spinner(f"正在深入节点获取 {date_str} 龙虎榜数据..."):
+                with st.spinner(f"正在获取 {date_str} 龙虎榜数据，如该日无数据将自动回溯最近可用交易日..."):
                     fetcher = LonghubangDataFetcher()
-                    raw_result = fetcher.get_longhubang_data(date_str)
+                    auto_result = fetcher.get_longhubang_data_auto(date_str, lookback_days=10)
 
-                if raw_result and raw_result.get('data'):
-                    data_list = raw_result['data']
+                if auto_result.get("success") and auto_result.get("data"):
+                    data_list = auto_result["data"]
+                    used_date = auto_result.get("used_date") or date_str
+                    source = auto_result.get("source", "未知数据源")
                     summary = fetcher.analyze_data_summary(data_list)
                     formatted_data = fetcher.format_data_for_ai(data_list, summary)
 
-                    st.success(f"✓ 成功获取 {len(data_list)} 条记录！激活AI集群协同计算...")
+                    if used_date != date_str:
+                        st.warning(f"{date_str} 未获取到有效龙虎榜数据，已自动切换到最近可用日期：{used_date}。")
+                    st.success(f"✓ 成功获取 {used_date} 的 {len(data_list)} 条龙虎榜记录！数据源：{source}。")
+
+                    if auto_result.get("errors"):
+                        with st.expander("查看数据源回溯记录", expanded=False):
+                            st.write("\n".join(auto_result.get("errors", [])[-20:]))
 
                     agents = LonghubangAgents()
                     all_analyses = []
@@ -2873,7 +2952,9 @@ with tab5:
                         st.markdown("### 👔 首席策略师最终研判")
                         st.markdown(chief_res['analysis'])
                 else:
-                    st.error(f"未能获取到 {date_str} 的龙虎榜数据，该日可能为周末或 API 暂时受限。")
+                    st.error(f"未能获取到 {date_str} 及最近10天的龙虎榜数据。可能原因：API 暂时受限、云端访问被拦截，或近期没有交易日数据。")
+                    with st.expander("查看失败明细", expanded=False):
+                        st.write("\n".join(auto_result.get("errors", [])))
 # ================= Tab 6: 主力资金选股 =================
 with tab6:
     render_main_force_tab()
