@@ -603,6 +603,105 @@ def fetch_json(url, timeout=6, extra_headers=None, retries=1, silent=True):
         st.caption(f"请求失败：{last_err} | {url[:100]}")
     return None
 
+# ================= 东方财富原生 API 稳定层 =================
+# 依据“东方财富API使用说明”统一处理：字段映射、Headers、JSONP、频率保护、缓存。
+EM_NATIVE_FIELDS_CORE = "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
+EM_MARKET_FS_ALL_A = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"  # 沪深主板/创业板/科创板/北交所常用全集
+
+def em_native_headers(host: str = "push2.eastmoney.com") -> dict:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+        "Host": host,
+        "Connection": "close",
+    }
+
+def fetch_eastmoney_native(url: str, params: dict | None = None, timeout: int = 10, retries: int = 1, host: str = "push2.eastmoney.com"):
+    """东方财富原生接口请求：严格 Headers + JSON/JSONP 双兼容 + 轻量重试。"""
+    headers = em_native_headers(host=host)
+    timeout_tuple = (3, timeout)
+    last_err = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            res = SESSION.get(url, params=params, headers=headers, timeout=timeout_tuple, verify=False)
+            if res.status_code in (403, 429, 500, 502, 503, 504):
+                last_err = f"HTTP {res.status_code}"
+                time.sleep(0.6 + random.random() * 0.5)
+                continue
+            if res.status_code != 200:
+                last_err = f"HTTP {res.status_code}"
+                continue
+            text = (res.text or "").strip()
+            if not text:
+                return None
+            # 东财部分接口会返回 jQueryxxxx({...}); 这里统一剥壳。
+            if text.startswith("jQuery") or ("(" in text[:50] and text.endswith((")", ");"))):
+                m = re.search(r"^[\w$]+\((.*)\);?$", text, re.S)
+                if m:
+                    text = m.group(1)
+            return json.loads(text)
+        except Exception as exc:
+            last_err = str(exc)
+            time.sleep(0.5 + random.random() * 0.5)
+    if DEBUG_MODE:
+        st.caption(f"东方财富原生接口失败：{last_err}")
+    return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_em_clist_cached(pz: int = 5000, fid: str = "f62", fields: str = EM_NATIVE_FIELDS_CORE) -> list:
+    """东方财富全市场 clist 底库。1小时缓存，避免 Streamlit 控件变化触发接口熔断。"""
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1", "pz": str(int(pz)), "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
+        "fid": fid, "fs": EM_MARKET_FS_ALL_A, "fields": fields,
+    }
+    js = fetch_eastmoney_native(url, params=params, timeout=10, retries=1, host="push2.eastmoney.com")
+    return (((js or {}).get("data") or {}).get("diff") or []) if isinstance(js, dict) else []
+
+def normalize_em_clist_rows(rows: list, source: str = "东方财富原生clist") -> pd.DataFrame:
+    """将东财 f 字段统一映射为本系统字段。"""
+    out = []
+    for item in rows or []:
+        code = str(item.get("f12", "")).strip().zfill(6)
+        name = str(item.get("f14", "")).strip()
+        if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+            continue
+        out.append({
+            "股票代码": code,
+            "股票简称": name,
+            "所属行业": item.get("f100") or "未分类",
+            "区间涨跌幅": safe_float(item.get("f3"), 0),
+            "最新价": safe_float(item.get("f2"), 0),
+            "主力净流入": safe_float(item.get("f62"), 0),
+            "主力净占比": safe_float(item.get("f184"), 0),
+            "成交额": safe_float(item.get("f6"), 0),
+            "换手率": safe_float(item.get("f8"), 0),
+            "总市值": _normalize_market_cap_yi(item.get("f20")),
+            "市盈率": item.get("f9", "-"),
+            "市净率": item.get("f23", "-"),
+            "资金热度分": 0.0,
+            "数据源": source,
+        })
+    return pd.DataFrame(out)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_em_mainflow_daykline_cached(symbol: str, days: int = 5) -> dict:
+    """个股主力资金历史日线：f51日期、f52主力净额、f53小单净额、f54中单净额、f55大单净额。"""
+    code = str(symbol).strip().zfill(6)
+    url = "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    params = {"secid": _secid_for_symbol(code), "fields1": "f1,f2,f3", "fields2": "f51,f52,f53,f54,f55"}
+    js = fetch_eastmoney_native(url, params=params, timeout=8, retries=1, host="push2.eastmoney.com")
+    klines = (((js or {}).get("data") or {}).get("klines") or []) if isinstance(js, dict) else []
+    vals = []
+    for line in klines[-int(days):]:
+        parts = str(line).split(",")
+        if len(parts) >= 2:
+            vals.append(safe_float(parts[1], 0))
+    return {"symbol": code, "days": len(vals), "main_net_5d": sum(vals), "source": "东方财富fflow/daykline"}
+
+
 # ================= 价格归一化修复 =================
 def normalize_em_price(raw_price, prev_close=None):
     raw_price = safe_float(raw_price)
@@ -1605,8 +1704,8 @@ def _load_json_cache(path, max_age_seconds=1800):
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _legacy_disabled_get_market_pulse():
-    """旧版宏观看板已停用；实际使用后文 v7 版本。"""
+def get_market_pulse():
+    """市场脉搏：JQData 指数日线优先，东财只做 USD/CNH 补充；不使用缓存伪装最新。"""
     targets = {"上证指数": "000001.XSHG", "深证成指": "399001.XSHE", "创业板指": "399006.XSHE", "沪深300": "000300.XSHG", "科创50": "000688.XSHG"}
     pulse = {}
     ok, msg = ensure_jqdata_auth()
@@ -1632,7 +1731,7 @@ def _legacy_disabled_get_market_pulse():
                         pulse[name] = {"price": close, "pct": pct, "source": "JQData指数日线", "status": "真实最新交易日"}
         except Exception as exc:
             if DEBUG_MODE:
-                st.caption(f"旧版JQData指数函数已停用：{exc}")
+                st.caption(f"JQData指数行情失败：{exc}")
     try:
         cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f170"
         cnh_res = fetch_json(cnh_url, timeout=4, retries=0)
@@ -1651,13 +1750,13 @@ def _legacy_disabled_get_market_pulse():
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def _legacy_disabled_get_hot_blocks():
-    """旧版热点板块已停用；实际使用后文 v7 版本。"""
+def get_hot_blocks():
+    """资金热点板块：JQData 全市场真实行情计算优先；不使用缓存、不使用内置热点兜底。"""
     data, msg = get_jqdata_hot_blocks(max_stocks=5000)
     if data:
         return data
     if DEBUG_MODE:
-        st.caption(f"旧版JQData热点函数已停用：{msg}")
+        st.caption(f"JQData热点板块计算失败：{msg}")
     def _normalize_blocks_df(df, source):
         if df is None or df.empty:
             return None
@@ -2463,28 +2562,7 @@ class MacroAnalysisEngine:
 
 # ====== 宏观 UI 渲染函数 ======
 def display_macro_analysis_ui():
-    st.info("本板块已改为 AKShare/东方财富/新浪轻量行情优先；JQData 不再参与宏观看板。宏观深度推演仍使用国家统计局公开数据与 AI 多智能体。")
-    try:
-        pulse_data = get_market_pulse()
-        if pulse_data:
-            st.markdown("##### 🌍 宏观市场实时看板")
-            dash_cols = st.columns(min(len(pulse_data), 3))
-            for idx, (key, data) in enumerate(pulse_data.items()):
-                with dash_cols[idx % len(dash_cols)]:
-                    with st.container(border=True):
-                        price = safe_float(data.get("price"), 0) if isinstance(data, dict) else 0
-                        pct = safe_float(data.get("pct", 0), 0) if isinstance(data, dict) else 0
-                        source = data.get("source", "") if isinstance(data, dict) else ""
-                        status = data.get("status", "") if isinstance(data, dict) else ""
-                        if price > 0:
-                            st.metric(key, f"{price:.4f}" if "CNH" in key else f"{price:.2f}", f"{pct:.2f}%", delta_color="inverse" if "CNH" in key else "normal")
-                            st.caption(source)
-                        else:
-                            st.metric(key, "待同步", "--")
-                            st.caption(status or source or "数据源暂不可用")
-    except Exception as exc:
-        if DEBUG_MODE:
-            st.caption(f"宏观看板渲染失败：{exc}")
+    st.info("本板块通过国家统计局官方接口抓取最新宏观经济数据，并联动 AI 多智能体进行 A 股大势研判与行业映射。")
     if st.button("🚀 启动全局宏观深度推演", type="primary", width="stretch"):
         if not api_key:
             st.error("配置缺失: GROQ_API_KEY")
@@ -2979,7 +3057,7 @@ class MainForceStockSelector:
     设计目标：宁愿少抓一点数据，也不要让 Streamlit Cloud 一直卡住。
     数据优先级：
     1. 东方财富轻量 clist 接口：快，单次请求，适合云端。
-    2. 外部接口不稳定时只使用真实缓存，不再启用内置观察池兜底。
+    2. 内置核心观察池：外部接口不稳定时兜底。
     """
 
     DEFAULT_POOL = [
@@ -3035,66 +3113,18 @@ class MainForceStockSelector:
                 return industry
         return "未分类"
 
-    def _fetch_eastmoney_fast_pool(self, pz=220):
-        """东方财富轻量实时列表。只请求一页，避免 AKShare 多页 tqdm 卡住。"""
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": "1",
-            "pz": str(pz),
-            "po": "1",
-            "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2",
-            "invt": "2",
-            "fid": "f6",
-            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f2,f3,f6,f8,f9,f12,f14,f20,f21,f62,f184"
-        }
+    def _fetch_eastmoney_fast_pool(self, pz=5000):
+        """东方财富原生 clist 全市场底库：一次取全量，1小时缓存，字段含 f62/f184/f100/f23。"""
         try:
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Referer": "https://quote.eastmoney.com/center/gridlist.html"
-            }
-            res = SESSION.get(url, params=params, headers=headers, timeout=8)
-            res.raise_for_status()
-            js = res.json()
-            diff = ((js or {}).get("data") or {}).get("diff") or []
-            if not diff:
-                return pd.DataFrame(), "东方财富轻量接口返回空"
-
-            rows = []
-            for item in diff:
-                code = self._normalize_code(item.get("f12", ""))
-                name = str(item.get("f14", ""))
-                if not re.match(r"^\d{6}$", code):
-                    continue
-                if "ST" in name or "退" in name:
-                    continue
-                amount = safe_float(item.get("f6"))
-                pct = safe_float(item.get("f3"))
-                turnover = safe_float(item.get("f8"))
-                market_cap = safe_float(item.get("f20")) / 100000000 if safe_float(item.get("f20")) > 1000000 else safe_float(item.get("f20"))
-                main_net = safe_float(item.get("f62"), 0)
-                rows.append({
-                    "股票代码": code,
-                    "股票简称": name,
-                    "所属行业": self._infer_industry(name),
-                    "区间涨跌幅": pct,
-                    "最新价": safe_float(item.get("f2")),
-                    "主力净流入": main_net,
-                    "成交额": amount,
-                    "换手率": turnover,
-                    "总市值": market_cap,
-                    "市盈率": item.get("f9", "-"),
-                    "资金热度分": 0.0,
-                    "数据源": "东方财富实时资金字段f62"
-                })
-            df = pd.DataFrame(rows)
+            rows = fetch_em_clist_cached(pz=int(pz), fid="f62", fields=EM_NATIVE_FIELDS_CORE)
+            if not rows:
+                return pd.DataFrame(), "东方财富原生clist返回空或被限流"
+            df = normalize_em_clist_rows(rows, source="东方财富原生clist｜f62主力资金+f184净占比")
             if df.empty:
-                return pd.DataFrame(), "东方财富轻量接口无有效股票"
-            return self._score_candidates(df), f"东方财富轻量接口成功获取{len(df)}只候选股票"
+                return pd.DataFrame(), "东方财富原生clist无有效股票"
+            return self._score_candidates(df), f"东方财富原生clist成功获取{len(df)}只候选股票（缓存1小时）"
         except Exception as exc:
-            return pd.DataFrame(), f"东方财富轻量接口异常: {exc}"
+            return pd.DataFrame(), f"东方财富原生clist异常: {exc}"
 
     def _fetch_tushare_moneyflow_pool(self, trade_date=None):
         """Tushare 真实资金流接口：作为东财被限流时的真实数据源，不做估算。"""
@@ -3238,7 +3268,7 @@ class MainForceStockSelector:
         df_ts, msg_ts = self._fetch_tushare_moneyflow_pool()
         if not df_ts.empty:
             return True, df_ts, f"{msg_jq}；{msg_ts}"
-        df_em, msg_em = self._fetch_eastmoney_fast_pool(pz=220)
+        df_em, msg_em = self._fetch_eastmoney_fast_pool(pz=5000)
         if not df_em.empty:
             return True, df_em, f"{msg_jq}；{msg_ts}；{msg_em}"
         return False, pd.DataFrame(), f"真实资金数据不可用：{msg_jq}；{msg_ts}；{msg_em}"
@@ -3921,7 +3951,31 @@ def render_high_end_news_terminal():
 
 # ================= 高端新闻情报终端模块结束 =================
 
-# 已移除旧版全局宏观看板：避免在 v7 数据源重构前误调用 JQData。宏观看板只在 Tab2 内按 v7 源链路展示。
+st.markdown("### 🌍 宏观市场实时看板")
+pulse_data = get_market_pulse()
+if pulse_data:
+    dash_cols = st.columns(len(pulse_data))
+    for idx, (key, data) in enumerate(pulse_data.items()):
+        with dash_cols[idx]:
+            with st.container(border=True):
+                price = safe_float(data.get("price"), 0) if isinstance(data, dict) else 0
+                pct = safe_float(data.get("pct"), 0) if isinstance(data, dict) else 0
+                source = data.get("source", "") if isinstance(data, dict) else ""
+                status = data.get("status", "") if isinstance(data, dict) else ""
+                if price > 0:
+                    if "CNH" in key:
+                        st.metric(key, f"{price:.4f}", f"{pct:.2f}%", delta_color="inverse")
+                    else:
+                        st.metric(key, f"{price:.2f}", f"{pct:.2f}%")
+                    st.caption(source)
+                else:
+                    st.metric(key, "待同步", "--")
+                    st.caption(status or source or "数据源暂不可用")
+else:
+    st.info("宏观看板暂未取得实时数据，但不会影响下方功能使用。")
+st.markdown("<br>", unsafe_allow_html=True)
+
+
 
 def render_module_crash_box(module_name: str, exc: Exception):
     """任何一个模块出错时只在本模块内提示，不让后面的 Tab 整页空白。"""
@@ -4666,52 +4720,28 @@ class MainForceStockSelector:
         ).round(2)
         return df.drop(columns=[c for c in df.columns if c.endswith("_rank")], errors="ignore")
 
-    def _fetch_eastmoney_money_rank(self, pz=240):
+    def _fetch_eastmoney_money_rank(self, pz=5000):
+        """东方财富原生资金榜：以 f62 主力净流入排序，补充 f184 主力净占比、f100 行业、f23 市净率。
+        使用 @st.cache_data(ttl=3600) 避免 Streamlit 每次滑块变动都请求接口。
+        """
         cache_path = _cache_file("main_force", f"em_money_rank_{datetime.now().strftime('%Y%m%d')}.json")
-        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-        fields = "f2,f3,f6,f8,f9,f12,f14,f20,f62,f184"
-        url = (
-            "https://push2.eastmoney.com/api/qt/clist/get?"
-            f"pn=1&pz={int(pz)}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-            "&fltt=2&invt=2&fid=f62"
-            f"&fs={fs}&fields={fields}"
-        )
-        res = fetch_json(url, timeout=8, retries=1)
-        diff = res.get("data", {}).get("diff", []) if isinstance(res, dict) else []
-        if not diff:
+        try:
+            rows = fetch_em_clist_cached(pz=int(pz), fid="f62", fields=EM_NATIVE_FIELDS_CORE)
+            df = normalize_em_clist_rows(rows, source="东方财富原生资金榜｜f62/f184/f100/f23")
+        except Exception as exc:
+            df = pd.DataFrame()
+            if DEBUG_MODE:
+                st.caption(f"东方财富资金榜异常：{exc}")
+        if df is None or df.empty:
             cached = _json_load(cache_path, max_age_seconds=6 * 3600)
             if cached and isinstance(cached.get("records"), list):
-                df = pd.DataFrame(cached["records"])
-                if not df.empty:
-                    df["数据源"] = "东方财富真实资金字段f62｜真实缓存"
-                    return self._score_candidates(df), f"东方财富实时接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
+                cached_df = pd.DataFrame(cached["records"])
+                if not cached_df.empty:
+                    cached_df["数据源"] = f"东方财富真实资金字段f62｜缓存 {cached.get('time','')}"
+                    return self._score_candidates(cached_df), f"东方财富实时接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
             return pd.DataFrame(), "东方财富资金字段f62接口返回空或熔断"
-        rows = []
-        for item in diff:
-            code = self._normalize_code(item.get("f12", ""))
-            name = str(item.get("f14", ""))
-            if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
-                continue
-            main_net = safe_float(item.get("f62"), 0)
-            rows.append({
-                "股票代码": code,
-                "股票简称": name,
-                "所属行业": self._infer_industry(name),
-                "区间涨跌幅": safe_float(item.get("f3"), 0),
-                "最新价": safe_float(item.get("f2"), 0),
-                "主力净流入": main_net,
-                "成交额": safe_float(item.get("f6"), 0),
-                "换手率": safe_float(item.get("f8"), 0),
-                "总市值": _normalize_market_cap_yi(item.get("f20")),
-                "市盈率": item.get("f9", "-"),
-                "资金热度分": 0.0,
-                "数据源": "东方财富真实资金字段f62",
-            })
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return pd.DataFrame(), "东方财富资金字段f62无有效股票"
         _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": df.to_dict("records")})
-        return self._score_candidates(df), f"东方财富真实资金字段f62成功获取 {len(df)} 只"
+        return self._score_candidates(df), f"东方财富原生资金榜成功获取 {len(df)} 只（含主力净占比f184，缓存1小时）"
 
     def _fetch_tushare_moneyflow_watchlist(self, codes=None, trade_date=None):
         codes = [str(c).zfill(6) for c in (codes or []) if re.fullmatch(r"\d{6}", str(c).zfill(6))]
@@ -4770,7 +4800,7 @@ class MainForceStockSelector:
             return pd.DataFrame(), f"Tushare低频自选池异常：{exc}"
 
     def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
-        df_em, msg_em = self._fetch_eastmoney_money_rank(pz=260)
+        df_em, msg_em = self._fetch_eastmoney_money_rank(pz=5000)
         if df_em is not None and not df_em.empty:
             return True, df_em, msg_em
         # 不再全市场打 Tushare，避免 800 次/日额度瞬间耗尽。
@@ -5095,7 +5125,7 @@ with tab2:
 with tab3:
     with st.container(border=True):
         st.markdown("#### 🔥 资金热点板块（附实战标的推荐）")
-        st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时会自动使用真实缓存兜底，不再使用观察池或 JQData 冒充实时热点。")
+        st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时会自动使用缓存或观察池兜底。")
         if st.button("扫描板块与生成配置推荐", type="primary"):
             with st.spinner("正在获取板块异动数据...（只展示真实接口/真实行情计算结果）"):
                 blocks = get_hot_blocks()
@@ -5103,7 +5133,7 @@ with tab3:
                 df_blocks = pd.DataFrame(blocks)
                 st.dataframe(df_blocks, width="stretch", hide_index=True)
                 source_set = "、".join(sorted({str(b.get("数据源", "未知")) for b in blocks}))
-                st.caption(f"板块数据源：{source_set}。本页不使用内置热点兜底，显示的都是 AKShare/东方财富接口返回或真实缓存。")
+                st.caption(f"板块数据源：{source_set}。本页不使用内置热点兜底，显示的都是接口返回或JQData真实行情计算结果。")
                 if not api_key:
                     st.info("未配置 GROQ_API_KEY，已展示板块数据；配置后可生成 AI 配置建议。")
                 else:
@@ -5127,7 +5157,7 @@ with tab3:
 """
                         st.markdown(call_ai(prompt, temperature=0.4))
             else:
-                st.warning("AKShare/东方财富真实板块接口均未返回结果，且没有可用真实缓存。请稍后重试，或打开调试模式查看失败原因。")
+                st.warning("真实板块接口/JQData真实行情计算均未返回结果。请稍后重试，或打开调试模式查看失败原因。")
 
 # ================= Tab 4: 高阶情报终端 =================
 with tab4:
