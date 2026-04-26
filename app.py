@@ -12,6 +12,12 @@ import pywencai
 import akshare as ak
 import tushare as ts
 import baostock as bs
+try:
+    import jqdatasdk as jq
+    JQDATA_SDK_AVAILABLE = True
+except Exception:
+    jq = None
+    JQDATA_SDK_AVAILABLE = False
 import random
 import time
 from datetime import datetime, timedelta
@@ -90,6 +96,274 @@ ts_token = get_tushare_token_from_secrets()
 if ts_token:
     ts.set_token(ts_token)
 
+
+# ================= JQData / 聚宽数据源 =================
+def get_jqdata_credentials_from_secrets():
+    """从 Streamlit Secrets 读取 JQData 账号密码。支持顶层或 [jqdata] 分组。"""
+    username_keys = ["JQDATA_USERNAME", "JQDATA_USER", "JQDATA_ACCOUNT", "JQ_USERNAME", "JQ_ACCOUNT", "jqdata_username"]
+    password_keys = ["JQDATA_PASSWORD", "JQDATA_PASS", "JQ_PASSWORD", "JQ_PASS", "jqdata_password"]
+    username = ""
+    password = ""
+    for key in username_keys:
+        try:
+            val = st.secrets.get(key, "")
+            if val:
+                username = str(val).strip()
+                break
+        except Exception:
+            pass
+    for key in password_keys:
+        try:
+            val = st.secrets.get(key, "")
+            if val:
+                password = str(val).strip()
+                break
+        except Exception:
+            pass
+    try:
+        section = st.secrets.get("jqdata", {})
+        if isinstance(section, dict):
+            username = username or str(section.get("username") or section.get("user") or section.get("account") or "").strip()
+            password = password or str(section.get("password") or section.get("pass") or "").strip()
+    except Exception:
+        pass
+    return username, password
+
+jq_username, jq_password = get_jqdata_credentials_from_secrets()
+
+
+def to_jq_code(symbol: str) -> str:
+    """A股六位代码转 JQData 证券代码。"""
+    symbol = str(symbol).strip().zfill(6)
+    if symbol.startswith(("6", "9", "5", "7")):
+        return f"{symbol}.XSHG"
+    return f"{symbol}.XSHE"
+
+
+def from_jq_code(jq_code: str) -> str:
+    return str(jq_code).split(".")[0].zfill(6)
+
+
+@st.cache_resource(show_spinner=False)
+def jqdata_auth_cached(username: str, password: str):
+    """JQData 登录只做一次缓存，避免每次刷新页面重复认证。"""
+    if not JQDATA_SDK_AVAILABLE:
+        return False, "未安装 jqdatasdk，请在 requirements.txt 添加 jqdatasdk>=1.9.7"
+    if not username or not password:
+        return False, "未在 Streamlit Secrets 中配置 JQData 账号密码"
+    try:
+        jq.auth(username, password)
+        return True, "JQData 登录成功"
+    except Exception as exc:
+        return False, f"JQData 登录失败：{exc}"
+
+
+def ensure_jqdata_auth():
+    return jqdata_auth_cached(jq_username, jq_password)
+
+
+def get_latest_trade_date_for_data(max_lookback=12):
+    today = datetime.now()
+    return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(max_lookback)]
+
+
+def _fetch_jq_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
+    """JQData 日K：真实接口数据，不做估算。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(msg)
+        return None
+    try:
+        jq_code = to_jq_code(symbol)
+        df = jq.get_price(
+            jq_code,
+            end_date=datetime.now().strftime("%Y-%m-%d"),
+            count=int(days) + 40,
+            frequency="daily",
+            fields=["open", "close", "high", "low", "volume", "money"],
+            fq="pre",
+            panel=False,
+        )
+        if df is None or df.empty:
+            return None
+        df = df.reset_index().rename(columns={"index": "date", "money": "amount"})
+        if "time" in df.columns and "date" not in df.columns:
+            df = df.rename(columns={"time": "date"})
+        return _normalize_daily_kline(df, days=days)
+    except Exception as exc:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"JQData 日K失败 {symbol}: {exc}")
+        return None
+
+
+def _quote_from_jqdata(symbol: str) -> dict | None:
+    """JQData 最新日线行情/基础资料。注意：这是最新交易日收盘数据，不伪装为盘中实时行情。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(msg)
+        return None
+    try:
+        jq_code = to_jq_code(symbol)
+        df = jq.get_price(
+            jq_code,
+            end_date=datetime.now().strftime("%Y-%m-%d"),
+            count=2,
+            frequency="daily",
+            fields=["open", "close", "high", "low", "volume", "money"],
+            fq="pre",
+            panel=False,
+        )
+        if df is None or df.empty:
+            return None
+        df = df.reset_index()
+        close = safe_float(df.iloc[-1].get("close"), 0)
+        prev_close = safe_float(df.iloc[-2].get("close"), 0) if len(df) >= 2 else 0
+        pct = ((close - prev_close) / prev_close * 100) if prev_close > 0 else 0
+        name = ""
+        try:
+            info = jq.get_security_info(jq_code)
+            name = getattr(info, "display_name", "") or getattr(info, "name", "") or ""
+        except Exception:
+            pass
+        return {
+            "symbol": symbol,
+            "name": name,
+            "price": close,
+            "pct": pct,
+            "turnover": 0.0,
+            "market_cap": 0.0,
+            "pe": "-",
+            "pb": "-",
+            "source": "JQData最新交易日日线",
+        }
+    except Exception as exc:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"JQData 个股行情失败 {symbol}: {exc}")
+        return None
+
+
+def _fetch_jqdata_moneyflow_pool(max_stocks=300, trade_date=None):
+    """JQData 真实资金流池。若账号权限不含 money_flow，会返回明确错误，不做估算。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        return pd.DataFrame(), msg
+    try:
+        securities = []
+        names = {}
+        try:
+            sec = jq.get_all_securities(types=["stock"], date=datetime.now().strftime("%Y-%m-%d"))
+            if sec is not None and not sec.empty:
+                sec = sec.reset_index().rename(columns={"index": "jq_code"})
+                sec = sec[~sec["display_name"].astype(str).str.contains("ST|退", na=False)]
+                securities = sec["jq_code"].head(max_stocks).tolist()
+                names = dict(zip(sec["jq_code"], sec["display_name"]))
+        except Exception as exc:
+            return pd.DataFrame(), f"JQData get_all_securities异常：{exc}"
+        if not securities:
+            return pd.DataFrame(), "JQData get_all_securities 返回空，无法构造真实查询列表"
+
+        dates = [str(trade_date)] if trade_date else get_latest_trade_date_for_data(12)
+        mf = None
+        used_date = None
+        last_error = ""
+        for d in dates:
+            try:
+                tmp = jq.get_money_flow(security_list=securities, start_date=d, end_date=d)
+                if tmp is not None and not tmp.empty:
+                    mf = tmp.copy()
+                    used_date = d
+                    break
+            except TypeError:
+                try:
+                    tmp = jq.get_money_flow(securities, d, d)
+                    if tmp is not None and not tmp.empty:
+                        mf = tmp.copy()
+                        used_date = d
+                        break
+                except Exception as exc2:
+                    last_error = str(exc2)
+            except Exception as exc:
+                last_error = str(exc)
+        if mf is None or mf.empty:
+            return pd.DataFrame(), f"JQData money_flow 最近交易日返回空或无权限：{last_error}"
+
+        if "sec_code" in mf.columns and "code" not in mf.columns:
+            mf = mf.rename(columns={"sec_code": "code"})
+        if "security" in mf.columns and "code" not in mf.columns:
+            mf = mf.rename(columns={"security": "code"})
+        if "code" not in mf.columns:
+            mf = mf.reset_index().rename(columns={"index": "code"})
+        mf["jq_code"] = mf["code"].astype(str).apply(lambda x: x if "." in x else to_jq_code(x[:6]))
+        mf["股票代码"] = mf["jq_code"].apply(from_jq_code)
+        mf["股票简称"] = mf["jq_code"].map(names).fillna(mf["股票代码"])
+
+        def pick_numeric(cols):
+            for c in cols:
+                if c in mf.columns:
+                    return pd.to_numeric(mf[c], errors="coerce").fillna(0)
+            return pd.Series([0] * len(mf), index=mf.index, dtype="float64")
+
+        main_net = pick_numeric(["net_amount_main", "net_amount", "main_net_amount", "net_mf_amount"])
+        if main_net.abs().sum() == 0:
+            main_net = pick_numeric(["net_amount_xl"]) + pick_numeric(["net_amount_l"])
+        pct = pick_numeric(["change_pct", "pct_chg", "涨跌幅"])
+        amount = pick_numeric(["money", "成交额", "amount"])
+
+        try:
+            price_df = jq.get_price(
+                mf["jq_code"].head(max_stocks).tolist(),
+                end_date=used_date,
+                count=1,
+                frequency="daily",
+                fields=["close", "money", "volume"],
+                fq="pre",
+                panel=False,
+            )
+            if price_df is not None and not price_df.empty:
+                if "code" not in price_df.columns:
+                    price_df = price_df.reset_index()
+                code_col = "code" if "code" in price_df.columns else ("security" if "security" in price_df.columns else None)
+                if code_col:
+                    price_df["jq_code"] = price_df[code_col].astype(str)
+                    price_map_close = dict(zip(price_df["jq_code"], pd.to_numeric(price_df["close"], errors="coerce")))
+                    price_map_money = dict(zip(price_df["jq_code"], pd.to_numeric(price_df["money"], errors="coerce")))
+                else:
+                    price_map_close, price_map_money = {}, {}
+            else:
+                price_map_close, price_map_money = {}, {}
+        except Exception:
+            price_map_close, price_map_money = {}, {}
+
+        rows = []
+        for idx, r in mf.iterrows():
+            code = str(r.get("股票代码", "")).zfill(6)
+            name = str(r.get("股票简称", code))
+            if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+                continue
+            jq_code = r.get("jq_code")
+            rows.append({
+                "股票代码": code,
+                "股票简称": name,
+                "所属行业": "未分类",
+                "区间涨跌幅": safe_float(pct.loc[idx], 0),
+                "最新价": safe_float(price_map_close.get(jq_code), 0),
+                "主力净流入": safe_float(main_net.loc[idx], 0),
+                "成交额": safe_float(amount.loc[idx], 0) or safe_float(price_map_money.get(jq_code), 0),
+                "换手率": 0.0,
+                "总市值": 0.0,
+                "市盈率": "-",
+                "资金热度分": 0.0,
+                "数据源": f"JQData真实资金流{used_date}",
+            })
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return pd.DataFrame(), "JQData money_flow 无有效股票"
+        return out, f"JQData money_flow 成功获取{len(out)}只股票，交易日{used_date}"
+    except Exception as exc:
+        return pd.DataFrame(), f"JQData money_flow异常：{exc}"
+
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
     st.header("⚙️ 终端控制台")
@@ -115,6 +389,11 @@ with st.sidebar:
         st.success("Tushare Token：已从 secrets 读取")
     else:
         st.error("Tushare Token：未读取到，请检查 secrets")
+    jq_ok, jq_msg = ensure_jqdata_auth()
+    if jq_ok:
+        st.success("JQData：已从 secrets 登录")
+    else:
+        st.warning(f"JQData：{jq_msg}")
     STRICT_REAL_DATA = st.checkbox("🧱 严格真实数据模式", value=True, help="开启后不使用内置观察池、不用K线构造行情、不估算主力资金。接口失败就明确显示失败。")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
 
@@ -1798,7 +2077,7 @@ def get_stock_quote(symbol):
     """
     严格真实数据版：只使用明确来自真实接口的行情字段。
     不再使用“日K构造行情”和“内置基础资料”补全，避免把兜底数据误当作实时判断依据。
-    链路：东财单股 → AKShare实时 → 新浪实时 → 东财全市场快照 → Tushare日终基础估值/名称补字段。
+    链路：东财单股 → AKShare实时 → 新浪实时 → 东财全市场快照 → JQData最新交易日日线 → Tushare日终基础估值/名称补字段。
     """
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
@@ -1817,6 +2096,9 @@ def get_stock_quote(symbol):
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"东财全市场快照补全失败 {symbol}: {e}")
+
+    # JQData 只作为真实最新交易日日线补充，来源会明确标注；不把它伪装为盘中实时行情。
+    merged = _merge_quote(merged, _quote_from_jqdata(symbol))
 
     # 只用 Tushare 的真实日终基础数据补名称、PE/PB、市值、换手率；不拿K线构造实时价格。
     merged = _merge_quote(merged, _quote_from_tushare_basic(symbol))
@@ -1890,7 +2172,7 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_kline(symbol, days=220):
-    """日K完整兜底版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
+    """日K真实数据版：JQData 优先；JQData 不可用时再使用其他真实接口，不做估算。"""
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
@@ -1900,6 +2182,13 @@ def get_kline(symbol, days=220):
     end_str = end_date.strftime("%Y%m%d")
     start_str_bs = start_date.strftime("%Y-%m-%d")
     end_str_bs = end_date.strftime("%Y-%m-%d")
+    try:
+        df = _fetch_jq_daily_kline(symbol, days=days)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"JQData 日K失败 {symbol}: {e}")
     try:
         df = _fetch_em_daily_kline(symbol, days=days)
         if df is not None and not df.empty:
@@ -2924,9 +3213,14 @@ class MainForceStockSelector:
         # 严格真实数据：东财实时资金字段失败后，转 Tushare moneyflow；不使用内置池、不估算主力净流入。
         df, msg = self._fetch_eastmoney_fast_pool(pz=220)
         if df.empty:
-            df2, msg2 = self._fetch_tushare_moneyflow_pool()
-            msg = f"{msg}；{msg2}"
-            df = df2
+            df_jq, msg_jq = _fetch_jqdata_moneyflow_pool(max_stocks=300)
+            if not df_jq.empty:
+                df = self._score_candidates(df_jq)
+                msg = f"{msg}；{msg_jq}"
+            else:
+                df2, msg2 = self._fetch_tushare_moneyflow_pool()
+                msg = f"{msg}；{msg_jq}；{msg2}"
+                df = df2
         if df.empty:
             return False, pd.DataFrame(), f"真实资金数据不可用：{msg}"
         return True, df, msg
@@ -4070,57 +4364,4 @@ with tab5:
                                 st.dataframe(pd.DataFrame([{"游资名称": k, "净流入金额": v} for k, v in top_youzi.items()]), width="stretch", hide_index=True)
                             else:
                                 st.info("当前数据源未提供明确游资席位。")
-                        with c2:
-                            st.markdown("##### 热门概念 TOP")
-                            hot_concepts = summary.get("hot_concepts", {})
-                            if hot_concepts:
-                                st.dataframe(pd.DataFrame([{"概念": k, "出现次数": v} for k, v in hot_concepts.items()]), width="stretch", hide_index=True)
-                            else:
-                                st.info("当前数据源未提供明确概念字段。")
-
-                    agents = res.get("agents_analysis", {})
-                    with tab_youzi:
-                        if agents.get("youzi"):
-                            st.markdown(agents["youzi"].get("analysis", ""))
-                        elif ai_depth != "深度":
-                            st.info("当前为标准模式，未运行游资画像分析。选择 AI 分析深度为“深度”后可生成。")
-                        else:
-                            st.info("暂无游资画像报告。")
-                    with tab_stock:
-                        if agents.get("stock"):
-                            st.markdown(agents["stock"].get("analysis", ""))
-                        else:
-                            st.info("暂无个股潜力报告。")
-                    with tab_theme:
-                        if agents.get("theme"):
-                            st.markdown(agents["theme"].get("analysis", ""))
-                        elif ai_depth != "深度":
-                            st.info("当前为标准模式，未运行题材追踪分析。选择 AI 分析深度为“深度”后可生成。")
-                        else:
-                            st.info("暂无题材追踪报告。")
-                    with tab_risk:
-                        if agents.get("risk"):
-                            st.markdown(agents["risk"].get("analysis", ""))
-                        else:
-                            st.info("暂无风险控制报告。")
-                    with tab_chief:
-                        if agents.get("chief"):
-                            st.markdown(agents["chief"].get("analysis", ""))
-                        elif not run_ai_lhb:
-                            st.info("你已关闭 AI 报告，本页仅展示量化评分与数据概况。")
-                        else:
-                            st.info("暂无首席策略报告。")
-                    with tab_raw:
-                        if show_raw_lhb and df_lhb is not None and not df_lhb.empty:
-                            st.dataframe(df_lhb, width="stretch", hide_index=True)
-                        else:
-                            st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
-# ================= Tab 6: 主力资金选股 =================
-
-with tab6:
-    render_main_force_tab()
-
-# ================= Tab 7: 高端情报终端 Pro =================
-with tab7:
-    with st.container(border=True):
-        render_high_end_news_terminal()
+                       
