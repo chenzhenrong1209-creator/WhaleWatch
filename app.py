@@ -603,105 +603,6 @@ def fetch_json(url, timeout=6, extra_headers=None, retries=1, silent=True):
         st.caption(f"请求失败：{last_err} | {url[:100]}")
     return None
 
-# ================= 东方财富原生 API 稳定层 =================
-# 依据“东方财富API使用说明”统一处理：字段映射、Headers、JSONP、频率保护、缓存。
-EM_NATIVE_FIELDS_CORE = "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
-EM_MARKET_FS_ALL_A = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"  # 沪深主板/创业板/科创板/北交所常用全集
-
-def em_native_headers(host: str = "push2.eastmoney.com") -> dict:
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-        "Host": host,
-        "Connection": "close",
-    }
-
-def fetch_eastmoney_native(url: str, params: dict | None = None, timeout: int = 10, retries: int = 1, host: str = "push2.eastmoney.com"):
-    """东方财富原生接口请求：严格 Headers + JSON/JSONP 双兼容 + 轻量重试。"""
-    headers = em_native_headers(host=host)
-    timeout_tuple = (3, timeout)
-    last_err = None
-    for attempt in range(max(1, retries + 1)):
-        try:
-            res = SESSION.get(url, params=params, headers=headers, timeout=timeout_tuple, verify=False)
-            if res.status_code in (403, 429, 500, 502, 503, 504):
-                last_err = f"HTTP {res.status_code}"
-                time.sleep(0.6 + random.random() * 0.5)
-                continue
-            if res.status_code != 200:
-                last_err = f"HTTP {res.status_code}"
-                continue
-            text = (res.text or "").strip()
-            if not text:
-                return None
-            # 东财部分接口会返回 jQueryxxxx({...}); 这里统一剥壳。
-            if text.startswith("jQuery") or ("(" in text[:50] and text.endswith((")", ");"))):
-                m = re.search(r"^[\w$]+\((.*)\);?$", text, re.S)
-                if m:
-                    text = m.group(1)
-            return json.loads(text)
-        except Exception as exc:
-            last_err = str(exc)
-            time.sleep(0.5 + random.random() * 0.5)
-    if DEBUG_MODE:
-        st.caption(f"东方财富原生接口失败：{last_err}")
-    return None
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_em_clist_cached(pz: int = 5000, fid: str = "f62", fields: str = EM_NATIVE_FIELDS_CORE) -> list:
-    """东方财富全市场 clist 底库。1小时缓存，避免 Streamlit 控件变化触发接口熔断。"""
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": "1", "pz": str(int(pz)), "po": "1", "np": "1",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
-        "fid": fid, "fs": EM_MARKET_FS_ALL_A, "fields": fields,
-    }
-    js = fetch_eastmoney_native(url, params=params, timeout=10, retries=1, host="push2.eastmoney.com")
-    return (((js or {}).get("data") or {}).get("diff") or []) if isinstance(js, dict) else []
-
-def normalize_em_clist_rows(rows: list, source: str = "东方财富原生clist") -> pd.DataFrame:
-    """将东财 f 字段统一映射为本系统字段。"""
-    out = []
-    for item in rows or []:
-        code = str(item.get("f12", "")).strip().zfill(6)
-        name = str(item.get("f14", "")).strip()
-        if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
-            continue
-        out.append({
-            "股票代码": code,
-            "股票简称": name,
-            "所属行业": item.get("f100") or "未分类",
-            "区间涨跌幅": safe_float(item.get("f3"), 0),
-            "最新价": safe_float(item.get("f2"), 0),
-            "主力净流入": safe_float(item.get("f62"), 0),
-            "主力净占比": safe_float(item.get("f184"), 0),
-            "成交额": safe_float(item.get("f6"), 0),
-            "换手率": safe_float(item.get("f8"), 0),
-            "总市值": _normalize_market_cap_yi(item.get("f20")),
-            "市盈率": item.get("f9", "-"),
-            "市净率": item.get("f23", "-"),
-            "资金热度分": 0.0,
-            "数据源": source,
-        })
-    return pd.DataFrame(out)
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_em_mainflow_daykline_cached(symbol: str, days: int = 5) -> dict:
-    """个股主力资金历史日线：f51日期、f52主力净额、f53小单净额、f54中单净额、f55大单净额。"""
-    code = str(symbol).strip().zfill(6)
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    params = {"secid": _secid_for_symbol(code), "fields1": "f1,f2,f3", "fields2": "f51,f52,f53,f54,f55"}
-    js = fetch_eastmoney_native(url, params=params, timeout=8, retries=1, host="push2.eastmoney.com")
-    klines = (((js or {}).get("data") or {}).get("klines") or []) if isinstance(js, dict) else []
-    vals = []
-    for line in klines[-int(days):]:
-        parts = str(line).split(",")
-        if len(parts) >= 2:
-            vals.append(safe_float(parts[1], 0))
-    return {"symbol": code, "days": len(vals), "main_net_5d": sum(vals), "source": "东方财富fflow/daykline"}
-
-
 # ================= 价格归一化修复 =================
 def normalize_em_price(raw_price, prev_close=None):
     raw_price = safe_float(raw_price)
@@ -3113,18 +3014,66 @@ class MainForceStockSelector:
                 return industry
         return "未分类"
 
-    def _fetch_eastmoney_fast_pool(self, pz=5000):
-        """东方财富原生 clist 全市场底库：一次取全量，1小时缓存，字段含 f62/f184/f100/f23。"""
+    def _fetch_eastmoney_fast_pool(self, pz=220):
+        """东方财富轻量实时列表。只请求一页，避免 AKShare 多页 tqdm 卡住。"""
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1",
+            "pz": str(pz),
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f6",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f2,f3,f6,f8,f9,f12,f14,f20,f21,f62,f184"
+        }
         try:
-            rows = fetch_em_clist_cached(pz=int(pz), fid="f62", fields=EM_NATIVE_FIELDS_CORE)
-            if not rows:
-                return pd.DataFrame(), "东方财富原生clist返回空或被限流"
-            df = normalize_em_clist_rows(rows, source="东方财富原生clist｜f62主力资金+f184净占比")
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Referer": "https://quote.eastmoney.com/center/gridlist.html"
+            }
+            res = SESSION.get(url, params=params, headers=headers, timeout=8)
+            res.raise_for_status()
+            js = res.json()
+            diff = ((js or {}).get("data") or {}).get("diff") or []
+            if not diff:
+                return pd.DataFrame(), "东方财富轻量接口返回空"
+
+            rows = []
+            for item in diff:
+                code = self._normalize_code(item.get("f12", ""))
+                name = str(item.get("f14", ""))
+                if not re.match(r"^\d{6}$", code):
+                    continue
+                if "ST" in name or "退" in name:
+                    continue
+                amount = safe_float(item.get("f6"))
+                pct = safe_float(item.get("f3"))
+                turnover = safe_float(item.get("f8"))
+                market_cap = safe_float(item.get("f20")) / 100000000 if safe_float(item.get("f20")) > 1000000 else safe_float(item.get("f20"))
+                main_net = safe_float(item.get("f62"), 0)
+                rows.append({
+                    "股票代码": code,
+                    "股票简称": name,
+                    "所属行业": self._infer_industry(name),
+                    "区间涨跌幅": pct,
+                    "最新价": safe_float(item.get("f2")),
+                    "主力净流入": main_net,
+                    "成交额": amount,
+                    "换手率": turnover,
+                    "总市值": market_cap,
+                    "市盈率": item.get("f9", "-"),
+                    "资金热度分": 0.0,
+                    "数据源": "东方财富实时资金字段f62"
+                })
+            df = pd.DataFrame(rows)
             if df.empty:
-                return pd.DataFrame(), "东方财富原生clist无有效股票"
-            return self._score_candidates(df), f"东方财富原生clist成功获取{len(df)}只候选股票（缓存1小时）"
+                return pd.DataFrame(), "东方财富轻量接口无有效股票"
+            return self._score_candidates(df), f"东方财富轻量接口成功获取{len(df)}只候选股票"
         except Exception as exc:
-            return pd.DataFrame(), f"东方财富原生clist异常: {exc}"
+            return pd.DataFrame(), f"东方财富轻量接口异常: {exc}"
 
     def _fetch_tushare_moneyflow_pool(self, trade_date=None):
         """Tushare 真实资金流接口：作为东财被限流时的真实数据源，不做估算。"""
@@ -3268,7 +3217,7 @@ class MainForceStockSelector:
         df_ts, msg_ts = self._fetch_tushare_moneyflow_pool()
         if not df_ts.empty:
             return True, df_ts, f"{msg_jq}；{msg_ts}"
-        df_em, msg_em = self._fetch_eastmoney_fast_pool(pz=5000)
+        df_em, msg_em = self._fetch_eastmoney_fast_pool(pz=220)
         if not df_em.empty:
             return True, df_em, f"{msg_jq}；{msg_ts}；{msg_em}"
         return False, pd.DataFrame(), f"真实资金数据不可用：{msg_jq}；{msg_ts}；{msg_em}"
@@ -4720,28 +4669,52 @@ class MainForceStockSelector:
         ).round(2)
         return df.drop(columns=[c for c in df.columns if c.endswith("_rank")], errors="ignore")
 
-    def _fetch_eastmoney_money_rank(self, pz=5000):
-        """东方财富原生资金榜：以 f62 主力净流入排序，补充 f184 主力净占比、f100 行业、f23 市净率。
-        使用 @st.cache_data(ttl=3600) 避免 Streamlit 每次滑块变动都请求接口。
-        """
+    def _fetch_eastmoney_money_rank(self, pz=240):
         cache_path = _cache_file("main_force", f"em_money_rank_{datetime.now().strftime('%Y%m%d')}.json")
-        try:
-            rows = fetch_em_clist_cached(pz=int(pz), fid="f62", fields=EM_NATIVE_FIELDS_CORE)
-            df = normalize_em_clist_rows(rows, source="东方财富原生资金榜｜f62/f184/f100/f23")
-        except Exception as exc:
-            df = pd.DataFrame()
-            if DEBUG_MODE:
-                st.caption(f"东方财富资金榜异常：{exc}")
-        if df is None or df.empty:
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+        fields = "f2,f3,f6,f8,f9,f12,f14,f20,f62,f184"
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get?"
+            f"pn=1&pz={int(pz)}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f62"
+            f"&fs={fs}&fields={fields}"
+        )
+        res = fetch_json(url, timeout=8, retries=1)
+        diff = res.get("data", {}).get("diff", []) if isinstance(res, dict) else []
+        if not diff:
             cached = _json_load(cache_path, max_age_seconds=6 * 3600)
             if cached and isinstance(cached.get("records"), list):
-                cached_df = pd.DataFrame(cached["records"])
-                if not cached_df.empty:
-                    cached_df["数据源"] = f"东方财富真实资金字段f62｜缓存 {cached.get('time','')}"
-                    return self._score_candidates(cached_df), f"东方财富实时接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
+                df = pd.DataFrame(cached["records"])
+                if not df.empty:
+                    df["数据源"] = "东方财富真实资金字段f62｜真实缓存"
+                    return self._score_candidates(df), f"东方财富实时接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
             return pd.DataFrame(), "东方财富资金字段f62接口返回空或熔断"
+        rows = []
+        for item in diff:
+            code = self._normalize_code(item.get("f12", ""))
+            name = str(item.get("f14", ""))
+            if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+                continue
+            main_net = safe_float(item.get("f62"), 0)
+            rows.append({
+                "股票代码": code,
+                "股票简称": name,
+                "所属行业": self._infer_industry(name),
+                "区间涨跌幅": safe_float(item.get("f3"), 0),
+                "最新价": safe_float(item.get("f2"), 0),
+                "主力净流入": main_net,
+                "成交额": safe_float(item.get("f6"), 0),
+                "换手率": safe_float(item.get("f8"), 0),
+                "总市值": _normalize_market_cap_yi(item.get("f20")),
+                "市盈率": item.get("f9", "-"),
+                "资金热度分": 0.0,
+                "数据源": "东方财富真实资金字段f62",
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame(), "东方财富资金字段f62无有效股票"
         _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": df.to_dict("records")})
-        return self._score_candidates(df), f"东方财富原生资金榜成功获取 {len(df)} 只（含主力净占比f184，缓存1小时）"
+        return self._score_candidates(df), f"东方财富真实资金字段f62成功获取 {len(df)} 只"
 
     def _fetch_tushare_moneyflow_watchlist(self, codes=None, trade_date=None):
         codes = [str(c).zfill(6) for c in (codes or []) if re.fullmatch(r"\d{6}", str(c).zfill(6))]
@@ -4800,7 +4773,7 @@ class MainForceStockSelector:
             return pd.DataFrame(), f"Tushare低频自选池异常：{exc}"
 
     def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
-        df_em, msg_em = self._fetch_eastmoney_money_rank(pz=5000)
+        df_em, msg_em = self._fetch_eastmoney_money_rank(pz=260)
         if df_em is not None and not df_em.empty:
             return True, df_em, msg_em
         # 不再全市场打 Tushare，避免 800 次/日额度瞬间耗尽。
@@ -4839,6 +4812,479 @@ def render_data_source_health_panel():
     rows.append({"数据源": "tushare", "失败次数": "-", "状态": f"低频保护 已用{tq.get('used',0)}/300", "最后错误": ""})
     rows.append({"数据源": "jqdata", "失败次数": "-", "状态": "最低优先级/默认不参与核心链路", "最后错误": ""})
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+
+# =============================================================================
+# 东方财富接口专项优化补丁 v7.1
+# 依据上传的《东方财富 API 使用说明》重构：
+# - 严格使用 push2 / datacenter 原生字段 f12/f14/f2/f9/f23/f62/f184/f100
+# - 强化 Headers：Host + Referer + User-Agent，兼容 Streamlit Cloud 海外环境
+# - JSONP 自动清洗
+# - clist 单次全市场优先，失败后自动降级 pz，防止 502 拖垮页面
+# - 盘中实时字段、主力资金、资金热点、龙虎榜分别调用对应东财路径
+# =============================================================================
+from urllib.parse import urlencode
+
+EASTMONEY_BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+    "Origin": "https://quote.eastmoney.com",
+    "Connection": "close",
+}
+
+def _eastmoney_headers(url: str, referer: str = "https://quote.eastmoney.com/center/gridlist.html") -> dict:
+    host = urlparse(url).netloc
+    headers = dict(EASTMONEY_BASE_HEADERS)
+    headers["Host"] = host
+    headers["Referer"] = referer
+    if "datacenter-web.eastmoney.com" in host:
+        headers["Referer"] = "https://data.eastmoney.com/"
+        headers["Origin"] = "https://data.eastmoney.com"
+    return headers
+
+def _loads_json_or_jsonp(text: str):
+    """兼容东财 JSON 与 JSONP，避免 jQuery_xxx(...) 解析失败。"""
+    if text is None:
+        return None
+    body = str(text).strip()
+    if not body:
+        return None
+    if body.startswith("{") or body.startswith("["):
+        return json.loads(body)
+    m = re.search(r"^[A-Za-z_$][\w$]*\((.*)\)\s*;?$", body, flags=re.S)
+    if m:
+        return json.loads(m.group(1))
+    # 个别接口前后带无关字符时，尽量截取首个 JSON 对象
+    m = re.search(r"(\{.*\})", body, flags=re.S)
+    if m:
+        return json.loads(m.group(1))
+    return None
+
+def fetch_eastmoney_native(url, params=None, timeout=10, retries=2, cache_key=None, cache_ttl=1800, referer=None, silent=True):
+    """东方财富原生请求：专用 headers + JSONP 清洗 + 熔断 + 真实缓存。"""
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urlencode(params, doseq=True)}"
+    cache_path = _cache_file("eastmoney_native", f"{cache_key or hashlib.md5(url.encode()).hexdigest()}.json")
+    if _cb_is_open("eastmoney"):
+        cached = _json_load(cache_path, max_age_seconds=cache_ttl)
+        if cached:
+            cached["_from_cache"] = True
+            return cached
+        return None
+    last_err = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            headers = _eastmoney_headers(url, referer or "https://quote.eastmoney.com/center/gridlist.html")
+            # 每次轻微变换 UA，降低云端重复请求被拦截概率
+            headers["User-Agent"] = random.choice(USER_AGENTS) if "USER_AGENTS" in globals() else headers["User-Agent"]
+            res = SESSION.get(url, headers=headers, timeout=(4, timeout), verify=False)
+            if res.status_code in (403, 429, 502, 503, 504):
+                last_err = f"HTTP {res.status_code}"
+                time.sleep(min(1.5, 0.35 * (attempt + 1) + random.uniform(0.05, 0.25)))
+                continue
+            if res.status_code != 200:
+                last_err = f"HTTP {res.status_code}"
+                continue
+            data = _loads_json_or_jsonp(res.text)
+            if not data:
+                last_err = "empty or invalid json"
+                continue
+            _cb_success("eastmoney")
+            if cache_key:
+                _json_save(cache_path, data)
+            return data
+        except Exception as exc:
+            last_err = str(exc)
+            time.sleep(min(1.5, 0.35 * (attempt + 1) + random.uniform(0.05, 0.25)))
+    _cb_failure("eastmoney", last_err)
+    cached = _json_load(cache_path, max_age_seconds=cache_ttl)
+    if cached:
+        cached["_from_cache"] = True
+        return cached
+    if DEBUG_MODE and not silent:
+        st.caption(f"东方财富原生接口失败：{last_err}")
+    return None
+
+def _em_market_fs(include_bj=True):
+    # 文档中的沪深京全市场：m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    return fs if include_bj else "m:0+t:6,m:0+t:80,m:1+t:2"
+
+def _em_clist(fields=None, fid="f3", pz_list=(5000, 3000, 1200, 600, 260), fs=None, cache_key="em_clist_core", cache_ttl=1800):
+    """东财全市场 clist。先按说明文档 pz=5000 获取全量，失败后降级，避免页面空白。"""
+    fields = fields or "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
+    fs = fs or _em_market_fs(include_bj=True)
+    base = "https://push2.eastmoney.com/api/qt/clist/get"
+    last_msg = ""
+    for pz in pz_list:
+        params = {
+            "pn": 1,
+            "pz": int(pz),
+            "po": 1,
+            "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2,
+            "invt": 2,
+            "fid": fid,
+            "fs": fs,
+            "fields": fields,
+        }
+        data = fetch_eastmoney_native(
+            base, params=params, timeout=10, retries=2,
+            cache_key=f"{cache_key}_{fid}_{pz}_{datetime.now().strftime('%Y%m%d')}",
+            cache_ttl=cache_ttl, referer="https://quote.eastmoney.com/center/gridlist.html"
+        )
+        rows = data.get("data", {}).get("diff", []) if isinstance(data, dict) else []
+        if rows:
+            return rows, f"东方财富 clist 成功 pz={pz}" + ("｜真实缓存" if data.get("_from_cache") else "")
+        last_msg = f"pz={pz} 返回空"
+        time.sleep(random.uniform(0.35, 0.9))
+    return [], f"东方财富 clist 未返回有效数据：{last_msg}"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_em_spot_snapshot_map() -> dict:
+    """东方财富全市场快照 v7.1：按说明文档补齐 f100/f62/f184/f23。"""
+    fields = "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
+    rows, msg = _em_clist(fields=fields, fid="f3", pz_list=(5000, 3000, 1200, 600), cache_key="em_spot_snapshot", cache_ttl=1800)
+    out = {}
+    for row in rows or []:
+        code = str(row.get("f12", "")).zfill(6)
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        out[code] = {
+            "symbol": code,
+            "name": row.get("f14", ""),
+            "price": safe_float(row.get("f2"), 0.0),
+            "pct": safe_float(row.get("f3"), 0.0),
+            "amount": safe_float(row.get("f6"), 0.0),
+            "turnover": safe_float(row.get("f8"), 0.0),
+            "pe": row.get("f9", "-"),
+            "pb": row.get("f23", "-"),
+            "market_cap": _normalize_market_cap_yi(row.get("f20")),
+            "main_net": safe_float(row.get("f62"), 0.0),
+            "main_net_pct": safe_float(row.get("f184"), 0.0),
+            "industry": row.get("f100", ""),
+            "source": "东方财富全市场快照 f字段",
+            "source_msg": msg,
+        }
+    return out
+
+def _quote_from_eastmoney_single_v7(symbol: str) -> dict | None:
+    """东方财富单股实时 v7.1：优先单股接口，失败时回全市场快照。"""
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"em_single_v71_{symbol}.json")
+    base = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": _secid_for_symbol(symbol),
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "fltt": 2,
+        "invt": 2,
+        # f57代码 f58名称 f43最新 f60昨收 f170涨跌幅 f116总市值 f162动态PE f167PB f168换手
+        "fields": "f57,f58,f43,f60,f170,f116,f162,f167,f168",
+    }
+    res = fetch_eastmoney_native(base, params=params, timeout=7, retries=2, cache_key=f"quote_em_single_{symbol}", cache_ttl=900)
+    d = res.get("data") if isinstance(res, dict) else None
+    if d:
+        price = normalize_em_price(d.get("f43"), d.get("f60"))
+        if price > 0:
+            out = {
+                "symbol": symbol,
+                "name": d.get("f58", ""),
+                "price": price,
+                "pct": safe_float(d.get("f170"), 0.0),
+                "market_cap": _normalize_market_cap_yi(d.get("f116")),
+                "pe": d.get("f162", "-"),
+                "pb": d.get("f167", "-"),
+                "turnover": safe_float(d.get("f168"), 0.0),
+                "source": "东方财富单股实时",
+            }
+            _json_save(cache_path, out)
+            return out
+    snap = get_em_spot_snapshot_map().get(symbol)
+    if snap and safe_float(snap.get("price"), 0) > 0:
+        snap = dict(snap)
+        snap["source"] = "东方财富全市场快照补全"
+        _json_save(cache_path, snap)
+        return snap
+    return _json_load(cache_path, max_age_seconds=3600)
+
+def _quote_from_em_single(symbol: str) -> dict | None:
+    return _quote_from_eastmoney_single_v7(symbol)
+
+def _em_fundflow_daykline(symbol: str, days=10):
+    """东财个股资金流向历史 K 线：/api/qt/stock/fflow/daykline/get。"""
+    symbol = str(symbol).zfill(6)
+    base = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    params = {
+        "secid": _secid_for_symbol(symbol),
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "fields1": "f1,f2,f3",
+        "fields2": "f51,f52,f53,f54,f55",
+    }
+    data = fetch_eastmoney_native(base, params=params, timeout=10, retries=2, cache_key=f"em_fflow_{symbol}", cache_ttl=3600, referer=f"https://quote.eastmoney.com/{'sh' if symbol.startswith('6') else 'sz'}{symbol}.html")
+    klines = data.get("data", {}).get("klines", []) if isinstance(data, dict) else []
+    rows = []
+    for line in klines[-int(days):]:
+        parts = str(line).split(",")
+        if len(parts) >= 5:
+            rows.append({
+                "日期": parts[0],
+                "主力净流入": safe_float(parts[1], 0),
+                "小单净流入": safe_float(parts[2], 0),
+                "中单净流入": safe_float(parts[3], 0),
+                "大单净流入": safe_float(parts[4], 0),
+                "数据源": "东方财富个股资金流历史K",
+            })
+    return pd.DataFrame(rows)
+
+def _em_datacenter_lhb(date: str):
+    """东方财富数据中心龙虎榜详情：RPT_LHB_BOARDDETAIL。"""
+    date_dash = str(date)[:10]
+    base = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    params = {
+        "sortColumns": "TRADE_DATE,SECURITY_CODE",
+        "sortTypes": "-1,1",
+        "pageSize": 500,
+        "pageNumber": 1,
+        "reportName": "RPT_LHB_BOARDDETAIL",
+        "columns": "ALL",
+        "source": "WEB",
+        "client": "WEB",
+        "filter": f"(TRADE_DATE='{date_dash}')",
+    }
+    data = fetch_eastmoney_native(base, params=params, timeout=10, retries=2, cache_key=f"em_lhb_{date_dash}", cache_ttl=12*3600, referer="https://data.eastmoney.com/stock/lhb.html")
+    rows = data.get("result", {}).get("data", []) if isinstance(data, dict) else []
+    if not rows and isinstance(data, dict):
+        rows = data.get("data", []) if isinstance(data.get("data"), list) else []
+    out = []
+    for r in rows or []:
+        code = str(r.get("SECURITY_CODE") or r.get("SECUCODE") or r.get("股票代码") or "")
+        m = re.search(r"(\d{6})", code)
+        code = m.group(1) if m else code
+        out.append({
+            "gpdm": code,
+            "gpmc": r.get("SECURITY_NAME_ABBR") or r.get("SECURITY_NAME") or r.get("股票简称") or "",
+            "yzmc": r.get("OPERATEDEPT_NAME") or r.get("营业部名称") or "龙虎榜席位",
+            "yyb": r.get("OPERATEDEPT_NAME") or r.get("EXPLANATION") or r.get("上榜原因") or "",
+            "sblx": r.get("EXPLANATION") or r.get("上榜原因") or "龙虎榜",
+            "mrje": r.get("BUY") or r.get("BUY_AMT") or r.get("买入金额") or 0,
+            "mcje": r.get("SELL") or r.get("SELL_AMT") or r.get("卖出金额") or 0,
+            "jlrje": r.get("NET") or r.get("NET_BUY_AMT") or r.get("净买额") or 0,
+            "rq": str(r.get("TRADE_DATE") or date_dash)[:10],
+            "gl": r.get("EXPLANATION") or r.get("上榜原因") or "",
+        })
+    return out
+
+def _normalize_em_block_from_clist(rows):
+    """用 f100 所属行业聚合全市场资金热点。"""
+    if not rows:
+        return []
+    tmp = []
+    for row in rows:
+        code = str(row.get("f12", "")).zfill(6)
+        name = str(row.get("f14", ""))
+        ind = str(row.get("f100") or "未分类")
+        if not re.fullmatch(r"\d{6}", code) or not ind or "ST" in name or "退" in name:
+            continue
+        tmp.append({
+            "股票代码": code,
+            "股票名称": name,
+            "板块名称": ind,
+            "涨跌幅": safe_float(row.get("f3"), 0),
+            "主力净流入": safe_float(row.get("f62"), 0),
+            "主力净占比": safe_float(row.get("f184"), 0),
+            "成交额": safe_float(row.get("f6"), 0),
+        })
+    df = pd.DataFrame(tmp)
+    if df.empty:
+        return []
+    rows_out = []
+    for ind, g in df.groupby("板块名称"):
+        g = g.copy()
+        leader = g.sort_values(["涨跌幅", "主力净流入"], ascending=False).iloc[0]
+        avg_pct = float(g["涨跌幅"].mean())
+        main_sum = float(g["主力净流入"].sum())
+        amount_sum = float(g["成交额"].sum())
+        up_count = int((g["涨跌幅"] > 0).sum())
+        down_count = int((g["涨跌幅"] < 0).sum())
+        # 不造假：热点分只基于真实字段排序归一前的原始指标，最终再整体排序
+        rows_out.append({
+            "板块名称": ind,
+            "涨跌幅": round(avg_pct, 2),
+            "主力净流入": main_sum,
+            "上涨家数": up_count,
+            "下跌家数": down_count,
+            "领涨股票": f"{leader.get('股票名称','')}-{leader.get('股票代码','')}",
+            "成交额": amount_sum,
+            "数据源": "东方财富clist按f100行业聚合",
+        })
+    out = pd.DataFrame(rows_out)
+    if out.empty:
+        return []
+    out["涨幅_rank"] = out["涨跌幅"].rank(pct=True).fillna(0)
+    out["资金_rank"] = out["主力净流入"].rank(pct=True).fillna(0)
+    out["成交_rank"] = out["成交额"].rank(pct=True).fillna(0)
+    out["热点分"] = (out["涨幅_rank"] * 40 + out["资金_rank"] * 45 + out["成交_rank"] * 15).round(2)
+    out = out.sort_values(["热点分", "主力净流入", "涨跌幅"], ascending=False).head(20)
+    cols = ["板块名称", "热点分", "涨跌幅", "主力净流入", "上涨家数", "下跌家数", "领涨股票", "数据源"]
+    return out[cols].to_dict("records")
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_hot_blocks():
+    """资金热点 v7.1：AKShare板块资金 + 东财clist f100/f62/f184聚合；失败用真实缓存。"""
+    cache_path = _cache_file("blocks", f"hot_blocks_v71_{datetime.now().strftime('%Y%m%d')}.json")
+    all_records = []
+    # 1. AKShare封装的东财板块/资金流接口
+    loaders = []
+    if hasattr(ak, "stock_sector_fund_flow_rank"):
+        loaders.extend([
+            ("AKShare东财行业资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")),
+            ("AKShare东财概念资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")),
+        ])
+    loaders.extend([
+        ("AKShare东财行业板块涨幅", lambda: ak.stock_board_industry_name_em()),
+        ("AKShare东财概念板块涨幅", lambda: ak.stock_board_concept_name_em()),
+    ])
+    for source, loader in loaders:
+        try:
+            recs = _normalize_block_records(loader(), source)
+            if recs:
+                all_records.extend(recs)
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"{source}失败：{e}")
+    # 2. 原生clist按f100行业聚合，直接使用说明文档中的核心字段
+    rows, msg = _em_clist(fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184", fid="f62", pz_list=(5000, 3000, 1200, 600), cache_key="em_hot_block_clist", cache_ttl=1800)
+    recs = _normalize_em_block_from_clist(rows)
+    if recs:
+        all_records.extend(recs)
+    if all_records:
+        df = pd.DataFrame(all_records)
+        for col in ["热点分", "涨跌幅", "主力净流入"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        df = df.sort_values(["热点分", "主力净流入", "涨跌幅"], ascending=False).drop_duplicates(subset=["板块名称"]).head(25)
+        data = df.to_dict("records")
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": data})
+        return data
+    cached = _json_load(cache_path, max_age_seconds=8 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        data = cached["records"]
+        for r in data:
+            r["数据源"] = f"{r.get('数据源','真实缓存')}｜缓存 {cached.get('time','')}"
+        return data
+    return []
+
+# Monkey patch 龙虎榜：在 ws4、AKShare之外加入东方财富 datacenter 原生接口
+def _lhb_get_em_datacenter(self, date):
+    records = []
+    try:
+        for item in _em_datacenter_lhb(str(date)):
+            norm = self._normalize_record(item, default_date=date, source="东方财富数据中心RPT_LHB_BOARDDETAIL")
+            if norm:
+                records.append(norm)
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"东方财富数据中心龙虎榜失败：{e}")
+    return records
+
+def _lhb_get_auto_v71(self, date, lookback_days=10):
+    errors = []
+    base_date = pd.to_datetime(date).date()
+    for offset in range(0, lookback_days + 1):
+        current_date = base_date - timedelta(days=offset)
+        date_str = current_date.strftime("%Y-%m-%d")
+        # 先用东财官方数据中心接口，和用户文档一致；再用ws4/AKShare
+        em_data = self.get_longhubang_data_eastmoney_datacenter(date_str)
+        if em_data:
+            return {"success": True, "requested_date": str(date), "used_date": date_str, "source": "东方财富数据中心RPT_LHB_BOARDDETAIL", "data": em_data, "errors": errors}
+        errors.append(f"{date_str} 东方财富数据中心无数据或受限")
+        ws4_data = self.get_longhubang_data(date_str)
+        if ws4_data:
+            return {"success": True, "requested_date": str(date), "used_date": date_str, "source": "ws4 智瞰龙虎接口", "data": ws4_data, "errors": errors}
+        errors.append(f"{date_str} ws4 无数据或受限")
+        ak_data = self.get_longhubang_data_akshare(date_str)
+        if ak_data:
+            return {"success": True, "requested_date": str(date), "used_date": date_str, "source": "AKShare 东方财富龙虎榜", "data": ak_data, "errors": errors}
+        errors.append(f"{date_str} AKShare 无数据或受限")
+        time.sleep(random.uniform(0.35, 0.9))
+    return {"success": False, "requested_date": str(date), "used_date": None, "source": "无可用源", "data": [], "errors": errors}
+
+try:
+    LonghubangDataFetcher.get_longhubang_data_eastmoney_datacenter = _lhb_get_em_datacenter
+    LonghubangDataFetcher.get_longhubang_data_auto = _lhb_get_auto_v71
+except Exception:
+    pass
+
+# Monkey patch 主力资金选择器：东财 f62/f184/f100 为核心，不扫 Tushare 全市场
+def _mfs_fetch_eastmoney_money_rank_v71(self, pz=5000):
+    cache_path = _cache_file("main_force", f"em_money_rank_v71_{datetime.now().strftime('%Y%m%d')}.json")
+    rows, msg = _em_clist(
+        fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184",
+        fid="f62",
+        pz_list=(5000, 3000, 1200, 600, 260),
+        cache_key="main_force_em_clist_v71",
+        cache_ttl=1800
+    )
+    if not rows:
+        cached = _json_load(cache_path, max_age_seconds=8 * 3600)
+        if cached and isinstance(cached.get("records"), list):
+            df = pd.DataFrame(cached["records"])
+            if not df.empty:
+                df["数据源"] = f"东方财富真实资金字段f62/f184｜真实缓存 {cached.get('time','')}"
+                return self._score_candidates(df), f"东方财富实时资金接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
+        return pd.DataFrame(), msg
+    out = []
+    for item in rows:
+        code = self._normalize_code(item.get("f12", ""))
+        name = str(item.get("f14", ""))
+        if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+            continue
+        main_net = safe_float(item.get("f62"), 0)
+        main_pct = safe_float(item.get("f184"), 0)
+        out.append({
+            "股票代码": code,
+            "股票简称": name,
+            "所属行业": item.get("f100") or self._infer_industry(name),
+            "区间涨跌幅": safe_float(item.get("f3"), 0),
+            "最新价": safe_float(item.get("f2"), 0),
+            "主力净流入": main_net,
+            "主力净占比": main_pct,
+            "成交额": safe_float(item.get("f6"), 0),
+            "换手率": safe_float(item.get("f8"), 0),
+            "总市值": _normalize_market_cap_yi(item.get("f20")),
+            "市盈率": item.get("f9", "-"),
+            "市净率": item.get("f23", "-"),
+            "资金热度分": 0.0,
+            "数据源": "东方财富真实资金字段f62/f184/f100",
+        })
+    df = pd.DataFrame(out)
+    if df.empty:
+        return pd.DataFrame(), "东方财富资金字段返回但无有效A股记录"
+    _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": df.to_dict("records")})
+    return self._score_candidates(df), f"{msg}，主力资金字段 f62/f184 成功解析 {len(df)} 只"
+
+def _mfs_get_main_force_v71(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
+    df_em, msg_em = self._fetch_eastmoney_money_rank(pz=5000)
+    if df_em is not None and not df_em.empty:
+        return True, df_em, msg_em
+    return False, pd.DataFrame(), f"真实主力资金暂不可用：{msg_em}。未使用估算数据，未使用内置观察池。"
+
+try:
+    MainForceStockSelector._fetch_eastmoney_money_rank = _mfs_fetch_eastmoney_money_rank_v71
+    MainForceStockSelector.get_main_force_stocks = _mfs_get_main_force_v71
+except Exception:
+    pass
+
+def render_eastmoney_doc_status():
+    """调试模式下展示本次东财专项优化启用状态。"""
+    if DEBUG_MODE:
+        st.caption("东方财富 v7.1 已启用：clist(f12/f14/f2/f9/f23/f62/f184/f100) + fflow/daykline + datacenter龙虎榜 + JSONP清洗 + Host/Referer伪装 + pz降级 + 真实缓存。")
+
 
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
