@@ -1274,102 +1274,440 @@ def get_hot_blocks():
         pass
     return None
 
+
 def _secid_for_symbol(symbol: str) -> str:
+    """东方财富 secid 市场代码：沪市/科创/基金为 1，其余深市为 0。"""
     symbol = str(symbol).strip()
     market = "1" if symbol.startswith(("6", "9", "5", "7")) else "0"
     return f"{market}.{symbol}"
 
 
-def _normalize_quote_dict(q: dict | None) -> dict | None:
+def _is_missing_value(value, numeric_zero_is_missing=True):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        v = value.strip()
+        return v == "" or v in ["-", "--", "None", "nan", "未知", "代码"]
+    try:
+        if numeric_zero_is_missing and float(value) == 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _clean_symbol_name(name, symbol):
+    name = str(name or "").strip()
+    if not name or name in ["-", "--", "未知", "None", "nan"] or name == f"代码{symbol}":
+        return ""
+    return name
+
+
+def _normalize_market_cap_yi(value):
+    """统一总市值为“亿元”。东财/AKShare 多数返回元，少数代码里已经是亿元。"""
+    v = safe_float(value, 0.0)
+    if v <= 0:
+        return 0.0
+    if v > 1_000_000:
+        return v / 100000000
+    return v
+
+
+def _merge_quote(base: dict, new: dict | None) -> dict:
+    """多接口串行补全：保留已有有效字段，只用新源补缺失字段。"""
+    if not isinstance(new, dict):
+        return base
+    if not base:
+        base = {}
+    symbol = str(new.get("symbol") or base.get("symbol") or "").strip()
+    new_name = _clean_symbol_name(new.get("name"), symbol)
+    old_name = _clean_symbol_name(base.get("name"), symbol)
+    if new_name and not old_name:
+        base["name"] = new_name
+    for key in ["price", "pct", "turnover", "market_cap"]:
+        nv = safe_float(new.get(key), 0.0)
+        ov = safe_float(base.get(key), 0.0)
+        if ov <= 0 and nv > 0:
+            base[key] = nv
+    for key in ["pe", "pb"]:
+        nv = new.get(key)
+        ov = base.get(key)
+        if _is_missing_value(ov, numeric_zero_is_missing=False) and not _is_missing_value(nv, numeric_zero_is_missing=False):
+            base[key] = nv
+    src = str(new.get("source") or "").strip()
+    if src:
+        old_src = str(base.get("source") or "").strip()
+        if src not in old_src:
+            base["source"] = f"{old_src} → {src}" if old_src else src
+    if symbol:
+        base["symbol"] = symbol
+    return base
+
+
+def _finalize_quote(q: dict | None, symbol: str) -> dict | None:
     if not isinstance(q, dict):
         return None
-    price = safe_float(q.get("price"), 0)
+    price = safe_float(q.get("price"), 0.0)
     if price <= 0:
         return None
+    name = _clean_symbol_name(q.get("name"), symbol) or f"代码{symbol}"
     return {
-        "name": q.get("name") or q.get("symbol") or "未知",
+        "symbol": symbol,
+        "name": name,
         "price": price,
-        "pct": safe_float(q.get("pct"), 0),
-        "market_cap": safe_float(q.get("market_cap"), 0),
-        "pe": q.get("pe", "-"),
-        "pb": q.get("pb", "-"),
-        "turnover": safe_float(q.get("turnover"), 0),
-        "source": q.get("source", "未知"),
+        "pct": safe_float(q.get("pct"), 0.0),
+        "market_cap": safe_float(q.get("market_cap"), 0.0),
+        "pe": q.get("pe", "-") if not _is_missing_value(q.get("pe"), numeric_zero_is_missing=False) else "-",
+        "pb": q.get("pb", "-") if not _is_missing_value(q.get("pb"), numeric_zero_is_missing=False) else "-",
+        "turnover": safe_float(q.get("turnover"), 0.0),
+        "source": str(q.get("source") or "未知"),
     }
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_stock_quote(symbol):
-    """个股行情保护版：单股轻量接口优先，失败后逐级兜底到日K构造行情。"""
-    symbol = str(symbol).strip()
-    if not re.fullmatch(r"\d{6}", symbol):
+@st.cache_data(ttl=90, show_spinner=False)
+def get_em_spot_snapshot_map() -> dict:
+    """东方财富全市场快照：用于补名称、现价、涨跌幅、换手率、总市值、PE、PB。"""
+    fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+    url = (
+        "https://push2.eastmoney.com/api/qt/clist/get?"
+        "pn=1&pz=6000&po=1&np=1&fid=f3&fltt=2&invt=2"
+        f"&fs={fs}&fields=f12,f14,f2,f3,f8,f9,f20,f23"
+    )
+    res = fetch_json(url, timeout=10, retries=1)
+    rows = (res or {}).get("data", {}).get("diff", []) if isinstance(res, dict) else []
+    out = {}
+    for row in rows or []:
+        code = str(row.get("f12", "")).zfill(6)
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        out[code] = {
+            "symbol": code,
+            "name": row.get("f14", ""),
+            "price": safe_float(row.get("f2"), 0.0),
+            "pct": safe_float(row.get("f3"), 0.0),
+            "turnover": safe_float(row.get("f8"), 0.0),
+            "pe": row.get("f9", "-"),
+            "market_cap": _normalize_market_cap_yi(row.get("f20")),
+            "pb": row.get("f23", "-"),
+            "source": "东方财富全市场快照",
+        }
+    return out
+
+
+def _quote_from_em_single(symbol: str) -> dict | None:
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/get?"
+        f"secid={_secid_for_symbol(symbol)}&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        "&fltt=2&invt=2&fields=f57,f58,f43,f60,f170,f116,f162,f167,f168"
+    )
+    res = fetch_json(url, timeout=7, retries=1)
+    d = res.get("data") if isinstance(res, dict) else None
+    if not d:
         return None
-    try:
-        url = (
-            "https://push2.eastmoney.com/api/qt/stock/get?"
-            f"secid={_secid_for_symbol(symbol)}&ut=fa5fd1943c7b386f172d6893dbfba10b"
-            "&fltt=2&invt=2&fields=f57,f58,f43,f60,f170,f116,f162,f167,f168"
-        )
-        res = fetch_json(url, timeout=5, retries=1)
-        d = res.get("data") if isinstance(res, dict) else None
-        if d:
-            price = normalize_em_price(d.get("f43"), d.get("f60"))
-            if price > 0:
-                return _normalize_quote_dict({
-                    "name": d.get("f58", f"代码{symbol}"),
-                    "price": price,
-                    "pct": safe_float(d.get("f170"), 0),
-                    "market_cap": safe_float(d.get("f116"), 0) / 100000000,
-                    "pe": d.get("f162", "-"),
-                    "pb": d.get("f167", "-"),
-                    "turnover": safe_float(d.get("f168"), 0),
-                    "source": "东方财富单股",
-                })
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"东财单股行情失败 {symbol}: {e}")
+    price = normalize_em_price(d.get("f43"), d.get("f60"))
+    if price <= 0:
+        return None
+    return {
+        "symbol": symbol,
+        "name": d.get("f58", ""),
+        "price": price,
+        "pct": safe_float(d.get("f170"), 0.0),
+        "market_cap": _normalize_market_cap_yi(d.get("f116")),
+        "pe": d.get("f162", "-"),
+        "pb": d.get("f167", "-"),
+        "turnover": safe_float(d.get("f168"), 0.0),
+        "source": "东方财富单股",
+    }
+
+
+def _quote_from_ak_spot(symbol: str) -> dict | None:
     try:
         spot_df = ak.stock_zh_a_spot_em()
-        if spot_df is not None and not spot_df.empty:
-            row = spot_df[spot_df["代码"].astype(str).str.zfill(6) == symbol]
-            if not row.empty:
-                row = row.iloc[0]
-                return _normalize_quote_dict({
-                    "name": row.get("名称", f"代码{symbol}"),
-                    "price": safe_float(row.get("最新价")),
-                    "pct": safe_float(row.get("涨跌幅")),
-                    "market_cap": safe_float(row.get("总市值")) / 100000000,
-                    "pe": row.get("市盈率-动态", "-"),
-                    "pb": row.get("市净率", "-"),
-                    "turnover": safe_float(row.get("换手率")),
-                    "source": "AKShare实时",
-                })
+        if spot_df is None or spot_df.empty:
+            return None
+        row = spot_df[spot_df["代码"].astype(str).str.zfill(6) == symbol]
+        if row.empty:
+            return None
+        r = row.iloc[0]
+        return {
+            "symbol": symbol,
+            "name": r.get("名称", ""),
+            "price": safe_float(r.get("最新价")),
+            "pct": safe_float(r.get("涨跌幅")),
+            "market_cap": _normalize_market_cap_yi(r.get("总市值")),
+            "pe": r.get("市盈率-动态", "-"),
+            "pb": r.get("市净率", "-"),
+            "turnover": safe_float(r.get("换手率")),
+            "source": "AKShare实时行情",
+        }
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"AKShare 实时行情失败 {symbol}: {e}")
+    return None
+
+
+def _quote_from_ak_individual(symbol: str) -> dict | None:
     try:
-        df = get_kline(symbol, days=8)
-        if df is not None and not df.empty:
-            df = df.sort_values("date").reset_index(drop=True)
-            last = df.iloc[-1]
-            prev = df.iloc[-2] if len(df) >= 2 else last
-            price = safe_float(last.get("close"), 0)
-            prev_close = safe_float(prev.get("close"), price)
-            pct = (price - prev_close) / prev_close * 100 if prev_close else 0
-            return _normalize_quote_dict({
-                "name": f"代码{symbol}",
-                "price": price,
-                "pct": pct,
-                "market_cap": 0,
-                "pe": "-",
-                "pb": "-",
-                "turnover": safe_float(last.get("turnover_rate"), 0),
-                "source": "日K构造",
-            })
+        info = ak.stock_individual_info_em(symbol=symbol)
+        if info is None or info.empty:
+            return None
+        data = {}
+        if set(["item", "value"]).issubset(set(info.columns)):
+            data = dict(zip(info["item"].astype(str), info["value"]))
+        elif set(["项目", "数据"]).issubset(set(info.columns)):
+            data = dict(zip(info["项目"].astype(str), info["数据"]))
+        if not data:
+            return None
+        return {
+            "symbol": symbol,
+            "name": data.get("股票简称") or data.get("简称") or data.get("名称") or "",
+            "market_cap": _normalize_market_cap_yi(data.get("总市值") or data.get("总股本")),
+            "source": "AKShare个股资料",
+        }
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"AKShare 个股资料失败 {symbol}: {e}")
+    return None
+
+
+def _quote_from_kline(symbol: str) -> dict | None:
+    try:
+        df = get_kline(symbol, days=10)
+        if df is None or df.empty:
+            return None
+        df = df.sort_values("date").reset_index(drop=True)
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else last
+        price = safe_float(last.get("close"), 0)
+        prev_close = safe_float(prev.get("close"), price)
+        pct = (price - prev_close) / prev_close * 100 if prev_close else 0
+        return {
+            "symbol": symbol,
+            "price": price,
+            "pct": pct,
+            "turnover": safe_float(last.get("turnover_rate"), 0),
+            "source": "日K构造行情",
+        }
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"日K构造行情失败 {symbol}: {e}")
     return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_a_code_name_map() -> dict:
+    """A股代码名称表：轻量字段兜底，只用于补股票名称。"""
+    out = {}
+    try:
+        df = ak.stock_info_a_code_name()
+        if df is not None and not df.empty:
+            code_col = "code" if "code" in df.columns else "代码" if "代码" in df.columns else None
+            name_col = "name" if "name" in df.columns else "名称" if "名称" in df.columns else None
+            if code_col and name_col:
+                for _, r in df.iterrows():
+                    code = str(r.get(code_col, "")).zfill(6)
+                    name = str(r.get(name_col, "")).strip()
+                    if re.fullmatch(r"\d{6}", code) and name:
+                        out[code] = name
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"AKShare A股代码名称表失败: {e}")
+    out.update({
+        "002281": "光迅科技", "688523": "航天环宇", "300750": "宁德时代",
+        "600276": "恒瑞医药", "002371": "北方华创", "300308": "中际旭创",
+        "601138": "工业富联", "600519": "贵州茅台", "000001": "平安银行",
+    })
+    return out
+
+
+def _quote_from_code_name_map(symbol: str) -> dict | None:
+    try:
+        name = get_a_code_name_map().get(symbol, "")
+        if name:
+            return {"symbol": symbol, "name": name, "source": "A股代码名称表"}
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"代码名称表补全失败 {symbol}: {e}")
+    return None
+
+
+def _quote_from_sina(symbol: str) -> dict | None:
+    """新浪轻量行情兜底：主要补名称、现价、涨跌幅；不提供估值。"""
+    try:
+        prefix = "sh" if symbol.startswith(("6", "9", "5", "7")) else "sz"
+        url = f"https://hq.sinajs.cn/list={prefix}{symbol}"
+        headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": random.choice(USER_AGENTS)}
+        res = SESSION.get(url, headers=headers, timeout=(3, 5), verify=False)
+        text = res.text if res is not None else ""
+        m = re.search(r'="(.*)"', text)
+        if not m:
+            return None
+        parts = m.group(1).split(",")
+        if len(parts) < 4 or not parts[0].strip():
+            return None
+        name = parts[0].strip()
+        open_px = safe_float(parts[1], 0)
+        prev_close = safe_float(parts[2], 0)
+        price = safe_float(parts[3], 0)
+        if price <= 0:
+            price = safe_float(parts[4], 0) or open_px
+        pct = (price - prev_close) / prev_close * 100 if price > 0 and prev_close > 0 else 0
+        return {"symbol": symbol, "name": name, "price": price, "pct": pct, "source": "新浪轻量行情"}
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"新浪轻量行情失败 {symbol}: {e}")
+    return None
+
+
+def _quote_from_baostock_basic(symbol: str) -> dict | None:
+    """Baostock 兜底：补名称、PE、PB、换手率、收盘价。"""
+    try:
+        bs.login()
+        bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
+        result = {"symbol": symbol, "source": "Baostock基础/日线"}
+        rs_basic = bs.query_stock_basic(code=bs_code)
+        if getattr(rs_basic, "error_code", "") == "0":
+            rows = []
+            while rs_basic.next():
+                rows.append(rs_basic.get_row_data())
+            if rows:
+                df_basic = pd.DataFrame(rows, columns=rs_basic.fields)
+                if not df_basic.empty:
+                    result["name"] = df_basic.iloc[0].get("code_name", "")
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
+        fields = "date,code,close,preclose,pctChg,turn,peTTM,pbMRQ"
+        rs = bs.query_history_k_data_plus(bs_code, fields, start_date=start_date, end_date=end_date, frequency="d", adjustflag="2")
+        rows = []
+        if getattr(rs, "error_code", "") == "0":
+            while rs.next():
+                rows.append(rs.get_row_data())
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if rows:
+            df = pd.DataFrame(rows, columns=rs.fields).replace("", pd.NA).dropna(subset=["close"])
+            if not df.empty:
+                last = df.iloc[-1]
+                result.update({
+                    "price": safe_float(last.get("close"), 0),
+                    "pct": safe_float(last.get("pctChg"), 0),
+                    "turnover": safe_float(last.get("turn"), 0),
+                    "pe": last.get("peTTM", "-"),
+                    "pb": last.get("pbMRQ", "-"),
+                })
+        return result if any(k in result for k in ["name", "price", "pe", "pb", "turnover"]) else None
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"Baostock 基础补全失败 {symbol}: {e}")
+        try:
+            bs.logout()
+        except Exception:
+            pass
+    return None
+
+
+def _quote_from_tushare_basic(symbol: str) -> dict | None:
+    """Tushare 可选兜底：有 token 时补名称、市值、PE、PB、换手。"""
+    try:
+        if not ts_token:
+            return None
+        pro = ts.pro_api()
+        suffix = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
+        ts_code = f"{symbol}{suffix}"
+        result = {"symbol": symbol, "source": "Tushare基础/估值"}
+        try:
+            basic = pro.stock_basic(ts_code=ts_code, fields="ts_code,name")
+            if basic is not None and not basic.empty:
+                result["name"] = basic.iloc[0].get("name", "")
+        except Exception:
+            pass
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
+        db = pro.daily_basic(ts_code=ts_code, start_date=start, end_date=end, fields="ts_code,trade_date,close,turnover_rate,pe_ttm,pb,total_mv")
+        if db is not None and not db.empty:
+            db = db.sort_values("trade_date")
+            last = db.iloc[-1]
+            result.update({
+                "price": safe_float(last.get("close"), 0),
+                "turnover": safe_float(last.get("turnover_rate"), 0),
+                "pe": last.get("pe_ttm", "-"),
+                "pb": last.get("pb", "-"),
+                "market_cap": safe_float(last.get("total_mv"), 0) / 10000,
+            })
+        return result if any(k in result for k in ["name", "price", "pe", "pb", "market_cap", "turnover"]) else None
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"Tushare 基础补全失败 {symbol}: {e}")
+    return None
+
+
+def _quote_quality(q: dict | None) -> int:
+    if not isinstance(q, dict):
+        return 0
+    score = 0
+    score += 2 if _clean_symbol_name(q.get("name"), q.get("symbol", "")) else 0
+    score += 2 if safe_float(q.get("price"), 0) > 0 else 0
+    score += 1 if not _is_missing_value(q.get("pct"), numeric_zero_is_missing=False) else 0
+    score += 2 if safe_float(q.get("market_cap"), 0) > 0 else 0
+    score += 1 if not _is_missing_value(q.get("pe"), numeric_zero_is_missing=False) else 0
+    score += 1 if not _is_missing_value(q.get("pb"), numeric_zero_is_missing=False) else 0
+    score += 1 if safe_float(q.get("turnover"), 0) > 0 else 0
+    return score
+
+@st.cache_data(ttl=75, show_spinner=False)
+def get_stock_quote(symbol):
+    """
+    个股行情完整性优先版：按接口稳定性与字段完整度串行补全，不再单源成功即返回。
+    优先级：东财单股 → AK实时 → 新浪轻量 → 东财全市场 → AK个股资料/代码名 → Baostock/Tushare → 日K构造。
+    """
+    symbol = str(symbol).strip()
+    if not re.fullmatch(r"\d{6}", symbol):
+        return None
+    merged = {"symbol": symbol}
+
+    # 1. 实时行情层：优先拿价格、涨跌幅、名称、估值。
+    for fetcher in [_quote_from_em_single, _quote_from_ak_spot, _quote_from_sina]:
+        merged = _merge_quote(merged, fetcher(symbol))
+        if _quote_quality(merged) >= 8:
+            break
+
+    # 2. 批量快照层：对自选股扫描特别有用，用来补市值/PE/PB/换手。
+    try:
+        snap = get_em_spot_snapshot_map()
+        if isinstance(snap, dict) and symbol in snap:
+            merged = _merge_quote(merged, snap.get(symbol))
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"东财全市场快照补全失败 {symbol}: {e}")
+
+    # 3. 基础资料层：只要还缺名称/市值/估值/换手，就继续补。
+    for fetcher in [_quote_from_ak_individual, _quote_from_code_name_map, _quote_from_baostock_basic, _quote_from_tushare_basic]:
+        need_more = (
+            _is_missing_value(merged.get("name"), numeric_zero_is_missing=False)
+            or safe_float(merged.get("market_cap"), 0) <= 0
+            or _is_missing_value(merged.get("pe"), numeric_zero_is_missing=False)
+            or _is_missing_value(merged.get("pb"), numeric_zero_is_missing=False)
+            or safe_float(merged.get("turnover"), 0) <= 0
+        )
+        if not need_more and _quote_quality(merged) >= 9:
+            break
+        merged = _merge_quote(merged, fetcher(symbol))
+
+    # 4. K线兜底层：保证技术分析、评分、交易计划不断掉。
+    if safe_float(merged.get("price"), 0) <= 0 or safe_float(merged.get("turnover"), 0) <= 0:
+        merged = _merge_quote(merged, _quote_from_kline(symbol))
+
+    finalized = _finalize_quote(merged, symbol)
+    if finalized:
+        finalized["quality_score"] = _quote_quality(finalized)
+        if finalized.get("market_cap", 0) <= 0 or finalized.get("pe") == "-" or finalized.get("pb") == "-":
+            finalized["fundamental_warning"] = "部分估值字段缺失，已使用多源行情与K线降级分析"
+        else:
+            finalized["fundamental_warning"] = "估值字段较完整"
+    return finalized
+
 
 def _normalize_daily_kline(df: pd.DataFrame | None, days=220) -> pd.DataFrame | None:
     if df is None or df.empty:
@@ -1384,10 +1722,12 @@ def _normalize_daily_kline(df: pd.DataFrame | None, days=220) -> pd.DataFrame | 
     need = ["date", "open", "high", "low", "close", "volume"]
     if not all(c in df.columns for c in need):
         return None
-    df = df[need + (["turnover_rate"] if "turnover_rate" in df.columns else [])].copy()
+    keep = need + (["turnover_rate"] if "turnover_rate" in df.columns else [])
+    df = df[keep].copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    for c in ["open", "high", "low", "close", "volume"] + (["turnover_rate"] if "turnover_rate" in df.columns else []):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in keep:
+        if c != "date":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=need).sort_values("date").reset_index(drop=True)
     if df.empty:
         return None
@@ -1397,8 +1737,8 @@ def _normalize_daily_kline(df: pd.DataFrame | None, days=220) -> pd.DataFrame | 
 
 
 def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
-    """东方财富历史日K：不依赖 AKShare，作为云端核心数据源。"""
-    lmt = max(days + 80, 260)
+    """东方财富历史日K：不依赖 AKShare，作为云端核心日K数据源。"""
+    lmt = max(days + 100, 320)
     url = (
         "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
         f"secid={_secid_for_symbol(symbol)}&ut=fa5fd1943c7b386f172d6893dbfba10b"
@@ -1406,7 +1746,7 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
         "&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
         f"&klt=101&fqt=1&end=20500101&lmt={lmt}"
     )
-    res = fetch_json(url, timeout=8, retries=1)
+    res = fetch_json(url, timeout=10, retries=1)
     data = res.get("data") if isinstance(res, dict) else None
     klines = data.get("klines") if isinstance(data, dict) else None
     if not klines:
@@ -1422,14 +1762,14 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
     return _normalize_daily_kline(pd.DataFrame(rows), days=days)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_kline(symbol, days=220):
-    """日K保护版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
+    """日K完整兜底版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
     end_date = datetime.now()
-    start_date = end_date - pd.Timedelta(days=days + 220)
+    start_date = end_date - pd.Timedelta(days=days + 260)
     start_str = start_date.strftime("%Y%m%d")
     end_str = end_date.strftime("%Y%m%d")
     start_str_bs = start_date.strftime("%Y-%m-%d")
@@ -1467,7 +1807,7 @@ def get_kline(symbol, days=220):
             frequency="d", adjustflag="2"
         )
         data_list = []
-        while (rs.error_code == "0") and rs.next():
+        while (rs.error_code == '0') and rs.next():
             data_list.append(rs.get_row_data())
         try:
             bs.logout()
@@ -1491,9 +1831,11 @@ def get_kline(symbol, days=220):
             market = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
             ts_code = f"{symbol}{market}"
             df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
-            df = _normalize_daily_kline(df, days=days)
             if df is not None and not df.empty:
-                return df
+                df = df.rename(columns={"vol": "volume"})
+                df = _normalize_daily_kline(df, days=days)
+                if df is not None and not df.empty:
+                    return df
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"Tushare 日K失败 {symbol}: {e}")
@@ -1707,7 +2049,7 @@ class MacroAnalysisEngine:
 # ====== 宏观 UI 渲染函数 ======
 def display_macro_analysis_ui():
     st.info("本板块通过国家统计局官方接口抓取最新宏观经济数据，并联动 AI 多智能体进行 A 股大势研判与行业映射。")
-    if st.button("🚀 启动全局宏观深度推演", type="primary", use_container_width=True):
+    if st.button("🚀 启动全局宏观深度推演", type="primary", width="stretch"):
         if not api_key:
             st.error("配置缺失: GROQ_API_KEY")
             return
@@ -1733,7 +2075,7 @@ def display_macro_analysis_ui():
                 snap = res["raw_data"].get("macro_snapshot", {})
                 if snap:
                     df_snap = pd.DataFrame([{"指标": v["label"], "最新值": f"{v['value']}{v['unit']}", "发布期": v["period_label"], "环比/同比变动": f"{v['change']:+.2f}{v['unit']}" if v.get("change") else "-"} for k,v in snap.items()])
-                    st.dataframe(df_snap, use_container_width=True, hide_index=True)
+                    st.dataframe(df_snap, width="stretch", hide_index=True)
             with mt3:
                 st.markdown(res["agents_analysis"]["sector"]["analysis"])
             with mt4:
@@ -3083,7 +3425,7 @@ with tab1:
         col1, col2 = st.columns([1, 1])
         with col1:
             symbol_input = st.text_input("标的代码", placeholder="例：600519")
-            analyze_btn = st.button("启动核心算法", type="primary", use_container_width=True)
+            analyze_btn = st.button("启动核心算法", type="primary", width="stretch")
         if analyze_btn:
             if not api_key:
                 st.error("配置缺失: GROQ_API_KEY")
@@ -3104,6 +3446,7 @@ with tab1:
                     c2.metric("总市值(亿)", f"{quote['market_cap']:.1f}")
                     c3.metric("动态 PE", f"{quote['pe']}")
                     c4.metric("换手率", f"{quote['turnover']:.2f}%")
+                    st.caption(f"行情数据源链路：{quote.get('source', '未知')}｜完整度评分：{quote.get('quality_score', 0)}/10｜{quote.get('fundamental_warning', '')}")
 
                     # 新增：先给出结构化评分和交易计划，再进入详细技术图与 AI 解读
                     assessment = score_stock_analysis(quote, df_kline, mtf)
@@ -3129,7 +3472,7 @@ with tab1:
                         tech = summarize_technicals(df_kline)
                         smc = tech["smc"]
                         fig = build_price_figure(df_kline)
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width="stretch")
 
                         st.markdown("##### 🔬 核心技术指标与阻力测算")
                         t1, t2, t3, t4 = st.columns(4)
@@ -3276,6 +3619,7 @@ with tab1:
 - 现价: {price} (日涨跌幅: {pct}%)
 - 总市值: {quote['market_cap']} 亿 | 动态 PE: {quote['pe']} | 市净率 PB: {quote['pb']}
 - 当日换手率: {quote['turnover']}%
+- 数据源链路: {quote.get('source', '未知')} | 数据完整度: {quote.get('quality_score', 0)}/10 | 估值提示: {quote.get('fundamental_warning', '')}
 - 近期量能状态: {tech['vol_state']}
 【核心日线技术与结构数据】
 - 趋势状态: {tech['trend']} | RSI14: {tech['rsi14']}
@@ -3305,7 +3649,7 @@ with tab1:
    - 15分钟、60分钟、120分钟是否共振
    - 是适合追涨、低吸、等回踩，还是观望
 6. 最后给出一句明确结论：强势看多 / 偏多观察 / 震荡等待 / 谨慎偏空
-要求：语言要专业、直接、机构化，不能空话，尽量像真正交易员盘前计划。
+要求：语言要专业、直接、机构化，不能空话，尽量像真正交易员盘前计划。如果 PE/PB/市值等字段仍有缺失，不要简单说“无法分析”，而要说明数据源限制，并结合已有价格、涨跌幅、换手率、K线结构、多周期结果进行降级研判。
 """
                             st.markdown(call_ai(prompt))
                         else:
@@ -3357,7 +3701,7 @@ with tab3:
                     blocks = get_hot_blocks()
                     if blocks:
                         df_blocks = pd.DataFrame(blocks)
-                        st.dataframe(df_blocks, use_container_width=True, hide_index=True)
+                        st.dataframe(df_blocks, width="stretch", hide_index=True)
                         with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
                             blocks_str = "\n".join([f"{b['板块名称']} (涨幅:{b['涨跌幅']}%, 领涨龙头:{b['领涨股票']})" for b in blocks[:5]])
                             prompt = f"""
