@@ -66,6 +66,30 @@ st.markdown(
 
 api_key = st.secrets.get("GROQ_API_KEY", "")
 
+# ================= Secrets 读取：兼容 Streamlit Cloud / 本地 secrets.toml =================
+def read_secret_value(*names: str, default: str = "") -> str:
+    """从 st.secrets 读取配置，兼容大写 key、小写 key、嵌套表三种写法。"""
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
+    # 兼容 [tushare] token="..." / [tushare] api_key="..."
+    try:
+        tushare_cfg = st.secrets.get("tushare", {})
+        if isinstance(tushare_cfg, dict):
+            for key in ["token", "api_key", "TUSHARE_TOKEN", "TUSHARE_API_KEY"]:
+                value = tushare_cfg.get(key, "")
+                if value:
+                    return str(value).strip()
+    except Exception:
+        pass
+    return default
+
+TUSHARE_SECRET_TOKEN = read_secret_value("TUSHARE_TOKEN", "TUSHARE_API_KEY", "TS_TOKEN", "tushare_token")
+
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
     st.header("⚙️ 终端控制台")
@@ -86,7 +110,17 @@ with st.sidebar:
         ema_mid = st.number_input("中期 EMA", min_value=10, max_value=100, value=60, step=1)
         ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
 
-    ts_token = st.text_input("🔑 Tushare Token", type="password", help="仅作极致容灾兜底")
+    ts_token_input = st.text_input(
+        "🔑 Tushare Token（可选覆盖 secrets）",
+        type="password",
+        value="",
+        help="已支持从 Streamlit secrets 自动读取；这里留空即可。只有临时覆盖时才填写。"
+    )
+    TUSHARE_TOKEN = (ts_token_input.strip() if ts_token_input else TUSHARE_SECRET_TOKEN)
+    if TUSHARE_TOKEN:
+        st.success("Tushare Token : ACTIVE（已从 secrets/侧边栏读取）")
+    else:
+        st.warning("Tushare Token : 未读取到，Tushare 兜底将跳过")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
 
     st.markdown("---")
@@ -98,8 +132,20 @@ with st.sidebar:
     st.success("多周期分析 : ACTIVE (15m / 60m / 120m)")
     st.success("智瞰龙虎榜 : ACTIVE")
 
-if ts_token:
-    ts.set_token(ts_token)
+if TUSHARE_TOKEN:
+    ts.set_token(TUSHARE_TOKEN)
+
+@st.cache_resource(show_spinner=False)
+def get_tushare_pro(token: str):
+    """缓存 Tushare Pro 对象，避免每次 rerun 重建连接。"""
+    if not token:
+        return None
+    ts.set_token(token)
+    return ts.pro_api(token)
+
+
+def get_ts_pro():
+    return get_tushare_pro(TUSHARE_TOKEN) if TUSHARE_TOKEN else None
 
 # ================= 网络底座 =================
 USER_AGENTS = [
@@ -1716,9 +1762,11 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
 def _quote_from_tushare_basic(symbol: str) -> dict | None:
     """Tushare 可选兜底：有 token 时补名称、市值、PE、PB、换手。"""
     try:
-        if not ts_token:
+        if not TUSHARE_TOKEN:
             return None
-        pro = ts.pro_api()
+        pro = get_ts_pro()
+        if pro is None:
+            return None
         suffix = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
         ts_code = f"{symbol}{suffix}"
         result = {"symbol": symbol, "source": "Tushare基础/估值"}
@@ -1894,10 +1942,46 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
             })
     return _normalize_daily_kline(pd.DataFrame(rows), days=days)
 
+def _fetch_tushare_daily_kline(symbol: str, start_str: str, end_str: str, days=220) -> pd.DataFrame | None:
+    """Tushare 日K主数据源：使用 daily + daily_basic 合并换手率，避免东财/AKShare 云端 502 或反爬时断档。"""
+    if not TUSHARE_TOKEN:
+        return None
+    pro = get_ts_pro()
+    if pro is None:
+        return None
+    suffix = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
+    ts_code = f"{symbol}{suffix}"
+
+    daily = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+    if daily is None or daily.empty:
+        return None
+
+    daily = daily.rename(columns={"trade_date": "date", "vol": "volume"}).copy()
+
+    # daily_basic 主要用于补换手率；失败不影响 K 线使用
+    try:
+        basic = pro.daily_basic(
+            ts_code=ts_code,
+            start_date=start_str,
+            end_date=end_str,
+            fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv"
+        )
+        if basic is not None and not basic.empty:
+            basic = basic.rename(columns={"trade_date": "date"})
+            keep_cols = [c for c in ["date", "turnover_rate"] if c in basic.columns]
+            if "date" in keep_cols:
+                daily = daily.merge(basic[keep_cols], on="date", how="left")
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"Tushare daily_basic 补换手率失败 {symbol}: {e}")
+
+    return _normalize_daily_kline(daily, days=days)
+
+
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_kline(symbol, days=220):
-    """日K完整兜底版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
+    """日K完整兜底版：Tushare Token 存在时优先，其后东财/AKShare/Baostock 多层兜底。"""
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
@@ -1907,6 +1991,15 @@ def get_kline(symbol, days=220):
     end_str = end_date.strftime("%Y%m%d")
     start_str_bs = start_date.strftime("%Y-%m-%d")
     end_str_bs = end_date.strftime("%Y-%m-%d")
+    # 0. 如果已配置 Tushare Token，优先使用 Tushare Pro，减少东财/AKShare 在云端 502、限流导致的失败。
+    try:
+        df = _fetch_tushare_daily_kline(symbol, start_str, end_str, days=days)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"Tushare 日K失败 {symbol}: {e}")
+
     try:
         df = _fetch_em_daily_kline(symbol, days=days)
         if df is not None and not df.empty:
@@ -1959,8 +2052,10 @@ def get_kline(symbol, days=220):
         except Exception:
             pass
     try:
-        if ts_token:
-            pro = ts.pro_api()
+        if TUSHARE_TOKEN:
+            pro = get_ts_pro()
+        if pro is None:
+            return None
             market = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
             ts_code = f"{symbol}{market}"
             df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
