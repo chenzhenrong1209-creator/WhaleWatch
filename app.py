@@ -3935,6 +3935,885 @@ def render_module_crash_box(module_name: str, exc: Exception):
     st.info("这个提示说明页面没有假装有数据，也没有用兜底数据冒充真实数据。把这段错误发给我，我可以继续按原文件精准修。")
 
 # ================= 终端功能选项卡 =================
+
+# =============================================================================
+# 数据源重构补丁 v7.0：AKShare/东方财富/新浪/腾讯/BaoStock 主架构
+# 说明：
+# - JQData 降为最低优先级，默认不参与核心行情与热点计算。
+# - Tushare 降为低频精查补充，避免一分钟 50 次、每天 800 次额度被打爆。
+# - AKShare 作为高价值封装入口；东方财富做实时行情/资金/板块主力并加熔断。
+# - 新浪/腾讯作为轻量实时兜底；BaoStock 作为 T+1 历史与基础数据主力军。
+# - 保留 AI 逻辑，不在本补丁里改 Groq token 策略。
+# =============================================================================
+import os
+from pathlib import Path
+from urllib.parse import urlparse
+
+APP_CACHE_DIR = Path(".stock_terminal_cache")
+APP_CACHE_DIR.mkdir(exist_ok=True)
+
+def _cache_file(*parts):
+    clean = [re.sub(r"[^0-9A-Za-z_\-.]+", "_", str(x)) for x in parts if str(x)]
+    return APP_CACHE_DIR.joinpath(*clean)
+
+def _json_save(path, payload):
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+
+def _json_load(path, max_age_seconds=1800):
+    try:
+        path = Path(path)
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if max_age_seconds is not None and age > max_age_seconds:
+            return None
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data["_cache_age_seconds"] = int(age)
+        return data
+    except Exception:
+        return None
+
+def _host_key_from_url(url):
+    try:
+        host = urlparse(url).netloc.lower()
+        if "eastmoney" in host:
+            return "eastmoney"
+        if "sina" in host:
+            return "sina"
+        if "gtimg" in host or "qq.com" in host:
+            return "tencent"
+        return host or "unknown"
+    except Exception:
+        return "unknown"
+
+def _cb_state():
+    if "_source_circuit_breaker_v7" not in st.session_state:
+        st.session_state["_source_circuit_breaker_v7"] = {}
+    return st.session_state["_source_circuit_breaker_v7"]
+
+def _cb_is_open(source):
+    item = _cb_state().get(source, {})
+    return time.time() < float(item.get("until", 0))
+
+def _cb_msg(source):
+    item = _cb_state().get(source, {})
+    until = float(item.get("until", 0))
+    if until > time.time():
+        return f"{source} 熔断中，剩余 {int(until - time.time())} 秒"
+    return ""
+
+def _cb_success(source):
+    _cb_state()[source] = {"fail": 0, "until": 0, "last_error": ""}
+
+def _cb_failure(source, err=""):
+    state = _cb_state()
+    item = state.get(source, {"fail": 0, "until": 0, "last_error": ""})
+    fail = int(item.get("fail", 0)) + 1
+    cooldown = 0
+    if fail >= 10:
+        cooldown = 30 * 60
+    elif fail >= 5:
+        cooldown = 15 * 60
+    elif fail >= 3:
+        cooldown = 5 * 60
+    state[source] = {"fail": fail, "until": time.time() + cooldown if cooldown else 0, "last_error": str(err)[:200]}
+
+def _tushare_quota_state():
+    today = datetime.now().strftime("%Y%m%d")
+    key = "_tushare_quota_v7"
+    if key not in st.session_state or st.session_state[key].get("date") != today:
+        st.session_state[key] = {"date": today, "used": 0, "minute": int(time.time() // 60), "minute_used": 0}
+    stt = st.session_state[key]
+    current_minute = int(time.time() // 60)
+    if stt.get("minute") != current_minute:
+        stt["minute"] = current_minute
+        stt["minute_used"] = 0
+    return stt
+
+def _allow_tushare(cost=1, daily_limit=300, minute_limit=30):
+    stt = _tushare_quota_state()
+    return (int(stt.get("used", 0)) + cost <= daily_limit) and (int(stt.get("minute_used", 0)) + cost <= minute_limit)
+
+def _mark_tushare(cost=1):
+    stt = _tushare_quota_state()
+    stt["used"] = int(stt.get("used", 0)) + cost
+    stt["minute_used"] = int(stt.get("minute_used", 0)) + cost
+
+def fetch_json(url, timeout=6, extra_headers=None, retries=1, silent=True):
+    """带熔断的 JSON 请求。东财 502/断连时自动降频，不让单一接口拖垮页面。"""
+    source = _host_key_from_url(url)
+    if _cb_is_open(source):
+        if DEBUG_MODE and not silent:
+            st.caption(_cb_msg(source))
+        return None
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://quote.eastmoney.com/",
+        "Connection": "close",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    timeout_tuple = timeout if isinstance(timeout, tuple) else (3, timeout)
+    last_err = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            res = SESSION.get(url, headers=headers, timeout=timeout_tuple, verify=False)
+            if res.status_code in (403, 429, 502, 503, 504):
+                last_err = f"HTTP {res.status_code}"
+                time.sleep(min(0.8, 0.18 * (attempt + 1)))
+                continue
+            if res.status_code != 200:
+                last_err = f"HTTP {res.status_code}"
+                continue
+            text_body = res.text.strip()
+            if not text_body:
+                last_err = "empty body"
+                continue
+            if text_body.startswith(("jQuery", "callback", "jsonp")) or ("(" in text_body[:50] and text_body.endswith(")")):
+                m = re.search(r"\((\{.*\}|\[.*\])\)\s*;?$", text_body, re.S)
+                if m:
+                    text_body = m.group(1)
+            data = json.loads(text_body)
+            _cb_success(source)
+            return data
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(min(0.8, 0.18 * (attempt + 1)))
+    _cb_failure(source, last_err)
+    if DEBUG_MODE and not silent:
+        st.caption(f"{source} 请求失败：{last_err} | {url[:100]}")
+    return None
+
+def _fetch_text(url, source=None, encoding=None, timeout=5, headers=None):
+    source = source or _host_key_from_url(url)
+    if _cb_is_open(source):
+        return ""
+    h = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": "https://finance.sina.com.cn/",
+        "Connection": "close",
+    }
+    if headers:
+        h.update(headers)
+    try:
+        r = SESSION.get(url, headers=h, timeout=(3, timeout), verify=False)
+        if r.status_code in (403, 429, 502, 503, 504):
+            _cb_failure(source, f"HTTP {r.status_code}")
+            return ""
+        if r.status_code != 200:
+            _cb_failure(source, f"HTTP {r.status_code}")
+            return ""
+        if encoding:
+            r.encoding = encoding
+        _cb_success(source)
+        return r.text
+    except Exception as e:
+        _cb_failure(source, e)
+        return ""
+
+def _market_prefix(symbol):
+    symbol = str(symbol).zfill(6)
+    return "sh" if symbol.startswith(("6", "9", "5", "7")) else "sz"
+
+def _quote_from_sina(symbol: str) -> dict | None:
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"sina_{symbol}.json")
+    url = f"https://hq.sinajs.cn/list={_market_prefix(symbol)}{symbol}"
+    text = _fetch_text(url, source="sina", encoding="gbk", headers={"Referer": "https://finance.sina.com.cn/"})
+    try:
+        m = re.search(r'="(.*)"', text)
+        if not m:
+            cached = _json_load(cache_path, max_age_seconds=3600)
+            return cached
+        arr = m.group(1).split(",")
+        if len(arr) < 32 or not arr[0]:
+            cached = _json_load(cache_path, max_age_seconds=3600)
+            return cached
+        price = safe_float(arr[3], 0)
+        prev = safe_float(arr[2], 0)
+        pct = (price - prev) / prev * 100 if price > 0 and prev > 0 else 0.0
+        out = {
+            "symbol": symbol,
+            "name": arr[0],
+            "price": price,
+            "pct": pct,
+            "turnover": 0.0,
+            "market_cap": 0.0,
+            "pe": "-",
+            "pb": "-",
+            "source": "新浪实时行情",
+        }
+        if price > 0:
+            _json_save(cache_path, out)
+            return out
+    except Exception:
+        pass
+    return _json_load(cache_path, max_age_seconds=3600)
+
+def _quote_from_tencent(symbol: str) -> dict | None:
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"tencent_{symbol}.json")
+    url = f"https://qt.gtimg.cn/q={_market_prefix(symbol)}{symbol}"
+    text = _fetch_text(url, source="tencent", encoding="gbk", headers={"Referer": "https://gu.qq.com/"})
+    try:
+        m = re.search(r'="(.*)"', text)
+        if not m:
+            return _json_load(cache_path, max_age_seconds=3600)
+        arr = m.group(1).split("~")
+        if len(arr) < 40:
+            return _json_load(cache_path, max_age_seconds=3600)
+        price = safe_float(arr[3], 0)
+        pct = safe_float(arr[32] if len(arr) > 32 else 0, 0)
+        amount_yuan = safe_float(arr[37] if len(arr) > 37 else 0, 0)
+        out = {
+            "symbol": symbol,
+            "name": arr[1] if len(arr) > 1 else "",
+            "price": price,
+            "pct": pct,
+            "turnover": safe_float(arr[38] if len(arr) > 38 else 0, 0),
+            "market_cap": 0.0,
+            "pe": "-",
+            "pb": "-",
+            "source": "腾讯实时行情",
+        }
+        if price > 0:
+            _json_save(cache_path, out)
+            return out
+    except Exception:
+        pass
+    return _json_load(cache_path, max_age_seconds=3600)
+
+def _quote_from_eastmoney_single_v7(symbol: str) -> dict | None:
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"em_{symbol}.json")
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/get?"
+        f"secid={_secid_for_symbol(symbol)}&ut=fa5fd1943c7b386f172d6893dbfba10b"
+        "&fltt=2&invt=2&fields=f57,f58,f43,f60,f170,f116,f162,f167,f168"
+    )
+    res = fetch_json(url, timeout=6, retries=1)
+    d = res.get("data") if isinstance(res, dict) else None
+    if not d:
+        return _json_load(cache_path, max_age_seconds=3600)
+    price = normalize_em_price(d.get("f43"), d.get("f60"))
+    if price <= 0:
+        return _json_load(cache_path, max_age_seconds=3600)
+    out = {
+        "symbol": symbol,
+        "name": d.get("f58", ""),
+        "price": price,
+        "pct": safe_float(d.get("f170"), 0.0),
+        "market_cap": _normalize_market_cap_yi(d.get("f116")),
+        "pe": d.get("f162", "-"),
+        "pb": d.get("f167", "-"),
+        "turnover": safe_float(d.get("f168"), 0.0),
+        "source": "东方财富单股实时",
+    }
+    _json_save(cache_path, out)
+    return out
+
+def _quote_from_baostock_t1(symbol: str) -> dict | None:
+    """BaoStock T+1 基础补全：不当盘中实时价，只补最近交易日历史字段与估值。"""
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"baostock_{symbol}.json")
+    cached = _json_load(cache_path, max_age_seconds=12 * 3600)
+    try:
+        lg = bs.login()
+        if getattr(lg, "error_code", "") != "0":
+            return cached
+        bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
+        result = {"symbol": symbol, "source": "BaoStock T+1基础"}
+        try:
+            basic = bs.query_stock_basic(code=bs_code)
+            rows = []
+            while basic.error_code == "0" and basic.next():
+                rows.append(basic.get_row_data())
+            if rows:
+                bdf = pd.DataFrame(rows, columns=basic.fields)
+                result["name"] = bdf.iloc[0].get("code_name", "")
+        except Exception:
+            pass
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+        fields = "date,code,close,preclose,pctChg,turn,peTTM,pbMRQ"
+        rs = bs.query_history_k_data_plus(bs_code, fields, start_date=start_date, end_date=end_date, frequency="d", adjustflag="2")
+        rows = []
+        while getattr(rs, "error_code", "") == "0" and rs.next():
+            rows.append(rs.get_row_data())
+        if rows:
+            df = pd.DataFrame(rows, columns=rs.fields).replace("", pd.NA).dropna(subset=["close"])
+            if not df.empty:
+                last = df.iloc[-1]
+                result.update({
+                    "price": safe_float(last.get("close"), 0),
+                    "pct": safe_float(last.get("pctChg"), 0),
+                    "turnover": safe_float(last.get("turn"), 0),
+                    "pe": last.get("peTTM", "-"),
+                    "pb": last.get("pbMRQ", "-"),
+                })
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if any(k in result for k in ["name", "price", "pe", "pb", "turnover"]):
+            _json_save(cache_path, result)
+            return result
+    except Exception as e:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if DEBUG_MODE:
+            st.caption(f"BaoStock T+1 补全失败 {symbol}: {e}")
+    return cached
+
+def _quote_from_tushare_lowfreq(symbol: str) -> dict | None:
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"tushare_{symbol}.json")
+    cached = _json_load(cache_path, max_age_seconds=24 * 3600)
+    if not ts_token or not _allow_tushare(cost=2):
+        return cached
+    try:
+        pro = ts.pro_api()
+        suffix = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
+        ts_code = f"{symbol}{suffix}"
+        _mark_tushare(1)
+        result = {"symbol": symbol, "source": "Tushare低频精查"}
+        try:
+            basic = pro.stock_basic(ts_code=ts_code, fields="ts_code,name")
+            if basic is not None and not basic.empty:
+                result["name"] = basic.iloc[0].get("name", "")
+        except Exception:
+            pass
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
+        _mark_tushare(1)
+        db = pro.daily_basic(ts_code=ts_code, start_date=start, end_date=end, fields="ts_code,trade_date,close,turnover_rate,pe_ttm,pb,total_mv")
+        if db is not None and not db.empty:
+            db = db.sort_values("trade_date")
+            last = db.iloc[-1]
+            result.update({
+                "price": safe_float(last.get("close"), 0),
+                "turnover": safe_float(last.get("turnover_rate"), 0),
+                "pe": last.get("pe_ttm", "-"),
+                "pb": last.get("pb", "-"),
+                "market_cap": safe_float(last.get("total_mv"), 0) / 10000,
+            })
+        if any(k in result for k in ["name", "price", "pe", "pb", "market_cap", "turnover"]):
+            _json_save(cache_path, result)
+            return result
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"Tushare低频精查失败 {symbol}: {e}")
+    return cached
+
+@st.cache_data(ttl=45, show_spinner=False)
+def get_stock_quote(symbol):
+    """个股行情 v7：东财实时 → 新浪 → 腾讯 → AKShare个股资料 → BaoStock T+1 → Tushare低频 → JQData最低级。"""
+    symbol = str(symbol).strip().zfill(6)
+    if not re.fullmatch(r"\d{6}", symbol):
+        return None
+    merged = {"symbol": symbol}
+    for fetcher in [_quote_from_eastmoney_single_v7, _quote_from_sina, _quote_from_tencent, _quote_from_ak_individual, _quote_from_baostock_t1, _quote_from_tushare_lowfreq]:
+        try:
+            merged = _merge_quote(merged, fetcher(symbol))
+            # 价格、名称、涨跌幅、估值中至少较完整时，不再继续耗额度
+            if _quote_quality(merged) >= 8:
+                break
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"{getattr(fetcher, '__name__', 'quote_fetcher')} 失败 {symbol}: {e}")
+    # JQData 权限受限，放到最低级，只在前面完全拿不到价格时才尝试。
+    if safe_float(merged.get("price"), 0) <= 0:
+        try:
+            merged = _merge_quote(merged, _quote_from_jqdata(symbol))
+        except Exception:
+            pass
+    finalized = _finalize_quote(merged, symbol)
+    if finalized:
+        finalized["quality_score"] = _quote_quality(finalized)
+        missing = []
+        for field, label in [("market_cap", "总市值"), ("pe", "PE"), ("pb", "PB"), ("turnover", "换手率")]:
+            if field in ["market_cap", "turnover"]:
+                if safe_float(finalized.get(field), 0) <= 0:
+                    missing.append(label)
+            elif finalized.get(field) == "-":
+                missing.append(label)
+        src = finalized.get("source", "")
+        if "BaoStock" in src and not any(x in src for x in ["东方财富", "新浪", "腾讯"]):
+            finalized["fundamental_warning"] = "当前为 BaoStock T+1 数据，不是盘中实时；" + ("缺失：" + "、".join(missing) if missing else "字段较完整")
+        else:
+            finalized["fundamental_warning"] = "真实接口字段缺失：" + "、".join(missing) if missing else "真实接口字段较完整"
+    return finalized
+
+def _fetch_baostock_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
+    symbol = str(symbol).zfill(6)
+    try:
+        lg = bs.login()
+        if getattr(lg, "error_code", "") != "0":
+            return None
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=days + 260)).strftime("%Y-%m-%d")
+        bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,high,low,close,volume,turn",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",
+            adjustflag="2",
+        )
+        rows = []
+        while getattr(rs, "error_code", "") == "0" and rs.next():
+            rows.append(rs.get_row_data())
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if not rows:
+            return None
+        df = pd.DataFrame(rows, columns=rs.fields).rename(columns={"turn": "turnover_rate"})
+        return _normalize_daily_kline(df, days=days)
+    except Exception as e:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if DEBUG_MODE:
+            st.caption(f"BaoStock 日K失败 {symbol}: {e}")
+    return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_kline(symbol, days=220):
+    """日K v7：AKShare东财历史 → 东方财富直连 → BaoStock T+1 → Tushare低频 → JQData最低级。"""
+    symbol = str(symbol).strip().zfill(6)
+    if not re.fullmatch(r"\d{6}", symbol):
+        return None
+    end_date = datetime.now()
+    start_date = end_date - pd.Timedelta(days=days + 260)
+    start_str = start_date.strftime("%Y%m%d")
+    end_str = end_date.strftime("%Y%m%d")
+    cache_path = _cache_file("kline", f"{symbol}_{days}.json")
+
+    # 1. AKShare 封装，价值高，但可能底层断连
+    for adjust in ["qfq", ""]:
+        try:
+            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_str, end_date=end_str, adjust=adjust)
+            df = _normalize_daily_kline(df, days=days)
+            if df is not None and not df.empty:
+                _json_save(cache_path, {"source": f"AKShare东财历史K-{adjust or 'raw'}", "data": df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")})
+                return df
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"AKShare {adjust or 'raw'} 日K失败 {symbol}: {e}")
+
+    # 2. 东方财富直连
+    try:
+        df = _fetch_em_daily_kline(symbol, days=days)
+        if df is not None and not df.empty:
+            _json_save(cache_path, {"source": "东方财富直连历史K", "data": df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")})
+            return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"东财日K失败 {symbol}: {e}")
+
+    # 3. BaoStock T+1 主力军
+    try:
+        df = _fetch_baostock_daily_kline(symbol, days=days)
+        if df is not None and not df.empty:
+            _json_save(cache_path, {"source": "BaoStock T+1历史K", "data": df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")})
+            return df
+    except Exception:
+        pass
+
+    # 4. Tushare 低频补充
+    if ts_token and _allow_tushare(cost=1):
+        try:
+            pro = ts.pro_api()
+            market = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
+            ts_code = f"{symbol}{market}"
+            _mark_tushare(1)
+            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+            if df is not None and not df.empty:
+                df = df.rename(columns={"vol": "volume"})
+                df = _normalize_daily_kline(df, days=days)
+                if df is not None and not df.empty:
+                    _json_save(cache_path, {"source": "Tushare低频历史K", "data": df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")})
+                    return df
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"Tushare 日K失败 {symbol}: {e}")
+
+    # 5. JQData 最低级验证源
+    try:
+        df = _fetch_jq_daily_kline(symbol, days=days)
+        if df is not None and not df.empty:
+            _json_save(cache_path, {"source": "JQData低优先级历史K", "data": df.assign(date=df["date"].dt.strftime("%Y-%m-%d")).to_dict("records")})
+            return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"JQData 日K最低级尝试失败 {symbol}: {e}")
+
+    cached = _json_load(cache_path, max_age_seconds=7 * 24 * 3600)
+    if cached and isinstance(cached.get("data"), list):
+        try:
+            df = pd.DataFrame(cached["data"])
+            return _normalize_daily_kline(df, days=days)
+        except Exception:
+            pass
+    return None
+
+def _em_index_quote(secid, name):
+    cache_path = _cache_file("index", f"em_{secid.replace('.', '_')}.json")
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/get?"
+        f"secid={secid}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f60,f170"
+    )
+    res = fetch_json(url, timeout=5, retries=1)
+    d = res.get("data") if isinstance(res, dict) else None
+    if d:
+        price = normalize_em_price(d.get("f43"), d.get("f60"))
+        pct = safe_float(d.get("f170"), 0)
+        if price > 0:
+            out = {"price": price, "pct": pct, "source": "东方财富指数实时", "status": "真实接口"}
+            _json_save(cache_path, out)
+            return out
+    return _json_load(cache_path, max_age_seconds=1800)
+
+def _sina_index_quote(sina_code, name):
+    cache_path = _cache_file("index", f"sina_{sina_code}.json")
+    url = f"https://hq.sinajs.cn/list={sina_code}"
+    text = _fetch_text(url, source="sina", encoding="gbk", headers={"Referer": "https://finance.sina.com.cn/"})
+    try:
+        m = re.search(r'="(.*)"', text)
+        if m:
+            arr = m.group(1).split(",")
+            if sina_code.startswith("s_") and len(arr) >= 4:
+                price = safe_float(arr[1], 0)
+                pct = safe_float(arr[3], 0)
+            elif len(arr) >= 4:
+                price = safe_float(arr[3], 0)
+                prev = safe_float(arr[2], 0)
+                pct = (price - prev) / prev * 100 if price > 0 and prev > 0 else 0
+            else:
+                price, pct = 0, 0
+            if price > 0:
+                out = {"price": price, "pct": pct, "source": "新浪指数实时", "status": "真实接口"}
+                _json_save(cache_path, out)
+                return out
+    except Exception:
+        pass
+    return _json_load(cache_path, max_age_seconds=1800)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_market_pulse():
+    """宏观看板 v7：AKShare/东财/新浪/腾讯轻量实时，失败展示最近一次真实缓存，不再依赖 JQData。"""
+    targets = {
+        "上证指数": {"em": "1.000001", "sina": "s_sh000001"},
+        "深证成指": {"em": "0.399001", "sina": "s_sz399001"},
+        "创业板指": {"em": "0.399006", "sina": "s_sz399006"},
+        "沪深300": {"em": "1.000300", "sina": "s_sh000300"},
+        "科创50": {"em": "1.000688", "sina": "s_sh000688"},
+    }
+    pulse = {}
+    for name, cfg in targets.items():
+        item = _em_index_quote(cfg["em"], name) or _sina_index_quote(cfg["sina"], name)
+        if item and safe_float(item.get("price"), 0) > 0:
+            pulse[name] = item
+        else:
+            pulse[name] = {"price": 0.0, "pct": 0.0, "source": "无可用实时源", "status": "真实接口暂不可用"}
+    try:
+        cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f170"
+        cnh_res = fetch_json(cnh_url, timeout=4, retries=1)
+        cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
+        if cnh_data:
+            cnh_price = safe_float(cnh_data.get("f43"), 0.0)
+            cnh_pct = safe_float(cnh_data.get("f170"), 0.0)
+            if cnh_price > 0:
+                pulse["USD/CNH(离岸)"] = {"price": cnh_price, "pct": cnh_pct, "source": "东方财富外汇", "status": "真实接口"}
+        if "USD/CNH(离岸)" not in pulse:
+            cached = _json_load(_cache_file("index", "em_133_USDCNH.json"), max_age_seconds=1800)
+            pulse["USD/CNH(离岸)"] = cached or {"price": 0.0, "pct": 0.0, "source": "无可用实时源", "status": "真实接口暂不可用"}
+    except Exception:
+        pulse["USD/CNH(离岸)"] = {"price": 0.0, "pct": 0.0, "source": "无可用实时源", "status": "真实接口暂不可用"}
+    return pulse
+
+def _normalize_block_records(df, source):
+    if df is None or df.empty:
+        return []
+    out = df.copy()
+    rename_candidates = {
+        "名称": "板块名称", "板块": "板块名称", "行业名称": "板块名称", "概念名称": "板块名称",
+        "涨跌幅": "涨跌幅", "涨幅": "涨跌幅", "今日涨跌幅": "涨跌幅",
+        "主力净流入": "主力净流入", "今日主力净流入-净额": "主力净流入", "净额": "主力净流入",
+        "今日超大单净流入-净额": "超大单净流入", "超大单净流入": "超大单净流入",
+        "上涨家数": "上涨家数", "下跌家数": "下跌家数",
+        "领涨股票": "领涨股票", "领涨股": "领涨股票", "领涨名称": "领涨股票",
+    }
+    out = out.rename(columns={k: v for k, v in rename_candidates.items() if k in out.columns})
+    if "板块名称" not in out.columns:
+        return []
+    for c, default in [("涨跌幅", 0.0), ("主力净流入", 0.0), ("超大单净流入", 0.0), ("上涨家数", 0), ("下跌家数", 0), ("领涨股票", "-")]:
+        if c not in out.columns:
+            out[c] = default
+    for c in ["涨跌幅", "主力净流入", "超大单净流入", "上涨家数", "下跌家数"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out = out.dropna(subset=["板块名称"]).copy()
+    if out.empty:
+        return []
+    out["涨幅_rank"] = out["涨跌幅"].rank(pct=True).fillna(0)
+    out["资金_rank"] = out["主力净流入"].rank(pct=True).fillna(0)
+    out["热点分"] = (out["涨幅_rank"] * 55 + out["资金_rank"] * 45).round(2)
+    out["数据源"] = source
+    out = out.sort_values(["热点分", "涨跌幅"], ascending=False).head(20)
+    cols = ["板块名称", "热点分", "涨跌幅", "主力净流入", "上涨家数", "下跌家数", "领涨股票", "数据源"]
+    return out[[c for c in cols if c in out.columns]].to_dict("records")
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_hot_blocks():
+    """资金热点 v7：AKShare板块资金/板块涨幅 → 东方财富板块思想 → 真实缓存；不使用 JQData 全市场计算。"""
+    cache_path = _cache_file("blocks", f"hot_blocks_{datetime.now().strftime('%Y%m%d')}.json")
+    loaders = []
+    # AKShare 不同版本函数名/参数略有差异，逐个尝试。
+    if hasattr(ak, "stock_sector_fund_flow_rank"):
+        loaders.extend([
+            ("AKShare行业资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")),
+            ("AKShare概念资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")),
+        ])
+    loaders.extend([
+        ("AKShare行业板块涨幅", lambda: ak.stock_board_industry_name_em()),
+        ("AKShare概念板块涨幅", lambda: ak.stock_board_concept_name_em()),
+    ])
+    all_records = []
+    for source, loader in loaders:
+        try:
+            recs = _normalize_block_records(loader(), source)
+            if recs:
+                all_records.extend(recs)
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"{source}失败：{e}")
+    if all_records:
+        df = pd.DataFrame(all_records)
+        df = df.sort_values(["热点分", "涨跌幅"], ascending=False).drop_duplicates(subset=["板块名称"]).head(20)
+        data = df.to_dict("records")
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": data})
+        return data
+    cached = _json_load(cache_path, max_age_seconds=6 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        data = cached["records"]
+        for r in data:
+            r["数据源"] = f"{r.get('数据源','真实缓存')}｜缓存 {cached.get('time','')}"
+        return data
+    return []
+
+class MainForceStockSelector:
+    """主力资金选择器 v7：东方财富真实 f62 资金字段为主；Tushare 只做低频少量补充；不启用 JQData，不启用内置假池。"""
+    INDUSTRY_HINTS = {
+        "银行": ["银行"], "证券": ["券商", "证券"], "保险": ["保险"],
+        "半导体": ["半导体", "芯片", "集成电路"], "算力AI": ["AI", "算力", "光模块", "服务器"],
+        "电池": ["新能源", "锂电", "电池"], "消费电子": ["消费电子", "苹果", "机器人"],
+        "食品饮料": ["消费", "白酒"], "创新药": ["医药", "创新药"],
+        "有色金属": ["有色", "铜", "铝"], "黄金": ["黄金", "避险"],
+        "汽车整车": ["汽车", "新能源车"], "国防军工": ["军工", "低空经济", "航天"]
+    }
+
+    def _normalize_code(self, value):
+        text = str(value or "").strip()
+        m = re.search(r"(\d{6})", text)
+        return m.group(1) if m else text.zfill(6)[-6:]
+
+    def _infer_industry(self, name):
+        text = str(name)
+        for ind, kws in self.INDUSTRY_HINTS.items():
+            if any(k in text for k in kws):
+                return ind
+        return "待识别"
+
+    def _standardize_numeric(self, df):
+        df = df.copy()
+        for col in ["区间涨跌幅", "最新价", "主力净流入", "成交额", "换手率", "总市值", "资金热度分"]:
+            if col not in df.columns:
+                df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        if "市盈率" not in df.columns:
+            df["市盈率"] = "-"
+        return df
+
+    def _score_candidates(self, df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = self._standardize_numeric(df)
+        df["股票代码"] = df["股票代码"].apply(self._normalize_code)
+        df = df[df["股票代码"].astype(str).str.match(r"^\d{6}$", na=False)]
+        df = df[~df["股票简称"].astype(str).str.contains("ST|退", na=False)]
+        df = df.drop_duplicates(subset=["股票代码"]).reset_index(drop=True)
+        if df.empty:
+            return df
+        for col in ["成交额", "换手率", "区间涨跌幅", "主力净流入"]:
+            df[f"{col}_rank"] = df[col].rank(pct=True).fillna(0)
+        df["资金热度分"] = (
+            df["成交额_rank"] * 30
+            + df["换手率_rank"] * 20
+            + df["主力净流入_rank"] * 35
+            + df["区间涨跌幅_rank"] * 15
+        ).round(2)
+        return df.drop(columns=[c for c in df.columns if c.endswith("_rank")], errors="ignore")
+
+    def _fetch_eastmoney_money_rank(self, pz=240):
+        cache_path = _cache_file("main_force", f"em_money_rank_{datetime.now().strftime('%Y%m%d')}.json")
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+        fields = "f2,f3,f6,f8,f9,f12,f14,f20,f62,f184"
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get?"
+            f"pn=1&pz={int(pz)}&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f62"
+            f"&fs={fs}&fields={fields}"
+        )
+        res = fetch_json(url, timeout=8, retries=1)
+        diff = res.get("data", {}).get("diff", []) if isinstance(res, dict) else []
+        if not diff:
+            cached = _json_load(cache_path, max_age_seconds=6 * 3600)
+            if cached and isinstance(cached.get("records"), list):
+                df = pd.DataFrame(cached["records"])
+                if not df.empty:
+                    df["数据源"] = "东方财富真实资金字段f62｜真实缓存"
+                    return self._score_candidates(df), f"东方财富实时接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
+            return pd.DataFrame(), "东方财富资金字段f62接口返回空或熔断"
+        rows = []
+        for item in diff:
+            code = self._normalize_code(item.get("f12", ""))
+            name = str(item.get("f14", ""))
+            if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+                continue
+            main_net = safe_float(item.get("f62"), 0)
+            rows.append({
+                "股票代码": code,
+                "股票简称": name,
+                "所属行业": self._infer_industry(name),
+                "区间涨跌幅": safe_float(item.get("f3"), 0),
+                "最新价": safe_float(item.get("f2"), 0),
+                "主力净流入": main_net,
+                "成交额": safe_float(item.get("f6"), 0),
+                "换手率": safe_float(item.get("f8"), 0),
+                "总市值": _normalize_market_cap_yi(item.get("f20")),
+                "市盈率": item.get("f9", "-"),
+                "资金热度分": 0.0,
+                "数据源": "东方财富真实资金字段f62",
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame(), "东方财富资金字段f62无有效股票"
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": df.to_dict("records")})
+        return self._score_candidates(df), f"东方财富真实资金字段f62成功获取 {len(df)} 只"
+
+    def _fetch_tushare_moneyflow_watchlist(self, codes=None, trade_date=None):
+        codes = [str(c).zfill(6) for c in (codes or []) if re.fullmatch(r"\d{6}", str(c).zfill(6))]
+        if not codes:
+            return pd.DataFrame(), "Tushare低频模式未提供自选股，已跳过"
+        if not ts_token or not _allow_tushare(cost=min(len(codes), 20)):
+            return pd.DataFrame(), "Tushare未配置或今日低频额度保护已触发"
+        try:
+            pro = ts.pro_api()
+            rows = []
+            today = datetime.now()
+            dates = [trade_date] if trade_date else [(today - timedelta(days=i)).strftime("%Y%m%d") for i in range(0, 8)]
+            for code in codes[:20]:
+                suffix = ".SH" if code.startswith(("6", "9", "5", "7")) else ".SZ"
+                ts_code = f"{code}{suffix}"
+                mf = None
+                used_date = None
+                for d in dates:
+                    try:
+                        _mark_tushare(1)
+                        tmp = pro.moneyflow(ts_code=ts_code, trade_date=str(d).replace("-", ""))
+                        if tmp is not None and not tmp.empty:
+                            mf = tmp.iloc[0]
+                            used_date = d
+                            break
+                    except Exception:
+                        continue
+                if mf is None:
+                    continue
+                q = get_stock_quote(code) or {}
+                main_net = safe_float(mf.get("net_mf_amount"), 0)
+                if main_net == 0:
+                    main_net = (
+                        safe_float(mf.get("buy_lg_amount"), 0) - safe_float(mf.get("sell_lg_amount"), 0)
+                        + safe_float(mf.get("buy_elg_amount"), 0) - safe_float(mf.get("sell_elg_amount"), 0)
+                    )
+                rows.append({
+                    "股票代码": code,
+                    "股票简称": q.get("name", code),
+                    "所属行业": "自选池",
+                    "区间涨跌幅": q.get("pct", 0),
+                    "最新价": q.get("price", 0),
+                    "主力净流入": main_net,
+                    "成交额": 0,
+                    "换手率": q.get("turnover", 0),
+                    "总市值": q.get("market_cap", 0),
+                    "市盈率": q.get("pe", "-"),
+                    "资金热度分": 0,
+                    "数据源": f"Tushare单股真实moneyflow {used_date}",
+                })
+            df = pd.DataFrame(rows)
+            if df.empty:
+                return pd.DataFrame(), "Tushare自选池moneyflow返回空"
+            return self._score_candidates(df), f"Tushare低频自选池成功 {len(df)} 只"
+        except Exception as exc:
+            return pd.DataFrame(), f"Tushare低频自选池异常：{exc}"
+
+    def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
+        df_em, msg_em = self._fetch_eastmoney_money_rank(pz=260)
+        if df_em is not None and not df_em.empty:
+            return True, df_em, msg_em
+        # 不再全市场打 Tushare，避免 800 次/日额度瞬间耗尽。
+        return False, pd.DataFrame(), f"真实主力资金暂不可用：{msg_em}。未使用估算数据，未使用内置观察池。"
+
+    def filter_stocks(self, df: pd.DataFrame, max_range_change=30.0, min_market_cap=10.0, max_market_cap=5000.0):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        filtered_df = self._standardize_numeric(df)
+        filtered_df = filtered_df[~filtered_df["股票简称"].astype(str).str.contains("ST|退", na=False)]
+        if "区间涨跌幅" in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df["区间涨跌幅"] <= float(max_range_change)]
+        if "总市值" in filtered_df.columns:
+            filtered_df = filtered_df[(filtered_df["总市值"] == 0) | ((filtered_df["总市值"] >= min_market_cap) & (filtered_df["总市值"] <= max_market_cap))]
+        sort_cols = [c for c in ["资金热度分", "主力净流入", "成交额", "换手率"] if c in filtered_df.columns]
+        if sort_cols:
+            filtered_df = filtered_df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        return filtered_df.reset_index(drop=True)
+
+def render_data_source_health_panel():
+    """可在调试模式查看接口状态。"""
+    if not DEBUG_MODE:
+        return
+    st.markdown("##### 🧭 数据源健康状态")
+    cb = _cb_state()
+    rows = []
+    for src in ["eastmoney", "sina", "tencent"]:
+        item = cb.get(src, {})
+        rows.append({
+            "数据源": src,
+            "失败次数": item.get("fail", 0),
+            "状态": "熔断中" if _cb_is_open(src) else "可尝试",
+            "最后错误": item.get("last_error", ""),
+        })
+    tq = _tushare_quota_state()
+    rows.append({"数据源": "tushare", "失败次数": "-", "状态": f"低频保护 已用{tq.get('used',0)}/300", "最后错误": ""})
+    rows.append({"数据源": "jqdata", "失败次数": "-", "状态": "最低优先级/默认不参与核心链路", "最后错误": ""})
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
