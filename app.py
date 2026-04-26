@@ -4808,7 +4808,7 @@ def render_data_source_health_panel():
     tq = _tushare_quota_state()
     rows.append({"数据源": "tushare", "失败次数": "-", "状态": f"低频保护 已用{tq.get('used',0)}/300", "最后错误": ""})
     rows.append({"数据源": "jqdata", "失败次数": "-", "状态": "最低优先级/默认不参与核心链路", "最后错误": ""})
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
