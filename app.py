@@ -20,7 +20,9 @@ from collections import Counter
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
+
 warnings.filterwarnings('ignore')
+
 # ================= 页面与终端 UI 配置 =================
 st.set_page_config(
     page_title="AI 智能投研终端 Pro Max",
@@ -55,61 +57,19 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
     f"<div class='terminal-header'>TERMINAL BUILD v6.4.4-DATA-GUARD | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
+
 api_key = st.secrets.get("GROQ_API_KEY", "")
-
-# ================= 全局表格显示保护 =================
-_ORIGINAL_ST_DATAFRAME = st.dataframe
-
-def _dataframe_for_display(obj):
-    try:
-        if isinstance(obj, pd.DataFrame):
-            out = obj.copy()
-            for col in out.columns:
-                if out[col].dtype == "object":
-                    out[col] = out[col].astype(str)
-            return out
-    except Exception:
-        pass
-    return obj
-
-def safe_dataframe(obj=None, *args, **kwargs):
-    try:
-        return _ORIGINAL_ST_DATAFRAME(_dataframe_for_display(obj), *args, **kwargs)
-    except Exception:
-        try:
-            return _ORIGINAL_ST_DATAFRAME(pd.DataFrame(obj).astype(str), *args, **kwargs)
-        except Exception as e:
-            st.warning(f"表格渲染失败，已隐藏异常表格：{e}")
-
-st.dataframe = safe_dataframe
-
-def fmt_num(value, digits=2, dash="-"):
-    try:
-        v = float(value)
-        if pd.isna(v):
-            return dash
-        return f"{v:.{digits}f}"
-    except Exception:
-        return dash
-
-def fmt_metric_value(value, suffix="", digits=2, dash="-"):
-    try:
-        v = float(value)
-        if pd.isna(v) or v == 0:
-            return dash
-        return f"{v:,.{digits}f}{suffix}"
-    except Exception:
-        return dash
-
 
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
     st.header("⚙️ 终端控制台")
+
     # 新增：手动选择 LLM 模型
     st.markdown("### 🧠 核心推理引擎")
     selected_model = st.selectbox(
@@ -118,14 +78,17 @@ with st.sidebar:
         index=0,
         help="手动指定底层计算模型，精准控制分析逻辑"
     )
+
     # 新增：手动干预技术参数
     st.markdown("### 🎛️ 策略参数微调")
     with st.expander("自定义均线周期 (手动输入)", expanded=False):
         ema_short = st.number_input("短期 EMA", min_value=5, max_value=50, value=20, step=1)
         ema_mid = st.number_input("中期 EMA", min_value=10, max_value=100, value=60, step=1)
         ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
+
     ts_token = st.text_input("🔑 Tushare Token", type="password", help="仅作极致容灾兜底")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
+
     st.markdown("---")
     st.markdown("### 📡 数据连通性")
     st.success("行情引流 : ACTIVE")
@@ -134,8 +97,10 @@ with st.sidebar:
     st.success("技术结构引擎 : ACTIVE")
     st.success("多周期分析 : ACTIVE (15m / 60m / 120m)")
     st.success("智瞰龙虎榜 : ACTIVE")
+
 if ts_token:
     ts.set_token(ts_token)
+
 # ================= 网络底座 =================
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -143,6 +108,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
 ]
+
 @st.cache_resource
 def get_session():
     """全局请求会话：缩短失败等待，避免云端接口卡死。"""
@@ -161,7 +127,9 @@ def get_session():
     session.mount("http://", adapter)
     session.headers.update({"Accept": "application/json,text/plain,*/*", "Connection": "close"})
     return session
+
 SESSION = get_session()
+
 def safe_float(val, default=0.0):
     if val is None or val == "-" or str(val).strip() == "":
         return default
@@ -169,6 +137,26 @@ def safe_float(val, default=0.0):
         return float(val)
     except Exception:
         return default
+
+def fmt_num(value, digits=2, empty="-"):
+    """统一数值展示，避免 370.199938 这类长小数影响手机端阅读。"""
+    try:
+        v = float(value)
+        if pd.isna(v):
+            return empty
+        return f"{v:.{digits}f}"
+    except Exception:
+        return empty
+
+
+def fmt_metric_value(value, digits=2, empty="-"):
+    """PE/PB/估值类字段展示；缺失或异常值显示为 -。"""
+    if value is None:
+        return empty
+    if isinstance(value, str) and value.strip() in ["", "-", "--", "None", "nan", "未知"]:
+        return empty
+    return fmt_num(value, digits=digits, empty=empty)
+
 def fetch_json(url, timeout=6, extra_headers=None, retries=1, silent=True):
     """稳健 JSON 请求：短超时、可重试、永不抛异常，避免页面被单一数据源拖死。"""
     headers = {
@@ -205,6 +193,7 @@ def fetch_json(url, timeout=6, extra_headers=None, retries=1, silent=True):
     if DEBUG_MODE and not silent:
         st.caption(f"请求失败：{last_err} | {url[:100]}")
     return None
+
 # ================= 价格归一化修复 =================
 def normalize_em_price(raw_price, prev_close=None):
     raw_price = safe_float(raw_price)
@@ -225,17 +214,20 @@ def normalize_em_price(raw_price, prev_close=None):
     if raw_price > 1000:
         return raw_price / 10
     return raw_price
+
 # ================= 技术面核心函数 =================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ema_short"] = df["close"].ewm(span=ema_short, adjust=False).mean()
     df["ema_mid"] = df["close"].ewm(span=ema_mid, adjust=False).mean()
     df["ema_long"] = df["close"].ewm(span=ema_long, adjust=False).mean()
+
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"] = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
     df["macd_hist"] = df["macd"] - df["macd_signal"]
+
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -243,19 +235,23 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss.replace(0, pd.NA)
     df["rsi14"] = 100 - (100 / (1 + rs))
+
     prev_close = df["close"].shift(1)
     tr1 = df["high"] - df["low"]
     tr2 = (df["high"] - prev_close).abs()
     tr3 = (df["low"] - prev_close).abs()
     df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["atr14"] = df["tr"].rolling(14).mean()
+
     ma20 = df["close"].rolling(20).mean()
     std20 = df["close"].rolling(20).std()
     df["bb_mid"] = ma20
     df["bb_up"] = ma20 + 2 * std20
     df["bb_low"] = ma20 - 2 * std20
+
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     return df
+
 def detect_swings(df: pd.DataFrame, left=2, right=2):
     swing_highs = []
     swing_lows = []
@@ -269,6 +265,7 @@ def detect_swings(df: pd.DataFrame, left=2, right=2):
         if low == df["low"].iloc[i-left: i+right+1].min():
             swing_lows.append((i, low))
     return swing_highs, swing_lows
+
 def detect_fvg(df: pd.DataFrame, max_zones=5):
     zones = []
     if len(df) < 3:
@@ -295,6 +292,7 @@ def detect_fvg(df: pd.DataFrame, max_zones=5):
                 "date": str(pd.to_datetime(c3["date"]).date())
             })
     return zones[-max_zones:]
+
 def detect_liquidity_sweep(df: pd.DataFrame):
     if len(df) < 25:
         return "样本不足"
@@ -307,6 +305,7 @@ def detect_liquidity_sweep(df: pd.DataFrame):
     if latest["low"] < prev_low and latest["close"] > prev_low:
         return "向下扫流动性后收回"
     return "未见明显扫流动性"
+
 def detect_bos(df: pd.DataFrame):
     swing_highs, swing_lows = detect_swings(df)
     if len(swing_highs) < 2 or len(swing_lows) < 2:
@@ -319,6 +318,7 @@ def detect_bos(df: pd.DataFrame):
     if latest_close < last_swing_low:
         return "向下 BOS (结构破坏)"
     return "结构未突破"
+
 def detect_order_blocks(df: pd.DataFrame, lookback=30, max_zones=4):
     zones = []
     recent = df.tail(lookback).reset_index(drop=True)
@@ -346,6 +346,7 @@ def detect_order_blocks(df: pd.DataFrame, lookback=30, max_zones=4):
                 "bottom": min(curr["open"], curr["close"])
             })
     return zones[-max_zones:]
+
 def detect_equal_high_low(df: pd.DataFrame, tolerance=0.003):
     swing_highs, swing_lows = detect_swings(df)
     eqh = []
@@ -361,6 +362,7 @@ def detect_equal_high_low(df: pd.DataFrame, tolerance=0.003):
         if l1 > 0 and abs(l1 - l2) / l1 <= tolerance:
             eql.append((swing_lows[i], swing_lows[i + 1]))
     return eqh[-3:], eql[-3:]
+
 def detect_mss(df: pd.DataFrame):
     swing_highs, swing_lows = detect_swings(df)
     if len(swing_highs) < 2 or len(swing_lows) < 2 or len(df) < 2:
@@ -374,6 +376,7 @@ def detect_mss(df: pd.DataFrame):
     if prev["close"] > last_low and latest["close"] < last_low:
         return "Bearish MSS (空头结构转换)"
     return "暂无明显 MSS"
+
 def get_premium_discount_zone(df: pd.DataFrame, lookback=60):
     recent = df.tail(lookback)
     if recent.empty:
@@ -393,6 +396,7 @@ def get_premium_discount_zone(df: pd.DataFrame, lookback=60):
         "equilibrium": eq,
         "zone": zone
     }
+
 def build_smc_summary(df: pd.DataFrame):
     obs = detect_order_blocks(df)
     eqh, eql = detect_equal_high_low(df)
@@ -408,6 +412,7 @@ def build_smc_summary(df: pd.DataFrame):
         "mss": mss,
         "pd_zone": pd_zone
     }
+
 def summarize_technicals(df: pd.DataFrame):
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else latest
@@ -467,12 +472,15 @@ def summarize_technicals(df: pd.DataFrame):
         "ema_long": latest["ema_long"],
         "smc": smc
     }
+
 def build_price_figure(df: pd.DataFrame):
     plot_df = df.copy()
     plot_df["date_str"] = plot_df["date"].dt.strftime("%Y-%m-%d")
+
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                         vertical_spacing=0.03, subplot_titles=('K 线与结构', '成交量'),
                         row_width=[0.2, 0.7])
+
     fig.add_trace(go.Candlestick(
         x=plot_df["date_str"],
         open=plot_df["open"],
@@ -481,9 +489,11 @@ def build_price_figure(df: pd.DataFrame):
         close=plot_df["close"],
         name="K线"
     ), row=1, col=1)
+
     fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_short"], mode="lines", name=f"EMA{ema_short}", line=dict(width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_mid"], mode="lines", name=f"EMA{ema_mid}", line=dict(width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df["date_str"], y=plot_df["ema_long"], mode="lines", name=f"EMA{ema_long}", line=dict(width=1)), row=1, col=1)
+
     colors = ['red' if row['open'] - row['close'] >= 0 else 'green' for index, row in plot_df.iterrows()]
     fig.add_trace(go.Bar(
         x=plot_df['date_str'],
@@ -491,6 +501,7 @@ def build_price_figure(df: pd.DataFrame):
         marker_color=colors,
         name='成交量'
     ), row=2, col=1)
+
     for zone in detect_fvg(plot_df, max_zones=4):
         start_idx = zone["start_idx"]
         end_idx = min(len(plot_df) - 1, start_idx + 12)
@@ -505,6 +516,7 @@ def build_price_figure(df: pd.DataFrame):
             fillcolor=fillcolor,
             row=1, col=1
         )
+
     fig.update_layout(
         height=650,
         xaxis_rangeslider_visible=False,
@@ -513,6 +525,7 @@ def build_price_figure(df: pd.DataFrame):
         showlegend=False
     )
     return fig
+
 # ================= 多周期数据与分析（增强稳定版） =================
 def normalize_min_df(df: pd.DataFrame):
     """统一分钟 K 线字段，兼容 AKShare / 东方财富返回格式。"""
@@ -543,10 +556,14 @@ def normalize_min_df(df: pd.DataFrame):
     if df.empty:
         return None
     return df[need_cols]
+
+
 def _get_market_id(symbol: str) -> str:
     """东方财富 secid 市场代码：沪市/科创/基金为 1，其余深市为 0。"""
     symbol = str(symbol).strip()
     return "1" if symbol.startswith(("6", "9", "5", "7")) else "0"
+
+
 def fetch_em_minute_df(symbol: str, klt: int = 15, lmt: int = 600):
     """东方财富分钟 K 线兜底。klt 支持 1/5/15/30/60。"""
     market = _get_market_id(symbol)
@@ -578,6 +595,8 @@ def fetch_em_minute_df(symbol: str, klt: int = 15, lmt: int = 600):
         if DEBUG_MODE:
             st.warning(f"东财 {klt}分钟 K 线失败: {e}")
         return None
+
+
 def get_intraday_by_period(symbol: str, period: str, max_rows=320):
     """多源获取分钟 K 线：AKShare 优先，东方财富兜底。"""
     period = str(period)
@@ -599,8 +618,12 @@ def get_intraday_by_period(symbol: str, period: str, max_rows=320):
         if DEBUG_MODE:
             st.warning(f"东财 {period}分钟数据失败: {e}")
     return None
+
+
 def get_intraday_15m(symbol, max_rows=320):
     return get_intraday_by_period(symbol, "15", max_rows=max_rows)
+
+
 def aggregate_minutes(df: pd.DataFrame, bars_per_group: int, label: str | None = None):
     if df is None or df.empty:
         return None
@@ -626,6 +649,8 @@ def aggregate_minutes(df: pd.DataFrame, bars_per_group: int, label: str | None =
     if not out.empty:
         out["source"] = label or "聚合分钟线"
     return out
+
+
 def _fallback_daily_as_intraday(symbol: str, days: int = 60):
     """分钟数据完全失败时，用日线降级，确保页面不再全是 N/A。"""
     try:
@@ -638,6 +663,8 @@ def _fallback_daily_as_intraday(symbol: str, days: int = 60):
         if DEBUG_MODE:
             st.warning(f"日线降级失败: {e}")
     return None
+
+
 def summarize_intraday_tf(df: pd.DataFrame, label: str):
     """输出尽量可用的多周期结果。即使样本较少，也给轻量判断。"""
     empty_result = {
@@ -650,9 +677,11 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
     }
     if df is None or df.empty:
         return empty_result
+
     df = df.copy().dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     if df.empty:
         return empty_result
+
     source = str(df["source"].iloc[-1]) if "source" in df.columns else "行情源"
     bars = len(df)
     latest = df.iloc[-1]
@@ -662,6 +691,7 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
     latest_time = str(pd.to_datetime(latest["date"]).strftime("%Y-%m-%d %H:%M")) if pd.notna(latest["date"]) else "-"
     first_close = float(df.iloc[0]["close"])
     change_pct = round((close - first_close) / first_close * 100, 2) if first_close else 0.0
+
     if bars < 12:
         recent_close = df["close"].tail(min(5, bars))
         slope = recent_close.iloc[-1] - recent_close.iloc[0] if len(recent_close) >= 2 else 0
@@ -684,6 +714,7 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
             "target_1": target_1, "target_2": target_2,
             "advice": "样本较少，仅作为轻量参考"
         }
+
     df = add_indicators(df)
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else latest
@@ -692,6 +723,7 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
     ema_m = latest.get("ema_mid", pd.NA)
     rsi = latest.get("rsi14", pd.NA)
     atr = latest.get("atr14", pd.NA)
+
     trend = "震荡"
     if pd.notna(ema_s) and pd.notna(ema_m) and close > ema_s > ema_m:
         trend = "多头"
@@ -701,16 +733,19 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
         trend = "偏强"
     elif pd.notna(ema_s) and close < ema_s:
         trend = "偏弱"
+
     macd_state = "中性"
     if pd.notna(latest.get("macd")) and pd.notna(latest.get("macd_signal")):
         if latest["macd"] > latest["macd_signal"] and latest["macd_hist"] >= prev["macd_hist"]:
             macd_state = "偏多"
         elif latest["macd"] < latest["macd_signal"] and latest["macd_hist"] <= prev["macd_hist"]:
             macd_state = "偏空"
+
     support = float(df.tail(min(20, len(df)))["low"].min())
     pressure = float(df.tail(min(20, len(df)))["high"].max())
     avg_vol = df["volume"].tail(min(20, len(df))).mean()
     vol_ratio = round(float(latest["volume"]) / avg_vol, 2) if avg_vol and avg_vol > 0 else None
+
     score = 0
     score += 2 if trend == "多头" else 1 if trend == "偏强" else -2 if trend == "空头" else -1 if trend == "偏弱" else 0
     score += 1 if macd_state == "偏多" else -1 if macd_state == "偏空" else 0
@@ -718,6 +753,7 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
         score += 1 if 55 <= rsi <= 70 else -1 if rsi < 45 or rsi > 82 else 0
     if vol_ratio is not None:
         score += 1 if vol_ratio >= 1.3 and change_pct >= 0 else -1 if vol_ratio >= 1.3 and change_pct < 0 else 0
+
     bias = "多头占优" if score >= 3 else "偏多观察" if score >= 1 else "空头占优" if score <= -3 else "偏空谨慎" if score <= -1 else "震荡分歧"
     atr_val = float(atr) if pd.notna(atr) and atr > 0 else max((pressure - support) / 4, close * 0.015)
     entry_low = max(support, close - atr_val * 0.8)
@@ -726,6 +762,7 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
     target_1 = pressure
     target_2 = close + max(close - stop_loss, atr_val) * 1.8
     advice = "顺势持有/回踩低吸" if score >= 3 else "偏多但等回踩确认" if score >= 1 else "谨慎，等重新站上均线" if score <= -1 else "震荡，等方向选择"
+
     return {
         "label": label, "status": "有效", "source": source, "bars": len(df),
         "latest_time": latest_time, "trend": trend, "rsi": float(rsi) if pd.notna(rsi) else None,
@@ -734,11 +771,14 @@ def summarize_intraday_tf(df: pd.DataFrame, label: str):
         "entry_zone": f"{entry_low:.2f} - {entry_high:.2f}", "stop_loss": round(stop_loss, 2),
         "target_1": round(target_1, 2), "target_2": round(target_2, 2), "advice": advice
     }
+
+
 def get_multi_timeframe_analysis(symbol: str):
     df15 = get_intraday_15m(symbol)
     df60_direct = get_intraday_by_period(symbol, "60", max_rows=260)
     df60 = df60_direct if df60_direct is not None and not df60_direct.empty else aggregate_minutes(df15, 4, label="15m聚合60m")
     df120 = aggregate_minutes(df60, 2, label="60m聚合120m") if df60 is not None else aggregate_minutes(df15, 8, label="15m聚合120m")
+
     fallback_daily = None
     if df15 is None and df60 is None and df120 is None:
         fallback_daily = _fallback_daily_as_intraday(symbol)
@@ -751,9 +791,11 @@ def get_multi_timeframe_analysis(symbol: str):
     if df120 is None and fallback_daily is not None:
         df120 = fallback_daily.tail(60).copy()
         df120["source"] = "日线降级-长周期参考"
+
     tf15 = summarize_intraday_tf(df15, "15分钟")
     tf60 = summarize_intraday_tf(df60, "60分钟")
     tf120 = summarize_intraday_tf(df120, "120分钟")
+
     score = tf15.get("score", 0) + tf60.get("score", 0) * 1.2 + tf120.get("score", 0) * 1.5
     if score >= 6:
         final_view = "多周期强共振偏多"
@@ -770,12 +812,14 @@ def get_multi_timeframe_analysis(symbol: str):
     else:
         final_view = "多周期分歧，偏观察"
         action = "等 15m 和 60m 同向后再行动"
+
     support_candidates = [x.get("support") for x in [tf15, tf60, tf120] if x.get("support")]
     pressure_candidates = [x.get("pressure") for x in [tf15, tf60, tf120] if x.get("pressure")]
     close_candidates = [x.get("close") for x in [tf15, tf60, tf120] if x.get("close")]
     key_support = round(min(support_candidates), 2) if support_candidates else None
     key_pressure = round(max(pressure_candidates), 2) if pressure_candidates else None
     current_close = round(close_candidates[0], 2) if close_candidates else None
+
     return {
         "15m": tf15,
         "60m": tf60,
@@ -788,6 +832,8 @@ def get_multi_timeframe_analysis(symbol: str):
         "current_close": current_close,
         "data_quality": "分钟线" if fallback_daily is None else "分钟线失败，已使用日线降级参考"
     }
+
+
 def render_tf_card(tf: dict, title: str):
     """移动端友好的多周期卡片。"""
     st.markdown(f"**{title}**")
@@ -810,12 +856,16 @@ def render_tf_card(tf: dict, title: str):
     if tf.get("target_1") is not None:
         st.caption(f"目标1: {tf['target_1']:.2f}")
     st.info(tf.get("advice", "等待确认"))
+
+
 # ================= 个股评分、交易计划、自选池扫描增强 =================
 def _clamp(value, low=0, high=20):
     try:
         return max(low, min(high, float(value)))
     except Exception:
         return low
+
+
 def _score_label(total_score: float) -> str:
     if total_score >= 82:
         return "强势观察"
@@ -826,6 +876,8 @@ def _score_label(total_score: float) -> str:
     if total_score >= 45:
         return "谨慎等待"
     return "暂不参与"
+
+
 def _action_suggestion(total_score: float, mtf_view: str, rr: float) -> str:
     if total_score >= 82 and rr >= 1.5:
         return "强势票，优先等回踩低吸或放量突破确认"
@@ -834,6 +886,8 @@ def _action_suggestion(total_score: float, mtf_view: str, rr: float) -> str:
     if "偏空" in str(mtf_view) or total_score < 45:
         return "先回避，等重新站回关键均线或多周期转强"
     return "观察为主，等待15分钟与60分钟同向"
+
+
 def build_trade_plan_from_inputs(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) -> dict:
     price = safe_float(quote.get("price"), mtf.get("current_close") or 0)
     key_support = mtf.get("key_support")
@@ -855,6 +909,7 @@ def build_trade_plan_from_inputs(quote: dict, df_kline: pd.DataFrame | None, mtf
     if not key_pressure:
         key_pressure = recent_high or price * 1.08
     atr = atr if atr and atr > 0 else max(price * 0.025, (key_pressure - key_support) / 6 if key_pressure > key_support else price * 0.025)
+
     aggressive_entry = round(price, 2)
     steady_low = round(max(key_support, price - atr * 1.2), 2)
     steady_high = round(max(key_support, price - atr * 0.35), 2)
@@ -864,9 +919,11 @@ def build_trade_plan_from_inputs(quote: dict, df_kline: pd.DataFrame | None, mtf
     risk = max(price - stop_loss, price * 0.01)
     target_2 = round(price + risk * 2.0, 2)
     rr = round(max(target_1 - price, 0) / risk, 2) if risk > 0 else 0
+
     invalidation = "跌破风控位且无法快速收回；或放量跌破60分钟支撑"
     if mtf.get("final_view") and "偏空" in mtf.get("final_view"):
         invalidation = "多周期仍偏空，未重新站上15/60分钟关键压力前不主动进攻"
+
     return {
         "current_price": round(price, 2),
         "aggressive_entry": aggressive_entry,
@@ -879,16 +936,20 @@ def build_trade_plan_from_inputs(quote: dict, df_kline: pd.DataFrame | None, mtf
         "invalidation": invalidation,
         "position_advice": "观察仓10%-20%" if rr < 1.2 else "试探仓20%-30%" if rr < 2 else "趋势确认后可提高至30%-40%",
     }
+
+
 def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) -> dict:
     turnover = safe_float(quote.get("turnover"), 0)
     pct = safe_float(quote.get("pct"), 0)
     pe = safe_float(quote.get("pe"), 0)
     market_cap = safe_float(quote.get("market_cap"), 0)
+
     tech_score = 8
     volume_score = 8
     position_score = 8
     risk_score = 10
     tech_summary = {}
+
     if df_kline is not None and not df_kline.empty and len(df_kline) >= 15:
         try:
             tmp = add_indicators(df_kline.copy())
@@ -897,6 +958,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
             high_60 = float(tmp.tail(min(60, len(tmp)))["high"].max())
             low_60 = float(tmp.tail(min(60, len(tmp)))["low"].min())
             loc = (float(latest["close"]) - low_60) / (high_60 - low_60) if high_60 > low_60 else 0.5
+
             tech_score = 10
             if tech.get("trend") == "多头趋势":
                 tech_score += 5
@@ -920,6 +982,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
                 tech_score += 1
             if "向上扫流动性后回落" in str(tech.get("sweep_state")):
                 tech_score -= 1
+
             volume_score = 8
             if tech.get("vol_state") == "显著放量" and pct >= 0:
                 volume_score += 6
@@ -935,6 +998,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
                 volume_score += 2
             elif pct <= -4:
                 volume_score -= 3
+
             if loc <= 0.25:
                 position_score = 15
             elif loc <= 0.55:
@@ -947,6 +1011,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
                 position_score += 2
             if float(latest["close"]) < float(latest.get("ema_mid", latest["close"])):
                 position_score -= 3
+
             risk_score = 12
             if pe and pe > 120:
                 risk_score -= 4
@@ -962,6 +1027,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
         except Exception as e:
             if DEBUG_MODE:
                 st.warning(f"评分计算降级: {e}")
+
     mtf_score_raw = safe_float(mtf.get("score"), 0)
     mtf_score = 10 + mtf_score_raw * 1.6
     if "强共振偏多" in str(mtf.get("final_view")):
@@ -972,6 +1038,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
         mtf_score -= 4
     elif "分歧" in str(mtf.get("final_view")):
         mtf_score -= 1
+
     detail_scores = {
         "趋势结构": round(_clamp(tech_score), 1),
         "多周期共振": round(_clamp(mtf_score), 1),
@@ -983,6 +1050,7 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
     plan = build_trade_plan_from_inputs(quote, df_kline, mtf)
     label = _score_label(total)
     action = _action_suggestion(total, mtf.get("final_view", ""), safe_float(plan.get("rr"), 0))
+
     return {
         "total_score": total,
         "label": label,
@@ -991,6 +1059,8 @@ def score_stock_analysis(quote: dict, df_kline: pd.DataFrame | None, mtf: dict) 
         "plan": plan,
         "tech_summary": tech_summary,
     }
+
+
 def render_score_panel(assessment: dict):
     st.markdown("##### 🧮 个股评分系统（新增）")
     total = assessment.get("total_score", 0)
@@ -1004,6 +1074,8 @@ def render_score_panel(assessment: dict):
         {"维度": k, "得分": v, "满分": 20} for k, v in assessment.get("detail_scores", {}).items()
     ])
     st.dataframe(score_df, width="stretch", hide_index=True)
+
+
 def render_trade_plan_card(assessment: dict):
     st.markdown("##### 🧾 买卖计划卡片（新增）")
     plan = assessment.get("plan", {})
@@ -1018,6 +1090,8 @@ def render_trade_plan_card(assessment: dict):
     q3.metric("目标一", f"{plan.get('target_1', 0):.2f}")
     q4.metric("目标二", f"{plan.get('target_2', 0):.2f}")
     st.caption(f"仓位建议：{plan.get('position_advice', '-')}｜失效条件：{plan.get('invalidation', '-')}")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def analyze_stock_for_watchlist(symbol: str) -> dict:
     symbol = str(symbol).strip()
@@ -1043,6 +1117,8 @@ def analyze_stock_for_watchlist(symbol: str) -> dict:
         "目标一": plan.get("target_1", "-"),
         "操作": assessment.get("action", "等待确认"),
     }
+
+
 def render_watchlist_scanner():
     st.markdown("#### 📋 自选股池批量扫描（新增）")
     st.caption("一次扫描多只股票，自动给出评分、状态、低吸区、突破价、止损位和操作建议。建议一次 5-10 只，云端更稳定。")
@@ -1079,6 +1155,7 @@ def render_watchlist_scanner():
         if not df_scan.empty:
             top = df_scan.iloc[0]
             st.info(f"当前评分最高：**{top.get('名称')}({top.get('代码')})**，评分 **{top.get('评分')}**，操作建议：{top.get('操作')}")
+
 # ================= 核心数据流 =================
 @st.cache_data(ttl=60)
 def get_global_news():
@@ -1091,14 +1168,19 @@ def get_global_news():
             if len(text) > 15:
                 news.append(f"[{item.get('create_time', '')}] {text}")
     return news
+
 def _pulse_placeholder(name, source="待同步"):
     return {"price": 0.0, "pct": 0.0, "source": source, "status": "数据源暂不可用"}
+
+
 def _save_json_cache(path, payload):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
         pass
+
+
 def _load_json_cache(path, max_age_seconds=1800):
     try:
         import os
@@ -1111,6 +1193,8 @@ def _load_json_cache(path, max_age_seconds=1800):
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_market_pulse():
     """宏观看板保护版：批量接口优先，失败用缓存/占位兜底，永远返回可渲染结构。"""
@@ -1189,61 +1273,108 @@ def get_market_pulse():
     if real_data:
         _save_json_cache(cache_path, real_data)
     return pulse
-def _static_hot_block_pool():
-    return [
-        {"板块名称": "算力AI", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "中际旭创", "代表代码": "300308", "数据源": "内置观察池"},
-        {"板块名称": "半导体", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "北方华创", "代表代码": "002371", "数据源": "内置观察池"},
-        {"板块名称": "新能源车", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "宁德时代", "代表代码": "300750", "数据源": "内置观察池"},
-        {"板块名称": "通信设备", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "光迅科技", "代表代码": "002281", "数据源": "内置观察池"},
-        {"板块名称": "机器人", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "机器人", "代表代码": "300024", "数据源": "内置观察池"},
-        {"板块名称": "医药创新", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "恒瑞医药", "代表代码": "600276", "数据源": "内置观察池"},
-        {"板块名称": "大金融", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "东方财富", "代表代码": "300059", "数据源": "内置观察池"},
-        {"板块名称": "消费电子", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "立讯精密", "代表代码": "002475", "数据源": "内置观察池"},
-    ]
-
-def _enrich_static_blocks(blocks):
-    out = []
-    for item in blocks:
-        x = dict(item)
-        code = str(x.get("代表代码", "")).strip()
-        if re.fullmatch(r"\d{6}", code):
-            q = get_stock_quote(code)
-            if q:
-                x["领涨股票"] = q.get("name") or x.get("领涨股票")
-                x["涨跌幅"] = round(safe_float(q.get("pct"), 0), 2)
-                x["数据源"] = f"{x.get('数据源', '内置观察池')}+单股行情"
-        out.append(x)
-    return sorted(out, key=lambda r: safe_float(r.get("涨跌幅"), 0), reverse=True)
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_hot_blocks():
+    """资金热点板块：多源串行 + 缓存 + 内置观察池兜底。
+
+    设计原则：板块接口在云端很容易被限流，不能因为实时源失败就让页面失效。
+    返回字段始终保持：板块名称、涨跌幅、上涨家数、下跌家数、领涨股票、数据源。
     """
-    资金热点稳定版：
-    弃用默认重度依赖东财 clist / AKShare 板块分页的路径；
-    优先显示“内置观察池 + 单股轻量行情”，接口可用时再增强。
-    """
-    blocks = _enrich_static_blocks(_static_hot_block_pool())
-    for func, source_name in [
-        (getattr(ak, "stock_board_industry_name_em", None), "AKShare行业板块"),
-        (getattr(ak, "stock_board_concept_name_em", None), "AKShare概念板块"),
-    ]:
-        if func is None:
-            continue
+    cache_path = "/tmp/hot_blocks_cache.json"
+
+    def _normalize_blocks_df(df, source):
+        if df is None or df.empty:
+            return None
+        out = df.copy()
+        rename_candidates = {
+            "名称": "板块名称", "板块": "板块名称", "行业名称": "板块名称", "概念名称": "板块名称",
+            "涨跌幅": "涨跌幅", "涨幅": "涨跌幅",
+            "上涨家数": "上涨家数", "下跌家数": "下跌家数",
+            "领涨股票": "领涨股票", "领涨股": "领涨股票", "领涨名称": "领涨股票",
+        }
+        out = out.rename(columns={k: v for k, v in rename_candidates.items() if k in out.columns})
+        if "板块名称" not in out.columns:
+            return None
+        if "涨跌幅" not in out.columns:
+            out["涨跌幅"] = 0.0
+        if "上涨家数" not in out.columns:
+            out["上涨家数"] = 0
+        if "下跌家数" not in out.columns:
+            out["下跌家数"] = 0
+        if "领涨股票" not in out.columns:
+            out["领涨股票"] = "-"
+        out["涨跌幅"] = pd.to_numeric(out["涨跌幅"], errors="coerce").fillna(0)
+        out = out.dropna(subset=["板块名称"]).sort_values("涨跌幅", ascending=False).head(10)
+        out["数据源"] = source
+        return out[["板块名称", "涨跌幅", "上涨家数", "下跌家数", "领涨股票", "数据源"]].to_dict("records")
+
+    sources = []
+    # 1. AKShare 封装的东财行业板块
+    sources.append(("AKShare行业板块", lambda: ak.stock_board_industry_name_em()))
+    # 2. AKShare 封装的东财概念板块
+    sources.append(("AKShare概念板块", lambda: ak.stock_board_concept_name_em()))
+
+    # 3. 东方财富原生行业/概念板块接口，绕开部分 AKShare 内部超时
+    def _em_board(fs, source):
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get?"
+            "pn=1&pz=80&po=1&np=1&fid=f3&fltt=2&invt=2"
+            f"&fs={fs}&fields=f12,f14,f3,f104,f105,f128"
+        )
+        res = fetch_json(url, timeout=6, retries=1)
+        rows = (res or {}).get("data", {}).get("diff", []) if isinstance(res, dict) else []
+        if not rows:
+            return None
+        return pd.DataFrame([
+            {
+                "板块名称": r.get("f14", "-"),
+                "涨跌幅": safe_float(r.get("f3"), 0),
+                "上涨家数": int(safe_float(r.get("f104"), 0)),
+                "下跌家数": int(safe_float(r.get("f105"), 0)),
+                "领涨股票": r.get("f128", "-"),
+            }
+            for r in rows
+        ])
+
+    sources.append(("东方财富行业板块", lambda: _em_board("m:90+t:2+f:!50", "东方财富行业板块")))
+    sources.append(("东方财富概念板块", lambda: _em_board("m:90+t:3+f:!50", "东方财富概念板块")))
+
+    for source_name, loader in sources:
         try:
-            df = func()
-            if df is not None and not df.empty and "板块名称" in df.columns and "涨跌幅" in df.columns:
-                keep_cols = [c for c in ["板块名称", "涨跌幅", "上涨家数", "下跌家数", "领涨股票"] if c in df.columns]
-                top = df.sort_values(by="涨跌幅", ascending=False).head(10)[keep_cols].copy()
-                top["数据源"] = source_name
-                return top.to_dict("records")
-        except Exception:
-            continue
-    return blocks
+            data = _normalize_blocks_df(loader(), source_name)
+            if data:
+                _save_json_cache(cache_path, {"records": data, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                return data
+        except Exception as e:
+            if DEBUG_MODE:
+                st.caption(f"{source_name} 获取失败：{e}")
+
+    cached = _load_json_cache(cache_path, max_age_seconds=24 * 3600)
+    if cached and isinstance(cached.get("records"), list) and cached["records"]:
+        rows = cached["records"]
+        for r in rows:
+            r["数据源"] = "缓存回显"
+        return rows
+
+    # 终极兜底：不给用户空页面，至少给出重点观察方向
+    fallback = [
+        {"板块名称": "算力AI", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "中际旭创/工业富联", "数据源": "内置观察池"},
+        {"板块名称": "半导体", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "北方华创/中芯国际", "数据源": "内置观察池"},
+        {"板块名称": "机器人", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "拓普集团/鸣志电器", "数据源": "内置观察池"},
+        {"板块名称": "低空经济", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "万丰奥威/中信海直", "数据源": "内置观察池"},
+        {"板块名称": "创新药", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "恒瑞医药/百济神州", "数据源": "内置观察池"},
+    ]
+    return fallback
+
+
 def _secid_for_symbol(symbol: str) -> str:
     """东方财富 secid 市场代码：沪市/科创/基金为 1，其余深市为 0。"""
     symbol = str(symbol).strip()
     market = "1" if symbol.startswith(("6", "9", "5", "7")) else "0"
     return f"{market}.{symbol}"
+
+
 def _is_missing_value(value, numeric_zero_is_missing=True):
     if value is None:
         return True
@@ -1256,11 +1387,15 @@ def _is_missing_value(value, numeric_zero_is_missing=True):
     except Exception:
         pass
     return False
+
+
 def _clean_symbol_name(name, symbol):
     name = str(name or "").strip()
     if not name or name in ["-", "--", "未知", "None", "nan"] or name == f"代码{symbol}":
         return ""
     return name
+
+
 def _normalize_market_cap_yi(value):
     """统一总市值为“亿元”。东财/AKShare 多数返回元，少数代码里已经是亿元。"""
     v = safe_float(value, 0.0)
@@ -1269,6 +1404,8 @@ def _normalize_market_cap_yi(value):
     if v > 1_000_000:
         return v / 100000000
     return v
+
+
 def _merge_quote(base: dict, new: dict | None) -> dict:
     """多接口串行补全：保留已有有效字段，只用新源补缺失字段。"""
     if not isinstance(new, dict):
@@ -1298,6 +1435,8 @@ def _merge_quote(base: dict, new: dict | None) -> dict:
     if symbol:
         base["symbol"] = symbol
     return base
+
+
 def _finalize_quote(q: dict | None, symbol: str) -> dict | None:
     if not isinstance(q, dict):
         return None
@@ -1316,6 +1455,8 @@ def _finalize_quote(q: dict | None, symbol: str) -> dict | None:
         "turnover": safe_float(q.get("turnover"), 0.0),
         "source": str(q.get("source") or "未知"),
     }
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def get_em_spot_snapshot_map() -> dict:
     """东方财富全市场快照：用于补名称、现价、涨跌幅、换手率、总市值、PE、PB。"""
@@ -1344,6 +1485,8 @@ def get_em_spot_snapshot_map() -> dict:
             "source": "东方财富全市场快照",
         }
     return out
+
+
 def _quote_from_em_single(symbol: str) -> dict | None:
     url = (
         "https://push2.eastmoney.com/api/qt/stock/get?"
@@ -1368,6 +1511,8 @@ def _quote_from_em_single(symbol: str) -> dict | None:
         "turnover": safe_float(d.get("f168"), 0.0),
         "source": "东方财富单股",
     }
+
+
 def _quote_from_ak_spot(symbol: str) -> dict | None:
     try:
         spot_df = ak.stock_zh_a_spot_em()
@@ -1392,6 +1537,8 @@ def _quote_from_ak_spot(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"AKShare 实时行情失败 {symbol}: {e}")
     return None
+
+
 def _quote_from_ak_individual(symbol: str) -> dict | None:
     try:
         info = ak.stock_individual_info_em(symbol=symbol)
@@ -1414,6 +1561,8 @@ def _quote_from_ak_individual(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"AKShare 个股资料失败 {symbol}: {e}")
     return None
+
+
 def _quote_from_kline(symbol: str) -> dict | None:
     try:
         df = get_kline(symbol, days=10)
@@ -1436,6 +1585,8 @@ def _quote_from_kline(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"日K构造行情失败 {symbol}: {e}")
     return None
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_a_code_name_map() -> dict:
     """A股代码名称表：轻量字段兜底，只用于补股票名称。"""
@@ -1460,6 +1611,8 @@ def get_a_code_name_map() -> dict:
         "601138": "工业富联", "600519": "贵州茅台", "000001": "平安银行",
     })
     return out
+
+
 def _quote_from_code_name_map(symbol: str) -> dict | None:
     try:
         name = get_a_code_name_map().get(symbol, "")
@@ -1469,6 +1622,8 @@ def _quote_from_code_name_map(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"代码名称表补全失败 {symbol}: {e}")
     return None
+
+
 def _quote_from_sina(symbol: str) -> dict | None:
     """新浪轻量行情兜底：主要补名称、现价、涨跌幅；不提供估值。"""
     try:
@@ -1495,12 +1650,15 @@ def _quote_from_sina(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"新浪轻量行情失败 {symbol}: {e}")
     return None
+
+
 def _quote_from_baostock_basic(symbol: str) -> dict | None:
-    """Baostock 兜底：补名称、PE、PB、换手率、收盘价。"""
+    """Baostock 兜底：补名称、PE、PB、换手率、收盘价，并用总股本估算总市值。"""
     try:
         bs.login()
         bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
         result = {"symbol": symbol, "source": "Baostock基础/日线"}
+        total_shares = 0.0
         rs_basic = bs.query_stock_basic(code=bs_code)
         if getattr(rs_basic, "error_code", "") == "0":
             rows = []
@@ -1509,7 +1667,10 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
             if rows:
                 df_basic = pd.DataFrame(rows, columns=rs_basic.fields)
                 if not df_basic.empty:
-                    result["name"] = df_basic.iloc[0].get("code_name", "")
+                    row = df_basic.iloc[0]
+                    result["name"] = row.get("code_name", "")
+                    # totalShares 通常单位为股；如果接口返回万股，下面会在市值估算中自动兜底
+                    total_shares = safe_float(row.get("totalShares"), 0)
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d")
         fields = "date,code,close,preclose,pctChg,turn,peTTM,pbMRQ"
@@ -1526,14 +1687,22 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
             df = pd.DataFrame(rows, columns=rs.fields).replace("", pd.NA).dropna(subset=["close"])
             if not df.empty:
                 last = df.iloc[-1]
+                price = safe_float(last.get("close"), 0)
                 result.update({
-                    "price": safe_float(last.get("close"), 0),
+                    "price": price,
                     "pct": safe_float(last.get("pctChg"), 0),
                     "turnover": safe_float(last.get("turn"), 0),
                     "pe": last.get("peTTM", "-"),
                     "pb": last.get("pbMRQ", "-"),
                 })
-        return result if any(k in result for k in ["name", "price", "pe", "pb", "turnover"]) else None
+                if price > 0 and total_shares > 0:
+                    # 若 totalShares 是股：市值亿元 = 股数 * 价格 / 1e8；若极小则按万股粗略修正
+                    cap_yi = total_shares * price / 100000000
+                    if cap_yi < 1 and total_shares < 1000000:
+                        cap_yi = total_shares * 10000 * price / 100000000
+                    if cap_yi > 0:
+                        result["market_cap"] = cap_yi
+        return result if any(k in result for k in ["name", "price", "pe", "pb", "market_cap", "turnover"]) else None
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"Baostock 基础补全失败 {symbol}: {e}")
@@ -1542,6 +1711,8 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
         except Exception:
             pass
     return None
+
+
 def _quote_from_tushare_basic(symbol: str) -> dict | None:
     """Tushare 可选兜底：有 token 时补名称、市值、PE、PB、换手。"""
     try:
@@ -1575,6 +1746,32 @@ def _quote_from_tushare_basic(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"Tushare 基础补全失败 {symbol}: {e}")
     return None
+
+
+def _quote_from_manual_reference(symbol: str, price_hint=0.0) -> dict | None:
+    """少数接口长期受限时的内置基础资料兜底，只补相对稳定的名称/市值参考。
+
+    说明：这里不是替代实时行情，只是在所有公开接口都无法给出市值时，避免页面显示 0.0。
+    市值为粗略参考，真实交易仍以券商/交易所行情为准。
+    """
+    manual = {
+        "002565": {"name": "顺灏股份", "market_cap": 72.0},
+        "002281": {"name": "光迅科技", "market_cap": 1000.0},
+        "688523": {"name": "航天环宇", "market_cap": 80.0},
+        "300750": {"name": "宁德时代", "market_cap": 10000.0},
+        "600276": {"name": "恒瑞医药", "market_cap": 3000.0},
+        "002371": {"name": "北方华创", "market_cap": 2000.0},
+        "300308": {"name": "中际旭创", "market_cap": 3000.0},
+        "601138": {"name": "工业富联", "market_cap": 12000.0},
+    }
+    data = manual.get(str(symbol).zfill(6))
+    if not data:
+        return None
+    out = {"symbol": symbol, "source": "内置基础资料兜底"}
+    out.update(data)
+    return out
+
+
 def _quote_quality(q: dict | None) -> int:
     if not isinstance(q, dict):
         return 0
@@ -1587,90 +1784,38 @@ def _quote_quality(q: dict | None) -> int:
     score += 1 if not _is_missing_value(q.get("pb"), numeric_zero_is_missing=False) else 0
     score += 1 if safe_float(q.get("turnover"), 0) > 0 else 0
     return score
-def _quote_from_yahoo(symbol: str) -> dict | None:
-    """
-    Yahoo Finance 免费行情兜底：主要补总市值、PE、PB。
-    A股后缀：沪市 .SS，深市/创业板 .SZ。
-    """
-    try:
-        suffix = ".SS" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
-        y_symbol = f"{symbol}{suffix}"
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={y_symbol}"
-        res = fetch_json(url, timeout=6, retries=1, extra_headers={"Accept": "application/json"})
-        result = ((res or {}).get("quoteResponse") or {}).get("result") or []
-        if not result:
-            return None
-        d = result[0]
-        price = safe_float(d.get("regularMarketPrice"), 0.0)
-        prev = safe_float(d.get("regularMarketPreviousClose"), 0.0)
-        pct = safe_float(d.get("regularMarketChangePercent"), 0.0)
-        if pct == 0 and price > 0 and prev > 0:
-            pct = (price - prev) / prev * 100
-        return {
-            "symbol": symbol,
-            "name": d.get("shortName") or d.get("longName") or "",
-            "price": price,
-            "pct": pct,
-            "market_cap": safe_float(d.get("marketCap"), 0.0) / 100000000,
-            "pe": d.get("trailingPE", "-"),
-            "pb": d.get("priceToBook", "-"),
-            "turnover": 0.0,
-            "source": "Yahoo Finance估值",
-        }
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"Yahoo Finance 补全失败 {symbol}: {e}")
-    return None
-
-
-def _quote_from_tencent(symbol: str) -> dict | None:
-    """腾讯轻量行情兜底：主要补名称、价格、涨跌幅。"""
-    try:
-        prefix = "sh" if symbol.startswith(("6", "9", "5", "7")) else "sz"
-        url = f"https://qt.gtimg.cn/q={prefix}{symbol}"
-        headers = {"Referer": "https://gu.qq.com/", "User-Agent": random.choice(USER_AGENTS)}
-        res = SESSION.get(url, headers=headers, timeout=(3, 5), verify=False)
-        text = res.text if res is not None else ""
-        m = re.search(r'="(.*)"', text)
-        if not m:
-            return None
-        p = m.group(1).split("~")
-        if len(p) < 6:
-            return None
-        name = p[1].strip() if len(p) > 1 else ""
-        price = safe_float(p[3] if len(p) > 3 else 0, 0.0)
-        prev = safe_float(p[4] if len(p) > 4 else 0, 0.0)
-        pct = safe_float(p[32], 0.0) if len(p) > 32 else 0.0
-        if pct == 0 and price > 0 and prev > 0:
-            pct = (price - prev) / prev * 100
-        return {"symbol": symbol, "name": name, "price": price, "pct": pct, "source": "腾讯轻量行情"} if (price > 0 or name) else None
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"腾讯轻量行情失败 {symbol}: {e}")
-    return None
-
 
 @st.cache_data(ttl=75, show_spinner=False)
 def get_stock_quote(symbol):
     """
-    个股行情完整性优先版 2.0：
-    弃用默认依赖东财 clist 全市场快照的路径；
-    采用单股轻量源串行补全：新浪 → 腾讯 → 东方财富单股 → Yahoo估值 → Baostock/Tushare → AKShare增强 → 日K兜底。
+    个股行情完整性优先版：按接口稳定性与字段完整度串行补全，不再单源成功即返回。
+    优先级：东财单股 → AK实时 → 新浪轻量 → 东财全市场 → AK个股资料/代码名 → Baostock/Tushare → 日K构造。
     """
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
-
     merged = {"symbol": symbol}
 
-    # 第一层：轻量实时源，保证名称、现价、涨跌幅。
-    for fetcher in [_quote_from_sina, _quote_from_tencent, _quote_from_em_single]:
+    # 1. 实时行情层：优先拿价格、涨跌幅、名称、估值。
+    for fetcher in [_quote_from_em_single, _quote_from_ak_spot, _quote_from_sina]:
         merged = _merge_quote(merged, fetcher(symbol))
+        if _quote_quality(merged) >= 8:
+            break
 
-    # 第二层：估值补全源，优先补总市值/PE/PB/换手率。
-    for fetcher in [_quote_from_yahoo, _quote_from_baostock_basic, _quote_from_tushare_basic]:
+    # 2. 批量快照层：对自选股扫描特别有用，用来补市值/PE/PB/换手。
+    try:
+        snap = get_em_spot_snapshot_map()
+        if isinstance(snap, dict) and symbol in snap:
+            merged = _merge_quote(merged, snap.get(symbol))
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"东财全市场快照补全失败 {symbol}: {e}")
+
+    # 3. 基础资料层：只要还缺名称/市值/估值/换手，就继续补。
+    for fetcher in [_quote_from_ak_individual, _quote_from_code_name_map, _quote_from_baostock_basic, _quote_from_tushare_basic]:
         need_more = (
-            safe_float(merged.get("market_cap"), 0) <= 0
+            _is_missing_value(merged.get("name"), numeric_zero_is_missing=False)
+            or safe_float(merged.get("market_cap"), 0) <= 0
             or _is_missing_value(merged.get("pe"), numeric_zero_is_missing=False)
             or _is_missing_value(merged.get("pb"), numeric_zero_is_missing=False)
             or safe_float(merged.get("turnover"), 0) <= 0
@@ -1679,34 +1824,24 @@ def get_stock_quote(symbol):
             break
         merged = _merge_quote(merged, fetcher(symbol))
 
-    # 第三层：AKShare 只作为增强，不作为默认主链路。
-    if _quote_quality(merged) < 8:
-        for fetcher in [_quote_from_ak_spot, _quote_from_ak_individual]:
-            merged = _merge_quote(merged, fetcher(symbol))
-            if _quote_quality(merged) >= 8:
-                break
-
-    # 第四层：名称兜底 + K线兜底，保证技术分析不断掉。
-    merged = _merge_quote(merged, _quote_from_code_name_map(symbol))
+    # 4. K线兜底层：保证技术分析、评分、交易计划不断掉。
     if safe_float(merged.get("price"), 0) <= 0 or safe_float(merged.get("turnover"), 0) <= 0:
         merged = _merge_quote(merged, _quote_from_kline(symbol))
+
+    # 5. 少量长期缺字段标的，用内置基础资料兜底，避免市值永远显示 0.0。
+    if safe_float(merged.get("market_cap"), 0) <= 0 or _is_missing_value(merged.get("name"), numeric_zero_is_missing=False):
+        merged = _merge_quote(merged, _quote_from_manual_reference(symbol, safe_float(merged.get("price"), 0)))
 
     finalized = _finalize_quote(merged, symbol)
     if finalized:
         finalized["quality_score"] = _quote_quality(finalized)
-        missing = []
-        if finalized.get("market_cap", 0) <= 0:
-            missing.append("总市值")
-        if finalized.get("pe") == "-":
-            missing.append("PE")
-        if finalized.get("pb") == "-":
-            missing.append("PB")
-        if finalized.get("turnover", 0) <= 0:
-            missing.append("换手率")
-        finalized["fundamental_warning"] = (
-            "估值字段较完整" if not missing else f"仍缺少：{','.join(missing)}；已使用多源行情与K线降级分析"
-        )
+        if finalized.get("market_cap", 0) <= 0 or finalized.get("pe") == "-" or finalized.get("pb") == "-":
+            finalized["fundamental_warning"] = "部分估值字段缺失，已使用多源行情与K线降级分析"
+        else:
+            finalized["fundamental_warning"] = "估值字段较完整"
     return finalized
+
+
 def _normalize_daily_kline(df: pd.DataFrame | None, days=220) -> pd.DataFrame | None:
     if df is None or df.empty:
         return None
@@ -1732,6 +1867,8 @@ def _normalize_daily_kline(df: pd.DataFrame | None, days=220) -> pd.DataFrame | 
     if "turnover_rate" not in df.columns:
         df["turnover_rate"] = 0.0
     return df.tail(days).reset_index(drop=True)
+
+
 def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
     """东方财富历史日K：不依赖 AKShare，作为云端核心日K数据源。"""
     lmt = max(days + 100, 320)
@@ -1756,6 +1893,8 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
                 "turnover_rate": p[10] if len(p) > 10 else 0,
             })
     return _normalize_daily_kline(pd.DataFrame(rows), days=days)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_kline(symbol, days=220):
     """日K完整兜底版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
@@ -1834,6 +1973,7 @@ def get_kline(symbol, days=220):
         if DEBUG_MODE:
             st.caption(f"Tushare 日K失败 {symbol}: {e}")
     return None
+
 # ================= AI 计算核心 =================
 def call_ai(prompt, model=None, temperature=0.3):
     try:
@@ -1850,6 +1990,7 @@ def call_ai(prompt, model=None, temperature=0.3):
 # ================= 宏观分析与数据采集模块 (整合版) =================
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 class MacroAnalysisDataFetcher:
     """宏观分析板块数据获取器"""
     NBS_URL = "https://data.stats.gov.cn/easyquery.htm"
@@ -1877,6 +2018,7 @@ class MacroAnalysisDataFetcher:
         "医药": [{"code": "600276", "name": "恒瑞医药"}, {"code": "688235", "name": "百济神州"}]
     }
     SECTOR_ALIASES = {"AI": ["算力AI"], "红利": ["银行", "煤炭"]}
+
     def fetch_all_data(self) -> Dict[str, Any]:
         result = {"success": False, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "macro_series": {}, "macro_snapshot": {}, "macro_tables": {}, "market_indices": {}, "news": [], "candidate_pools": self.SECTOR_STOCK_POOLS, "rule_based_sector_view": {}, "errors": []}
         for key, config in self.NBS_SERIES_CONFIG.items():
@@ -1893,6 +2035,7 @@ class MacroAnalysisDataFetcher:
         except Exception as exc: result["errors"].append(f"宏观新闻: {exc}")
         result["success"] = bool(result["macro_snapshot"])
         return result
+
     def _fetch_nbs_series(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         params = {"m": "QueryData", "dbcode": config["dbcode"], "rowcode": "zb", "colcode": "sj", "wds": "[]", "dfwds": json.dumps([{"wdcode": "zb", "valuecode": config["group_code"]}, {"wdcode": "sj", "valuecode": config["period"]}], ensure_ascii=False), "k1": str(int(time.time() * 1000))}
         res = requests.post(self.NBS_URL, params=params, verify=False, timeout=15)
@@ -1909,6 +2052,7 @@ class MacroAnalysisDataFetcher:
             v_trans = round(v_raw - 100, 2) if config.get("transform") == "index_minus_100" else round(v_raw, 2)
             rows.append({"series_code": match.group(1), "series_label": config["label"], "period_code": match.group(2), "period_label": time_nodes.get(match.group(2), {}).get("cname", ""), "value_raw": v_raw, "value": v_trans, "unit": config.get("unit", "")})
         return sorted(rows, key=lambda x: x["period_code"], reverse=True)
+
     def _build_macro_snapshot(self, macro_series):
         snapshot = {}
         for k, s in macro_series.items():
@@ -1916,8 +2060,10 @@ class MacroAnalysisDataFetcher:
             latest, prev = s[0], s[1] if len(s) > 1 else None
             snapshot[k] = {"label": latest["series_label"], "value": latest["value"], "value_raw": latest["value_raw"], "unit": latest["unit"], "period_label": latest["period_label"], "change": round(latest["value"] - prev["value"], 2) if prev else None}
         return snapshot
+
     def _build_macro_tables(self, macro_series):
         return {k: pd.DataFrame([{"期间": i["period_label"], "数值": i["value"], "原始值": i["value_raw"], "单位": i["unit"] or "-"} for i in s]) for k, s in macro_series.items() if s}
+
     def _fetch_market_indices(self):
         res = {}
         for label, symbol in self.A_SHARE_INDEX_CONFIG.items():
@@ -1926,19 +2072,24 @@ class MacroAnalysisDataFetcher:
             latest, prev = df.iloc[-1], df.iloc[-2] if len(df) > 1 else df.iloc[-1]
             res[label] = {"close": round(float(latest["close"]), 2), "date": str(latest["date"]), "daily_change_pct": round(((float(latest["close"]) - float(prev["close"])) / float(prev["close"])) * 100, 2) if float(prev["close"]) != 0 else 0.0, "pct_20d": self._calc_return(df, 20), "pct_60d": self._calc_return(df, 60)}
         return res
+
     def _fetch_macro_news(self):
         df = ak.stock_info_global_em()
         if df is None or df.empty: return []
         kw = ["财政", "货币", "央行", "地产", "消费", "PMI", "CPI"]
         return [{"title": r["标题"], "summary": str(r.get("摘要", ""))[:180], "publish_time": str(r.get("发布时间", ""))} for _, r in df.iterrows() if any(k in str(r.get("标题")) or k in str(r.get("摘要")) for k in kw)][:12]
+
     def _calc_return(self, df, days):
         if len(df) <= days: return 0.0
         base = float(df.iloc[-days - 1]["close"])
         return round((float(df.iloc[-1]["close"]) - base) / base * 100, 2) if base != 0 else 0.0
+
     def build_rule_based_sector_view(self, snapshot):
         return {"market_view": "结构性机会为主", "bullish_sectors": [], "bearish_sectors": [], "watch_signals": []}
+
     def build_stock_candidates_for_sectors(self, sectors):
         return [s for sec in sectors for s in self.SECTOR_STOCK_POOLS.get(sec, [])][:10]
+
     def build_prompt_context(self, data):
         lines = ["===== 当前国内宏观数据快照 ====="]
         for k, v in data.get("macro_snapshot", {}).items():
@@ -1948,20 +2099,25 @@ class MacroAnalysisDataFetcher:
             lines.append(f"- {k}: {v['close']}, 日涨跌 {v['daily_change_pct']}%")
         lines.append("\n===== 可选板块池 =====\n" + "、".join(self.SECTOR_STOCK_POOLS.keys()))
         return "\n".join(lines)
+
+
 class MacroAnalysisAgents:
     """基于主程序 call_ai 接口的宏观智能体集群"""
     def macro_analyst_agent(self, context_text: str) -> Dict:
         prompt = f"你是一位资深中国宏观经济研究员。请严格基于下面的数据，分析当前国内宏观经济形势。\n\n{context_text}\n重点回答：1.当前经济所处阶段。2.核心矛盾。3.关键跟踪变量。4.对A股投资的影响。"
         return self._call_text("你是中国宏观经济分析师", prompt, "宏观总量分析师", ["增长", "通胀", "信用"])
+
     def policy_analyst_agent(self, context_text: str) -> Dict:
         prompt = f"你是一位资深的政策与流动性分析师。请基于以下数据评估中国政策环境与流动性。\n\n{context_text}\n重点回答：1.当前政策组合倾向。2.流动性对A股估值的支撑。3.A股风格与板块轮动含义。"
         return self._call_text("你是政策流动性分析师", prompt, "政策流动性分析师", ["货币", "财政", "风格"])
+
     def sector_mapper_agent(self, context_text: str, sector_pool: List[str]) -> Dict:
         prompt = f"你是行业配置分析师。请结合数据，从以下板块池选择未来1季度受益和承压板块。\n板块池：{', '.join(sector_pool)}\n\n数据：\n{context_text}\n请只返回JSON：{{\"market_view\": \"...\", \"bullish_sectors\": [{{\"sector\":\"银行\", \"logic\":\"...\"}}], \"bearish_sectors\": []}}"
         structured = self._call_json("只输出合法JSON", prompt, {"market_view": "结构性震荡", "bullish_sectors": [], "bearish_sectors": []})
         analysis_prompt = f"请基于以下JSON写一份A股行业配置报告：\n{json.dumps(structured, ensure_ascii=False)}\n包含市场主线、看多/看空逻辑及传导链。"
         analysis = call_ai(f"你是A股行业配置专家\n\n{analysis_prompt}")
         return {"agent_name": "行业映射分析师", "analysis": analysis, "structured": structured}
+
     def stock_selector_agent(self, context_text: str, sector_view: Dict, stock_candidates: List[Dict]) -> Dict:
         cand_str = json.dumps(stock_candidates, ensure_ascii=False)
         prompt = f"你是选股分析师。结合行业视图从候选池中选股。\n行业视图：\n{json.dumps(sector_view, ensure_ascii=False)}\n候选池：\n{cand_str}\n请只返回JSON格式包含 'recommended_stocks' 和 'watchlist'。"
@@ -1969,12 +2125,15 @@ class MacroAnalysisAgents:
         analysis_prompt = f"请基于结构化结果写一份选股说明：\n{json.dumps(structured, ensure_ascii=False)}\n解释适配逻辑，指出催化剂与风险。"
         analysis = call_ai(f"你是A股选股专家\n\n{analysis_prompt}")
         return {"agent_name": "优质标的分析师", "analysis": analysis, "structured": structured}
+
     def chief_strategist_agent(self, context_text: str, macro_report: str, policy_report: str, sector_view: Dict) -> Dict:
         prompt = f"你是首席策略官，请给出A股后市综合报告。\n\n宏观数据：\n{context_text}\n\n【宏观研判】\n{macro_report}\n\n【政策研判】\n{policy_report}\n\n【行业映射】\n{json.dumps(sector_view, ensure_ascii=False)}\n\n要求输出：宏观判断、后市展望、利多利空板块及风险跟踪。"
         return self._call_text("你是首席策略官", prompt, "首席策略官", ["总策略", "配置"])
+
     def _call_text(self, sys_prompt, user_prompt, agent_name, focus_areas):
         res = call_ai(f"{sys_prompt}\n\n{user_prompt}")
         return {"agent_name": agent_name, "analysis": res, "focus_areas": focus_areas}
+
     def _call_json(self, sys_prompt, user_prompt, fallback):
         res = call_ai(f"{sys_prompt}\n\n{user_prompt}")
         if not res: return fallback
@@ -1983,6 +2142,7 @@ class MacroAnalysisAgents:
             try: return json.loads(match.group(1))
             except: pass
         return fallback
+
 class MacroAnalysisEngine:
     def run_full_analysis(self, progress_callback=None):
         results = {"success": False, "raw_data": {}, "agents_analysis": {}, "sector_view": {}, "candidate_stocks": [], "errors": []}
@@ -2018,6 +2178,7 @@ class MacroAnalysisEngine:
         except Exception as e:
             results["error"] = str(e)
         return results
+
 # ====== 宏观 UI 渲染函数 ======
 def display_macro_analysis_ui():
     st.info("本板块通过国家统计局官方接口抓取最新宏观经济数据，并联动 AI 多智能体进行 A 股大势研判与行业映射。")
@@ -2061,18 +2222,21 @@ def display_macro_analysis_ui():
 # 整合来源：智瞰龙虎数据采集模块、智瞰龙虎AI分析模块、智瞰龙虎综合分析引擎
 class LonghubangDataFetcher:
     """龙虎榜数据获取与清洗。
+
     设计原则：
     1. 先走 ws4 智瞰龙虎接口，保留游资席位字段；
     2. 失败后走 AKShare 东方财富龙虎榜详情；
     3. 自动向前回溯最近可用交易日；
     4. 统一字段结构，避免 UI 和 AI 模块因字段不一致崩溃。
     """
+
     def __init__(self, api_key=None):
         self.base_url = "http://lhb-api.ws4.cn/v1"
         self.api_key = api_key
         self.max_retries = 2
         self.retry_delay = 0.8
         self.request_delay = 0.05
+
     def _safe_request(self, url, params=None, timeout=8):
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         for attempt in range(self.max_retries):
@@ -2094,6 +2258,7 @@ class LonghubangDataFetcher:
                 elif DEBUG_MODE:
                     st.warning(f"龙虎榜请求失败: {e}")
         return None
+
     def _extract_data_list(self, raw_result):
         if not raw_result:
             return []
@@ -2110,6 +2275,7 @@ class LonghubangDataFetcher:
                 if isinstance(val, list):
                     return val
         return []
+
     def _normalize_record(self, record, default_date=None, source="ws4"):
         if not isinstance(record, dict):
             return None
@@ -2132,6 +2298,7 @@ class LonghubangDataFetcher:
             "gl": str(record.get("gl") or record.get("概念") or record.get("解读") or record.get("上榜原因") or ""),
             "source": source,
         }
+
     def get_longhubang_data(self, date):
         url = f"{self.base_url}/youzi/all"
         raw = self._safe_request(url, params={"date": date})
@@ -2141,6 +2308,7 @@ class LonghubangDataFetcher:
             if norm:
                 records.append(norm)
         return records
+
     def get_longhubang_data_akshare(self, date):
         date_ymd = str(date).replace("-", "")
         records = []
@@ -2169,6 +2337,7 @@ class LonghubangDataFetcher:
             if DEBUG_MODE:
                 st.warning(f"AKShare 龙虎榜备用源失败: {e}")
             return []
+
     def get_longhubang_data_auto(self, date, lookback_days=10):
         errors = []
         base_date = pd.to_datetime(date).date()
@@ -2185,6 +2354,7 @@ class LonghubangDataFetcher:
                 return {"success": True, "requested_date": str(date), "used_date": date_str, "source": "AKShare 东方财富龙虎榜", "data": ak_data, "errors": errors}
             errors.append(f"{date_str} AKShare 无数据或受限")
         return {"success": False, "requested_date": str(date), "used_date": None, "source": "无可用源", "data": [], "errors": errors}
+
     def parse_to_dataframe(self, data_list):
         if not data_list:
             return pd.DataFrame()
@@ -2203,6 +2373,7 @@ class LonghubangDataFetcher:
         if "净流入金额" in df.columns:
             df = df.sort_values("净流入金额", ascending=False)
         return df
+
     def analyze_data_summary(self, data_list):
         if not data_list:
             return {}
@@ -2229,6 +2400,7 @@ class LonghubangDataFetcher:
                         concepts.append(part)
             summary["hot_concepts"] = dict(Counter(concepts).most_common(20))
         return summary
+
     def format_data_for_ai(self, data_list, summary=None):
         if not data_list:
             return "暂无龙虎榜数据"
@@ -2264,8 +2436,11 @@ class LonghubangDataFetcher:
                 f"净流入:{safe_float(row.get('净流入金额')):,.0f} | 日期:{row.get('日期', 'N/A')} | 类型:{row.get('榜单类型', '')}"
             )
         return "\n".join(parts)
+
+
 class LonghubangScoring:
     """龙虎榜轻量评分器：先给结构化排名，再交给 AI 深度分析。"""
+
     def score_all_stocks(self, data_list):
         fetcher = LonghubangDataFetcher()
         df = fetcher.parse_to_dataframe(data_list)
@@ -2293,13 +2468,18 @@ class LonghubangScoring:
         grouped["信号标签"] = grouped["智瞰评分"].apply(lambda x: "强势进攻" if x >= 75 else "偏多观察" if x >= 60 else "分歧博弈" if x >= 45 else "风险优先")
         grouped = grouped.sort_values(["智瞰评分", "净流入金额"], ascending=False)
         return grouped
+
+
 class LonghubangAgents:
     """龙虎榜 AI 分析师集合。复用主程序 call_ai/Groq，不依赖 DeepSeek 外部模块。"""
+
     def __init__(self, model=None):
         self.model = model or selected_model
+
     def _run(self, role, prompt, max_chars=9000):
         final_prompt = f"你现在扮演【{role}】。请用中文输出，结构清晰，避免空话，重点给出可执行结论。\n\n{prompt[:max_chars]}"
         return call_ai(final_prompt, model=self.model, temperature=0.25)
+
     def youzi_behavior_analyst(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
         youzi_info = ""
         if summary.get("top_youzi"):
@@ -2314,9 +2494,11 @@ class LonghubangAgents:
 净流入金额: {summary.get('total_net_inflow', 0):,.2f} 元
 {youzi_info}
 {longhubang_data}
+
 请分析：1. 活跃游资画像；2. 操作风格；3. 目标股票；4. 进出节奏；5. 题材偏好；6. 风险与机会；7. 跟随策略。
 """
         return {"agent_name": "游资行为分析师", "agent_role": "分析游资操作特征、意图和目标股票", "analysis": self._run("资深游资行为分析师", prompt), "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+
     def stock_potential_analyst(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
         stock_info = ""
         if summary.get("top_stocks"):
@@ -2326,9 +2508,11 @@ class LonghubangAgents:
 记录总数: {summary.get('total_records', 0)}；涉及股票: {summary.get('total_stocks', 0)} 只；涉及游资: {summary.get('total_youzi', 0)} 个
 {stock_info}
 {longhubang_data}
+
 请重点挖掘：1. 次日大概率上涨股票 TOP5-8；2. 资金流入强度；3. 技术位置假设；4. 题材逻辑；5. 风险股票；6. 买入价位、目标、止损、持有周期。
 """
         return {"agent_name": "个股潜力分析师", "agent_role": "挖掘次日大概率上涨的潜力股票", "analysis": self._run("短线个股潜力分析师", prompt), "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+
     def theme_tracker_analyst(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
         concept_info = ""
         if summary.get("hot_concepts"):
@@ -2337,17 +2521,21 @@ class LonghubangAgents:
 【龙虎榜数据概况】记录总数: {summary.get('total_records', 0)}，涉及股票: {summary.get('total_stocks', 0)} 只
 {concept_info}
 {longhubang_data}
+
 请分析：1. 热点题材；2. 炒作周期；3. 龙头与梯队；4. 游资对题材的态度；5. 题材轮动；6. 题材风险；7. 题材投资策略。
 """
         return {"agent_name": "题材追踪分析师", "agent_role": "识别热点题材，分析炒作周期，预判轮动方向", "analysis": self._run("题材追踪分析师", prompt), "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+
     def risk_control_specialist(self, longhubang_data: str, summary: Dict) -> Dict[str, Any]:
         prompt = f"""
 【龙虎榜数据概况】
 记录总数: {summary.get('total_records', 0)}；涉及股票: {summary.get('total_stocks', 0)}；净流入金额: {summary.get('total_net_inflow', 0):,.2f} 元
 {longhubang_data}
+
 请从保守风控视角分析：1. 高风险股票；2. 游资出货信号；3. 资金陷阱；4. 题材退潮风险；5. 技术面风险；6. 情绪风险；7. 仓位与止损纪律。
 """
         return {"agent_name": "风险控制专家", "agent_role": "识别高风险股票、游资出货信号和市场陷阱", "analysis": self._run("风险控制专家", prompt), "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+
     def chief_strategist(self, all_analyses: List[Dict], summary: Dict = None, scoring_df: pd.DataFrame = None) -> Dict[str, Any]:
         analyses_text = ""
         for a in all_analyses:
@@ -2359,15 +2547,20 @@ class LonghubangAgents:
 你是一名首席投资策略师。请综合以下分析师意见和量化评分，给出最终龙虎榜策略报告。
 {score_text}
 {analyses_text[:14000]}
+
 请输出：1. 市场总体研判和热度分；2. 次日重点推荐股票 TOP5-8；3. 高风险警示股票 TOP3-5；4. 热点题材总结；5. 仓位和操作策略；6. 纪律与预案。
 """
         return {"agent_name": "首席策略师", "agent_role": "综合多维度分析，给出最终投资建议和推荐股票清单", "analysis": self._run("首席投资策略师", prompt, max_chars=16000), "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
 class LonghubangEngine:
     """智瞰龙虎综合分析引擎：数据获取 → 摘要统计 → 量化评分 → AI 分析 → 最终报告。"""
+
     def __init__(self, model=None):
         self.fetcher = LonghubangDataFetcher()
         self.scoring = LonghubangScoring()
         self.agents = LonghubangAgents(model=model)
+
     def run_comprehensive_analysis(self, date=None, lookback_days=10, ai_depth="标准", run_ai=True):
         results = {
             "success": False,
@@ -2384,6 +2577,7 @@ class LonghubangEngine:
         if not auto.get("success") or not data_list:
             results["error"] = "未获取到龙虎榜数据"
             return results
+
         summary = self.fetcher.analyze_data_summary(data_list)
         formatted_data = self.fetcher.format_data_for_ai(data_list, summary)
         df = self.fetcher.parse_to_dataframe(data_list)
@@ -2400,11 +2594,13 @@ class LonghubangEngine:
                     "net_inflow": row.get("净流入金额"),
                     "reason": f"净流入{safe_float(row.get('净流入金额')):,.0f}元，{row.get('游资数量', 0)}个席位参与，上榜{row.get('上榜次数', 0)}次",
                 })
+
         results["data_info"] = {"total_records": summary.get("total_records", 0), "total_stocks": summary.get("total_stocks", 0), "total_youzi": summary.get("total_youzi", 0), "summary": summary}
         results["dataframe"] = df
         results["scoring_ranking"] = scoring_df
         results["recommended_stocks"] = recommended
         results["formatted_data"] = formatted_data
+
         if run_ai:
             agents_results = {}
             all_analyses = []
@@ -2419,6 +2615,7 @@ class LonghubangEngine:
         results["success"] = True
         return results
 # ================= 智瞰龙虎榜数据与分析模块结束 =================
+
 # ==========================================
 # ===================== 新增：主力资金选股整合模块 =====================
 # =====================================================================
@@ -2428,14 +2625,17 @@ class LonghubangEngine:
 # 3. 即使外部接口失败，也会立刻进入内置观察池，不让页面长时间转圈。
 # 4. AI 分析从原来的三次串行调用压缩为一次调用；先展示量化结果，再生成 AI 解读。
 # 5. JSON 解析失败也不再报错，直接使用量化打分结果兜底。
+
 import sqlite3
 import json
 import re
+
 class MainForceBatchDatabase:
     """主力选股分析历史数据库管理类"""
     def __init__(self, db_path="main_force_batch.db"):
         self.db_path = db_path
         self._init_database()
+
     def _init_database(self):
         try:
             conn = sqlite3.connect(self.db_path)
@@ -2454,6 +2654,7 @@ class MainForceBatchDatabase:
             conn.close()
         except Exception:
             pass
+
     def save_analysis(self, batch_count, success_count, results_json):
         try:
             conn = sqlite3.connect(self.db_path)
@@ -2468,13 +2669,16 @@ class MainForceBatchDatabase:
             conn.close()
         except Exception:
             pass
+
 class MainForceStockSelector:
     """主力资金快速选股器。
+
     设计目标：宁愿少抓一点数据，也不要让 Streamlit Cloud 一直卡住。
     数据优先级：
     1. 东方财富轻量 clist 接口：快，单次请求，适合云端。
     2. 内置核心观察池：外部接口不稳定时兜底。
     """
+
     DEFAULT_POOL = [
         {"股票代码": "600519", "股票简称": "贵州茅台", "所属行业": "食品饮料", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
         {"股票代码": "300750", "股票简称": "宁德时代", "所属行业": "电池", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
@@ -2492,6 +2696,7 @@ class MainForceStockSelector:
         {"股票代码": "600547", "股票简称": "山东黄金", "所属行业": "黄金", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
         {"股票代码": "688523", "股票简称": "航天环宇", "所属行业": "国防军工", "区间涨跌幅": 0, "最新价": 0, "主力净流入": 0, "成交额": 0, "换手率": 0, "总市值": 0, "市盈率": "-"},
     ]
+
     INDUSTRY_HINTS = {
         "银行": ["银行"], "证券": ["券商", "证券"], "保险": ["保险"],
         "半导体": ["半导体", "芯片", "集成电路"], "算力AI": ["AI", "算力", "光模块", "服务器"],
@@ -2500,12 +2705,14 @@ class MainForceStockSelector:
         "有色金属": ["有色", "铜", "铝"], "黄金": ["黄金", "避险"],
         "汽车整车": ["汽车", "新能源车"], "国防军工": ["军工", "低空经济", "航天"]
     }
+
     def _normalize_code(self, value):
         if pd.isna(value):
             return ""
         text = str(value).strip()
         m = re.search(r"(\d{6})", text)
         return m.group(1) if m else text.zfill(6)[-6:]
+
     def _standardize_numeric(self, df):
         numeric_cols = ["区间涨跌幅", "最新价", "主力净流入", "成交额", "换手率", "总市值"]
         for col in numeric_cols:
@@ -2517,12 +2724,14 @@ class MainForceStockSelector:
         if "所属行业" not in df.columns:
             df["所属行业"] = "未分类"
         return df
+
     def _infer_industry(self, name: str):
         name = str(name)
         for industry, keys in self.INDUSTRY_HINTS.items():
             if any(k in name for k in keys):
                 return industry
         return "未分类"
+
     def _fetch_eastmoney_fast_pool(self, pz=220):
         """东方财富轻量实时列表。只请求一页，避免 AKShare 多页 tqdm 卡住。"""
         url = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -2549,6 +2758,7 @@ class MainForceStockSelector:
             diff = ((js or {}).get("data") or {}).get("diff") or []
             if not diff:
                 return pd.DataFrame(), "东方财富轻量接口返回空"
+
             rows = []
             for item in diff:
                 code = self._normalize_code(item.get("f12", ""))
@@ -2584,6 +2794,7 @@ class MainForceStockSelector:
             return self._score_candidates(df), f"东方财富轻量接口成功获取{len(df)}只候选股票"
         except Exception as exc:
             return pd.DataFrame(), f"东方财富轻量接口异常: {exc}"
+
     def _fetch_static_pool(self):
         df = pd.DataFrame(self.DEFAULT_POOL).copy()
         df["数据源"] = "内置兜底观察池"
@@ -2606,6 +2817,7 @@ class MainForceStockSelector:
             rows.append(item)
         final_df = pd.DataFrame(rows)
         return self._score_candidates(final_df), f"已启用内置观察池{len(final_df)}只"
+
     def _score_candidates(self, df):
         if df is None or df.empty:
             return pd.DataFrame()
@@ -2616,6 +2828,7 @@ class MainForceStockSelector:
         df = df.drop_duplicates(subset=["股票代码"]).reset_index(drop=True)
         if df.empty:
             return df
+
         # 热度评分：不用等待精确资金流，快速给出可排序结果。
         df["成交额_rank"] = df["成交额"].rank(pct=True).fillna(0)
         df["换手率_rank"] = df["换手率"].rank(pct=True).fillna(0)
@@ -2628,13 +2841,17 @@ class MainForceStockSelector:
             + df["涨幅_rank"] * 15
         ).round(2)
         return df.drop(columns=["成交额_rank", "换手率_rank", "涨幅_rank", "净流入_rank"], errors="ignore")
+
     def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
-        # 稳定优先：弃用容易 502/反爬的东方财富 clist、问财和 AKShare 分页资金流。
-        # 使用内置观察池 + 单股轻量行情补全，保证模块稳定返回。
-        df, msg = self._fetch_static_pool()
+        # 只走快速路径，不再调用 pywencai/AKShare分页资金流，避免长时间转圈。
+        df, msg = self._fetch_eastmoney_fast_pool(pz=220)
         if df.empty:
-            return False, pd.DataFrame(), "内置观察池为空"
-        return True, df, "已弃用东方财富clist/问财/AKShare分页资金流；使用内置观察池+单股行情稳态扫描"
+            df, msg2 = self._fetch_static_pool()
+            msg = f"{msg}；{msg2}"
+        if df.empty:
+            return False, pd.DataFrame(), "所有快速数据源均为空"
+        return True, df, msg
+
     def filter_stocks(self, df: pd.DataFrame, max_range_change=30.0, min_market_cap=10.0, max_market_cap=5000.0):
         if df is None or df.empty:
             return pd.DataFrame()
@@ -2649,6 +2866,7 @@ class MainForceStockSelector:
         if sort_cols:
             filtered_df = filtered_df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
         return filtered_df.reset_index(drop=True)
+
 class MainForceAnalyzer:
     """主力选股快速分析引擎。"""
     def __init__(self):
@@ -2657,6 +2875,7 @@ class MainForceAnalyzer:
         self.fund_flow_analysis = ""
         self.industry_analysis = ""
         self.data_source_msg = ""
+
     @staticmethod
     def _build_recommendations(filtered_data: pd.DataFrame, final_n: int) -> List[Dict[str, Any]]:
         recs = []
@@ -2692,6 +2911,7 @@ class MainForceAnalyzer:
                 "risks": "该结果为快速资金热度模型筛选，需结合日线位置、公告、板块强度和大盘环境二次确认。"
             })
         return recs
+
     @staticmethod
     def _extract_json_from_ai_response(text: str) -> Dict[str, Any]:
         if text is None:
@@ -2708,24 +2928,29 @@ class MainForceAnalyzer:
         if start != -1 and end != -1 and end > start:
             return json.loads(raw[start:end + 1])
         raise ValueError("未能从 AI 回复中提取合法 JSON")
+
     def run_full_analysis(self, start_date, days_ago, final_n, max_range_change, min_market_cap, max_market_cap, use_ai=True):
         result = {"success": False, "final_recommendations": [], "error": None}
         t0 = time.time()
+
         success, raw_data, msg = self.selector.get_main_force_stocks(start_date, days_ago, min_market_cap, max_market_cap)
         self.data_source_msg = msg
         if not success:
             result["error"] = msg
             return result
+
         filtered_data = self.selector.filter_stocks(raw_data, max_range_change, min_market_cap, max_market_cap)
         if filtered_data.empty:
             result["error"] = "筛选后无符合条件的股票。建议提高区间最大涨幅限制或放宽市值范围。"
             return result
+
         self.raw_stocks = filtered_data
         quick_recs = self._build_recommendations(filtered_data, final_n)
         result["final_recommendations"] = quick_recs
         result["success"] = True
         result["data_source_msg"] = msg
         result["elapsed_fetch"] = round(time.time() - t0, 2)
+
         # 先完成可展示结果，再做一次短 AI 解读；AI 失败不影响结果。
         top_data = filtered_data.head(min(20, len(filtered_data)))
         show_cols = ["股票代码", "股票简称", "所属行业", "资金热度分", "主力净流入", "成交额", "区间涨跌幅", "换手率", "总市值", "市盈率", "数据源"]
@@ -2733,13 +2958,16 @@ class MainForceAnalyzer:
         table_text = top_data[show_cols].to_string(index=False)
         self.fund_flow_analysis = "已根据成交额、换手率、估算主力净流入、涨跌幅构造资金热度分，并完成快速排序。"
         self.industry_analysis = "行业分布来自股票名称和内置行业映射，属于快速归类，适合先做观察池，不适合作为唯一买入依据。"
+
         if use_ai and api_key:
             try:
                 prompt = f"""
 你是A股短线资金流研究员。请基于以下快速候选池，给出精炼结论。
+
 数据来源说明：{msg}
 候选数据：
 {table_text}
+
 请严格输出合法 JSON，不要使用 Markdown 代码块：
 {{
   "fund_view": "一句话总结资金流状态",
@@ -2759,6 +2987,7 @@ class MainForceAnalyzer:
                 result["ai_raw_response"] = ai_resp
             except Exception as exc:
                 result["warning"] = f"AI 解读未完成，已使用快速量化结果。原因：{exc}"
+
         try:
             self.db.save_analysis(
                 len(filtered_data),
@@ -2768,11 +2997,13 @@ class MainForceAnalyzer:
         except Exception:
             pass
         return result
+
 def render_main_force_tab():
     """主力选股专属 UI 渲染器（快速版）。"""
     st.markdown("### 🎯 主力资金选股 - 快速资金热度引擎")
     st.write("为避免云端接口长时间卡住，本模块改为轻量行情池 + 资金热度评分 + 单次AI解读。先出结果，再做研判。")
     st.markdown("---")
+
     col1, col2, col3 = st.columns(3)
     with col1:
         date_option = st.selectbox("监控时间区间", ["最近10天", "最近30天", "最近3个月"])
@@ -2781,11 +3012,14 @@ def render_main_force_tab():
         final_n = st.slider("最终精选数量", 2, 10, 5)
     with col3:
         max_change = st.number_input("区间最大涨幅限制(%)", value=30.0, step=5.0, help="剔除已经大涨的高位股")
+
     use_ai = st.checkbox("生成AI解读", value=True, help="关闭后速度最快，只展示量化资金热度结果。")
+
     if st.button("🚀 启动主力追踪引擎", type="primary", width="stretch"):
         if not api_key and use_ai:
             st.warning("未配置 GROQ_API_KEY，将只展示快速量化结果。")
             use_ai = False
+
         analyzer = MainForceAnalyzer()
         with st.spinner("正在快速提取候选池并计算资金热度..."):
             result = analyzer.run_full_analysis(
@@ -2797,17 +3031,20 @@ def render_main_force_tab():
                 max_market_cap=5000.0,
                 use_ai=use_ai,
             )
+
         if result["success"]:
             st.success(f"✅ 计算完成！已锁定 {len(result['final_recommendations'])} 只候选标的。数据源：{result.get('data_source_msg', analyzer.data_source_msg)}")
             if result.get("elapsed_fetch") is not None:
                 st.caption(f"数据提取与初筛耗时：{result['elapsed_fetch']} 秒")
             if result.get("warning"):
                 st.warning(result["warning"])
+
             if hasattr(analyzer, "raw_stocks") and analyzer.raw_stocks is not None and not analyzer.raw_stocks.empty:
                 with st.expander("📋 查看快速候选池 Top 30", expanded=False):
                     show_cols = ["股票代码", "股票简称", "所属行业", "资金热度分", "主力净流入", "成交额", "区间涨跌幅", "换手率", "总市值", "市盈率", "数据源"]
                     show_cols = [c for c in show_cols if c in analyzer.raw_stocks.columns]
                     st.dataframe(analyzer.raw_stocks[show_cols].head(30), width="stretch", hide_index=True)
+
             st.markdown("### ⭐ 首席精选标的池")
             for rec in result["final_recommendations"]:
                 with st.expander(f"🏅 TOP {rec.get('rank', '-')} | {rec.get('name', '未知')} ({rec.get('symbol', '未知')})", expanded=True):
@@ -2820,6 +3057,7 @@ def render_main_force_tab():
                         st.write(f"- {r}")
                     st.markdown(f"**💰 建议仓位：** {rec.get('position', 'N/A')}")
                     st.markdown(f"**⚠️ 预警提示：** {rec.get('risks', 'N/A')}")
+
             st.markdown("---")
             st.markdown("### 🤖 投研底稿")
             t1, t2 = st.tabs(["💰 资金流向透视", "📊 行业格局研判"])
@@ -2830,9 +3068,12 @@ def render_main_force_tab():
         else:
             st.error(f"❌ 运行失败: {result['error']}")
 # ===================== 主力选股模块结束 =====================
+
+
 # ================= 高端新闻情报终端模块 =================
 # 整合思路来源：news_announcement_data / news_flow_data / news_flow_agents / news_flow_engine / news_flow_db / news_flow_ui
 # 采用单文件内嵌方式，避免 Streamlit Cloud 因外部模块缺失导致部署失败。
+
 NEWS_KEYWORD_SECTOR_MAP = {
     "AI": ["人工智能", "算力", "CPO", "数据中心", "机器人"],
     "算力": ["算力", "CPO", "光模块", "服务器", "液冷", "数据中心"],
@@ -2847,6 +3088,7 @@ NEWS_KEYWORD_SECTOR_MAP = {
     "军工": ["军工", "航天", "卫星", "商业航天", "低轨"],
     "黄金有色": ["黄金", "铜", "铝", "稀土", "有色", "贵金属"],
 }
+
 NEWS_SECTOR_STOCK_POOL = {
     "AI": [{"code": "300308", "name": "中际旭创"}, {"code": "601138", "name": "工业富联"}, {"code": "000977", "name": "浪潮信息"}],
     "算力": [{"code": "300308", "name": "中际旭创"}, {"code": "300502", "name": "新易盛"}, {"code": "601138", "name": "工业富联"}],
@@ -2861,11 +3103,13 @@ NEWS_SECTOR_STOCK_POOL = {
     "军工": [{"code": "600760", "name": "中航沈飞"}, {"code": "000768", "name": "中航西飞"}, {"code": "002179", "name": "中航光电"}],
     "黄金有色": [{"code": "600547", "name": "山东黄金"}, {"code": "601899", "name": "紫金矿业"}, {"code": "600111", "name": "北方稀土"}],
 }
+
 class HighEndNewsDB:
     """轻量情报缓存库。优先写入本地 sqlite；失败时不影响主流程。"""
     def __init__(self, db_path="news_terminal_cache.db"):
         self.db_path = db_path
         self._init_db()
+
     def _init_db(self):
         try:
             conn = sqlite3.connect(self.db_path)
@@ -2884,6 +3128,7 @@ class HighEndNewsDB:
             conn.close()
         except Exception:
             pass
+
     def save_run(self, mode, stock_code, score, summary):
         try:
             conn = sqlite3.connect(self.db_path)
@@ -2896,6 +3141,7 @@ class HighEndNewsDB:
             conn.close()
         except Exception:
             pass
+
     def recent_runs(self, limit=10):
         try:
             conn = sqlite3.connect(self.db_path)
@@ -2904,11 +3150,13 @@ class HighEndNewsDB:
             return df
         except Exception:
             return pd.DataFrame()
+
 class HighEndNewsFetcher:
     """高端情报数据采集器：全网快讯 + 财经新闻 + 个股新闻公告。"""
     def __init__(self, max_items=60):
         self.max_items = max_items
         self.errors = []
+
     def collect(self, stock_code="", max_items=60, include_wencai=False):
         items = []
         self.errors = []
@@ -2919,6 +3167,7 @@ class HighEndNewsFetcher:
             items.extend(self._fetch_stock_announcements_em(stock_code, max_items=max_items))
             if include_wencai:
                 items.extend(self._fetch_wencai_stock_news(stock_code, max_items=min(15, max_items)))
+
         seen = set()
         cleaned = []
         for item in items:
@@ -2933,8 +3182,10 @@ class HighEndNewsFetcher:
             item["impact_score"] = self._score_item(item)
             item["matched_sectors"] = self._match_sectors(title + " " + str(item.get("summary", "")))
             cleaned.append(item)
+
         cleaned = sorted(cleaned, key=lambda x: (safe_float(x.get("impact_score")), str(x.get("time", ""))), reverse=True)
         return {"items": cleaned[:max_items], "errors": self.errors, "count": len(cleaned[:max_items])}
+
     def _fetch_sina_live(self, max_items=60):
         url = "https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size=80&zhibo_id=152&tag_id=0&dire=f&dpc=1"
         res = fetch_json(url, timeout=6, extra_headers={"Referer": "https://finance.sina.com.cn/"})
@@ -2948,6 +3199,7 @@ class HighEndNewsFetcher:
         except Exception as e:
             self.errors.append(f"新浪财经直播失败: {e}")
         return out
+
     def _fetch_em_global(self, max_items=60):
         out = []
         try:
@@ -2960,6 +3212,7 @@ class HighEndNewsFetcher:
         except Exception as e:
             self.errors.append(f"东方财富全球财经失败: {e}")
         return out
+
     def _fetch_em_announcements(self, max_items=60):
         url = "https://np-anotice-stock.eastmoney.com/api/security/ann?page_size=30&page_index=1&ann_type=A"
         res = fetch_json(url, timeout=6, extra_headers={"Referer": "https://data.eastmoney.com/"})
@@ -2973,6 +3226,7 @@ class HighEndNewsFetcher:
         except Exception as e:
             self.errors.append(f"东方财富公告失败: {e}")
         return out
+
     def _fetch_stock_announcements_em(self, stock_code, max_items=30):
         out = []
         try:
@@ -2989,6 +3243,7 @@ class HighEndNewsFetcher:
         except Exception as e:
             self.errors.append(f"个股公告备用源失败: {e}")
         return out
+
     def _fetch_wencai_stock_news(self, stock_code, max_items=15):
         out = []
         try:
@@ -3012,12 +3267,14 @@ class HighEndNewsFetcher:
         except Exception as e:
             self.errors.append(f"问财新闻公告总失败: {e}")
         return out
+
     def _match_sectors(self, text):
         matched = []
         for sector, kws in NEWS_KEYWORD_SECTOR_MAP.items():
             if any(k.lower() in text.lower() for k in kws):
                 matched.append(sector)
         return matched
+
     def _score_item(self, item):
         text = f"{item.get('title','')} {item.get('summary','')}"
         high_words = ["重磅", "突发", "大涨", "暴涨", "涨停", "政策", "央行", "国务院", "并购", "重组", "制裁", "降息", "关税", "突破", "新高"]
@@ -3029,10 +3286,12 @@ class HighEndNewsFetcher:
         if item.get("platform") == "公告":
             score += 8
         return min(100, score)
+
 class HighEndNewsAnalyzer:
     """高端新闻流分析器：热点抽取、流量评分、板块映射、AI 投研。"""
     def __init__(self):
         pass
+
     def analyze(self, items, stock_code="", use_ai=True, mode="标准"):
         topics = self.extract_topics(items)
         sector_view = self.build_sector_view(items, topics)
@@ -3045,6 +3304,7 @@ class HighEndNewsAnalyzer:
         else:
             ai_report = self.fallback_ai_report(sector_view, flow, risk, candidate_stocks)
         return {"topics": topics, "sector_view": sector_view, "flow": flow, "risk": risk, "candidate_stocks": candidate_stocks, "ai_report": ai_report}
+
     def extract_topics(self, items):
         counter = Counter()
         for item in items:
@@ -3057,8 +3317,10 @@ class HighEndNewsAnalyzer:
         for kw, cnt in counter.most_common(15):
             topics.append({"topic": kw, "heat": cnt * 10, "cross_platform": self._count_platform_for_kw(items, kw)})
         return topics
+
     def _count_platform_for_kw(self, items, kw):
         return len(set([i.get("platform", "未知") for i in items if kw.lower() in f"{i.get('title','')} {i.get('summary','')}".lower()]))
+
     def build_sector_view(self, items, topics):
         sector_counter = Counter()
         sector_sources = {}
@@ -3076,6 +3338,7 @@ class HighEndNewsAnalyzer:
                 "候选标的": "、".join([s["name"] for s in NEWS_SECTOR_STOCK_POOL.get(sec, [])[:3]])
             })
         return rows
+
     def calc_flow_score(self, items, topics):
         source_count = len(set([i.get("platform", "未知") for i in items]))
         avg_impact = sum([safe_float(i.get("impact_score")) for i in items]) / max(1, len(items))
@@ -3094,6 +3357,7 @@ class HighEndNewsAnalyzer:
             level = "低热度"
             stage = "低位潜伏期"
         return {"score": score, "level": level, "stage": stage, "source_count": source_count, "item_count": len(items)}
+
     def calc_risk(self, items, flow):
         risk_words = ["减持", "立案", "处罚", "亏损", "退市", "监管", "暴跌", "调查", "风险", "澄清"]
         risk_hits = []
@@ -3104,6 +3368,7 @@ class HighEndNewsAnalyzer:
         risk_score = min(100, len(risk_hits) * 12 + (20 if flow.get("stage") == "高潮扩散期" else 0))
         level = "高" if risk_score >= 65 else "中" if risk_score >= 35 else "低"
         return {"risk_score": risk_score, "risk_level": level, "risk_factors": risk_hits[:8]}
+
     def build_candidate_stocks(self, sector_view):
         out = []
         rank = 1
@@ -3113,6 +3378,7 @@ class HighEndNewsAnalyzer:
                 out.append({"rank": rank, "code": stock["code"], "name": stock["name"], "sector": sec, "reason": f"新闻流量映射到{sec}，板块热度分{row.get('热度分')}"})
                 rank += 1
         return out[:10]
+
     def run_ai_agents(self, items, topics, sector_view, flow, risk, candidate_stocks, stock_code, mode):
         compact_news = "\n".join([f"- [{i.get('platform')}/{i.get('source')}] {i.get('title')}" for i in items[:35]])
         topics_text = json.dumps(topics[:12], ensure_ascii=False)
@@ -3121,6 +3387,7 @@ class HighEndNewsAnalyzer:
         risk_text = json.dumps(risk, ensure_ascii=False)
         prompt = f"""
 你是顶级对冲基金的A股新闻流情报官。请基于以下数据生成【高端情报终端报告】。
+
 【分析模式】{mode}
 【关注个股】{stock_code or '无'}
 【流量状态】{json.dumps(flow, ensure_ascii=False)}
@@ -3130,6 +3397,7 @@ class HighEndNewsAnalyzer:
 【风险信号】{risk_text}
 【新闻流】
 {compact_news}
+
 请按以下结构输出，禁止空话：
 1. 📡 情报总览：今天新闻流的主线是什么，处于潜伏/发酵/高潮/退潮哪个阶段。
 2. 🔥 题材与板块映射：列出3-5条最可能影响A股的题材链条。
@@ -3140,6 +3408,7 @@ class HighEndNewsAnalyzer:
 """
         report = call_ai(prompt, temperature=0.25)
         return {"chief_report": report}
+
     def fallback_ai_report(self, sector_view, flow, risk, candidate_stocks):
         lines = [f"当前新闻流量等级：{flow.get('level')}，阶段：{flow.get('stage')}，风险等级：{risk.get('risk_level')}。"]
         if sector_view:
@@ -3147,9 +3416,11 @@ class HighEndNewsAnalyzer:
         if candidate_stocks:
             lines.append("候选股票：" + "、".join([f"{x['name']}({x['code']})" for x in candidate_stocks[:6]]))
         return {"chief_report": "\n\n".join(lines)}
+
 def render_high_end_news_terminal():
     st.markdown("#### 🛰️ 高端情报终端 Pro")
     st.write("整合全网快讯、公告、个股新闻、题材映射、风险雷达与 AI 多智能体研判，用来判断新闻流对 A 股板块和个股的影响。")
+
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         stock_code = st.text_input("关注个股代码（可选）", placeholder="例如：300750", key="news_stock_code")
@@ -3157,39 +3428,47 @@ def render_high_end_news_terminal():
         max_items = st.slider("情报数量", 20, 120, 60, 10)
     with c3:
         mode = st.selectbox("情报模式", ["标准", "深度", "极速"], index=0)
+
     c4, c5 = st.columns([1, 1])
     with c4:
         include_wencai = st.checkbox("启用问财个股新闻/公告（可能较慢）", value=False)
     with c5:
         use_ai_news = st.checkbox("生成 AI 情报报告", value=True)
+
     if st.button("🚀 启动高端情报扫描", type="primary", width="stretch"):
         if use_ai_news and not api_key:
             st.warning("未配置 GROQ_API_KEY，将只展示规则引擎分析。")
             use_ai_news = False
+
         with st.spinner("正在抓取新闻流、公告流与财经快讯..."):
             fetcher = HighEndNewsFetcher(max_items=max_items)
             raw = fetcher.collect(stock_code=stock_code.strip(), max_items=max_items, include_wencai=include_wencai)
             items = raw.get("items", [])
+
         if not items:
             st.error("未获取到有效新闻数据。可能是云端接口受限，请稍后再试或关闭问财选项。")
             if raw.get("errors"):
                 with st.expander("查看错误详情"):
                     st.write(raw.get("errors"))
             return
+
         analyzer = HighEndNewsAnalyzer()
         with st.spinner("正在进行题材识别、板块映射与风险雷达计算..."):
             res = analyzer.analyze(items, stock_code=stock_code.strip(), use_ai=use_ai_news, mode=mode)
+
         flow = res.get("flow", {})
         risk = res.get("risk", {})
         st.success(f"情报扫描完成：共获取 {len(items)} 条有效信息。")
         if raw.get("errors"):
             with st.expander("数据源提示 / 失败记录", expanded=False):
                 st.write("\n".join(raw.get("errors", [])[-20:]))
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("新闻流量分", f"{flow.get('score', 0)}")
         m2.metric("流量阶段", flow.get("stage", "未知"))
         m3.metric("风险等级", risk.get("risk_level", "未知"), f"{risk.get('risk_score', 0)}")
         m4.metric("数据源数量", f"{flow.get('source_count', 0)}")
+
         tab_a, tab_b, tab_c, tab_d, tab_e, tab_f = st.tabs(["📌 首席结论", "🔥 热点话题", "🏭 板块映射", "🎯 股票观察池", "⚠️ 风险雷达", "🧾 原始情报"])
         with tab_a:
             st.markdown(res.get("ai_report", {}).get("chief_report", "暂无报告"))
@@ -3227,13 +3506,16 @@ def render_high_end_news_terminal():
             df_items = pd.DataFrame(items)
             show_cols = [c for c in show_cols if c in df_items.columns]
             st.dataframe(df_items[show_cols], width="stretch", hide_index=True)
+
     with st.expander("📚 查看最近情报运行记录", expanded=False):
         hist = HighEndNewsDB().recent_runs(10)
         if hist is not None and not hist.empty:
             st.dataframe(hist, width="stretch", hide_index=True)
         else:
             st.info("暂无历史记录。")
+
 # ================= 高端新闻情报终端模块结束 =================
+
 st.markdown("### 🌍 宏观市场实时看板")
 pulse_data = get_market_pulse()
 if pulse_data:
@@ -3257,6 +3539,7 @@ if pulse_data:
 else:
     st.info("宏观看板暂未取得实时数据，但不会影响下方功能使用。")
 st.markdown("<br>", unsafe_allow_html=True)
+
 # ================= 终端功能选项卡 =================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
@@ -3267,10 +3550,11 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🐋 主力资金",
     "🛰️ 新闻情报"
 ])
+
 # ================= Tab 1: 个股解析 =================
 with tab1:
     with st.container(border=True):
-        st.markdown("#### 🔎 个股解析（多维买卖点测算）")
+        st.markdown("#### 🔎 个股解析（多维买卖点测算版）")
         col1, col2 = st.columns([1, 1])
         with col1:
             symbol_input = st.text_input("标的代码", placeholder="例：600519")
@@ -3292,14 +3576,16 @@ with tab1:
                     name, price, pct = quote["name"], quote["price"], quote["pct"]
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric(f"{name}", f"{price:.2f}", f"{pct:.2f}%")
-                    c2.metric("总市值(亿)", f"{quote['market_cap']:.1f}")
-                    c3.metric("动态 PE", f"{quote['pe']}")
-                    c4.metric("换手率", f"{quote['turnover']:.2f}%")
+                    c2.metric("总市值(亿)", fmt_num(quote.get("market_cap"), 1))
+                    c3.metric("动态 PE", fmt_metric_value(quote.get("pe"), 2))
+                    c4.metric("换手率", f"{fmt_num(quote.get("turnover"), 2)}%")
                     st.caption(f"行情数据源链路：{quote.get('source', '未知')}｜完整度评分：{quote.get('quality_score', 0)}/10｜{quote.get('fundamental_warning', '')}")
+
                     # 新增：先给出结构化评分和交易计划，再进入详细技术图与 AI 解读
                     assessment = score_stock_analysis(quote, df_kline, mtf)
                     render_score_panel(assessment)
                     render_trade_plan_card(assessment)
+
                     if df_kline is None or len(df_kline) < 15:
                         st.warning("获取到的有效 K 线极少，仅能通过最新行情进行轻量化推演。")
                         with st.spinner("🧠 首席策略官撰写资产评估报告..."):
@@ -3320,6 +3606,7 @@ with tab1:
                         smc = tech["smc"]
                         fig = build_price_figure(df_kline)
                         st.plotly_chart(fig, width="stretch")
+
                         st.markdown("##### 🔬 核心技术指标与阻力测算")
                         t1, t2, t3, t4 = st.columns(4)
                         t1.metric("趋势", tech["trend"])
@@ -3331,6 +3618,7 @@ with tab1:
                         t6.metric("量能状态", tech["vol_state"])
                         t7.metric("BOS", tech["bos_state"])
                         t8.metric("流动性扫盘", tech["sweep_state"])
+
                         st.markdown("##### 🧩 FVG / ICT / SMC 结构信息")
                         f1, f2 = st.columns(2)
                         with f1:
@@ -3353,6 +3641,7 @@ with tab1:
                                 st.error(f"最近空头 OB：{smc['latest_bear_ob']['date']} | 区间 {smc['latest_bear_ob']['bottom']:.2f} - {smc['latest_bear_ob']['top']:.2f}")
                             else:
                                 st.info("最近未检测到明显空头 OB")
+
                         st.markdown("##### 🏗️ 市场结构补充")
                         s1, s2, s3 = st.columns(3)
                         eqh_count = len(smc["eqh"]) if smc["eqh"] else 0
@@ -3362,6 +3651,7 @@ with tab1:
                         s2.metric("EQH / EQL", f"{eqh_count} / {eql_count}")
                         s3.metric("P/D Zone", pd_zone)
                         latest_close = tech["latest_close"]
+
                         support_zone = min(tech["ema_short"], tech["ema_mid"])
                         pressure_zone = max(tech["ema_short"], tech["ema_mid"])
                         st.markdown("##### 🎯 动态支撑 / 压力")
@@ -3369,6 +3659,7 @@ with tab1:
                         z1.metric("最新收盘", f"{latest_close:.2f}")
                         z2.metric("动态支撑参考", f"{support_zone:.2f}")
                         z3.metric("动态压力参考", f"{pressure_zone:.2f}")
+
                     st.markdown("##### ⏱️ 多周期技术分析")
                     st.caption(f"数据质量：{mtf.get('data_quality', '未知')}｜综合分：{mtf.get('score', 0)}")
                     m1, m2, m3 = st.columns(3)
@@ -3378,6 +3669,7 @@ with tab1:
                         render_tf_card(mtf["60m"], "60分钟级别")
                     with m3:
                         render_tf_card(mtf["120m"], "120分钟级别")
+
                     st.markdown("##### 🧠 多周期综合结论")
                     v1, v2, v3, v4 = st.columns(4)
                     v1.metric("综合结论", mtf.get("final_view", "无法判断"))
@@ -3385,6 +3677,7 @@ with tab1:
                     v3.metric("关键支撑", f"{mtf['key_support']:.2f}" if mtf.get("key_support") is not None else "N/A")
                     v4.metric("关键压力", f"{mtf['key_pressure']:.2f}" if mtf.get("key_pressure") is not None else "N/A")
                     st.info(f"综合结论：**{mtf.get('final_view', '无法判断')}**；执行建议：**{mtf.get('action', '等待确认')}**")
+
                     # 新增：量化交易计划卡片，便于直接转化为盘中观察点
                     st.markdown("##### 🎯 交易计划辅助")
                     current_px = mtf.get("current_close") or price
@@ -3407,6 +3700,7 @@ with tab1:
                             st.info("盈亏比中性，适合小仓位观察或等待更清晰信号。")
                     else:
                         st.warning("关键支撑/压力尚不完整，建议先以日线结构和成交量为主。")
+
                     # 新增：多周期结构明细表，方便手机端复制与复盘
                     tf_table = pd.DataFrame([
                         {
@@ -3444,6 +3738,7 @@ with tab1:
                         }
                     ])
                     st.dataframe(tf_table, width="stretch", hide_index=True)
+
                     with st.spinner(f"🧠 首席策略官正在使用 {selected_model} 进行多维深度解构..."):
                         if df_kline is not None and len(df_kline) >= 15:
                             tech = summarize_technicals(add_indicators(df_kline))
@@ -3514,31 +3809,40 @@ with tab1:
 5. 最后一行给明确结论：看多 / 观察 / 谨慎 / 偏空
 """
                             st.markdown(call_ai(prompt))
+
     st.markdown("---")
     with st.container(border=True):
         render_watchlist_scanner()
+
 # ================= Tab 2: 宏观大盘推演 (已升级为多智能体版本) =================
 with tab2:
     with st.container(border=True):
         st.markdown("#### 📊 全局宏观基本面推演")
         display_macro_analysis_ui()
+
+
 # ================= Tab 3: 热点资金板块 =================
 with tab3:
     with st.container(border=True):
-        st.markdown("#### 🔥 资金热点板块")
-        st.write("追踪全天涨幅最猛的行业板块，揪出领涨龙头，识别主线题材，并生成配置标的清单。")
+        st.markdown("#### 🔥 资金热点板块（附实战标的推荐）")
+        st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时会自动使用缓存或观察池兜底。")
         if st.button("扫描板块与生成配置推荐", type="primary"):
-            if not api_key:
-                st.error("配置缺失: GROQ_API_KEY")
-            else:
-                with st.spinner("深潜获取东方财富板块异动数据... (若遇熔断将自动切换备用数据源)"):
-                    blocks = get_hot_blocks()
-                    if blocks:
-                        df_blocks = pd.DataFrame(blocks)
-                        st.dataframe(df_blocks, width="stretch", hide_index=True)
-                        with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
-                            blocks_str = "\n".join([f"{b['板块名称']} (涨幅:{b['涨跌幅']}%, 领涨龙头:{b['领涨股票']})" for b in blocks[:5]])
-                            prompt = f"""
+            with st.spinner("正在获取板块异动数据...（实时源失败时自动使用缓存或观察池）"):
+                blocks = get_hot_blocks()
+            if blocks:
+                df_blocks = pd.DataFrame(blocks)
+                st.dataframe(df_blocks, width="stretch", hide_index=True)
+                source_set = "、".join(sorted({str(b.get("数据源", "未知")) for b in blocks}))
+                st.caption(f"板块数据源：{source_set}。若显示为“缓存回显”或“内置观察池”，说明实时接口暂时不稳定，但页面仍可继续分析。")
+                if not api_key:
+                    st.info("未配置 GROQ_API_KEY，已展示板块数据；配置后可生成 AI 配置建议。")
+                else:
+                    with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
+                        blocks_str = "\n".join([
+                            f"{b.get('板块名称', '-')} (涨幅:{b.get('涨跌幅', 0)}%, 领涨龙头:{b.get('领涨股票', '-')}, 数据源:{b.get('数据源', '-')})"
+                            for b in blocks[:5]
+                        ])
+                        prompt = f"""
 作为顶级游资操盘手，请深度解读今日最强的 5 个板块及其领涨龙头：
 {blocks_str}
 请输出：
@@ -3551,9 +3855,10 @@ with tab3:
    - 核心配置理由
    - 建议的入场姿势
 """
-                            st.markdown(call_ai(prompt, temperature=0.4))
-                    else:
-                        st.error("获取板块数据失败，所有接口均处于熔断保护期。")
+                        st.markdown(call_ai(prompt, temperature=0.4))
+            else:
+                st.warning("实时板块接口、缓存和内置观察池均未返回结果。请稍后重试。")
+
 # ================= Tab 4: 高阶情报终端 =================
 with tab4:
     st.markdown("#### 📡 机构级事件图谱与智能评级矩阵")
@@ -3595,11 +3900,13 @@ with tab4:
                         report = call_ai(prompt, temperature=0.2)
                         st.markdown("---")
                         st.markdown(report)
+
 # ================= Tab 5: 智瞰龙虎榜解析 =================
 with tab5:
     with st.container(border=True):
         st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 2.0")
         st.write("整合龙虎榜数据采集、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。")
+
         col_date, col_lookback, col_depth = st.columns([1, 1, 1])
         with col_date:
             lhb_date = st.date_input("选择龙虎榜日期", datetime.now() - timedelta(days=1))
@@ -3607,12 +3914,15 @@ with tab5:
             lookback_days = st.slider("无数据时自动回溯天数", 3, 20, 10, 1)
         with col_depth:
             ai_depth = st.selectbox("AI 分析深度", ["标准", "深度"], index=0, help="标准更快：个股潜力+风险控制+首席策略；深度会增加游资画像和题材追踪。")
+
         col_opt1, col_opt2 = st.columns([1, 1])
         with col_opt1:
             run_ai_lhb = st.checkbox("生成 AI 分析报告", value=True, help="关闭后只显示数据、评分和候选股票，速度最快。")
         with col_opt2:
             show_raw_lhb = st.checkbox("显示原始明细数据", value=False)
+
         run_lhb_btn = st.button("🚀 启动智瞰龙虎分析集群", type="primary", width="stretch")
+
         if run_lhb_btn:
             if run_ai_lhb and not api_key:
                 st.error("配置缺失: GROQ_API_KEY。你可以先关闭“生成 AI 分析报告”，只查看龙虎榜数据和量化评分。")
@@ -3626,6 +3936,7 @@ with tab5:
                         ai_depth=ai_depth,
                         run_ai=run_ai_lhb,
                     )
+
                 if not res.get("success"):
                     st.error(f"未能获取到 {date_str} 及最近 {lookback_days} 天的龙虎榜数据。可能是 API 受限、云端访问不稳定，或近期无交易日数据。")
                     with st.expander("查看失败明细", expanded=False):
@@ -3637,23 +3948,28 @@ with tab5:
                     summary = info.get("summary", {})
                     df_lhb = res.get("dataframe", pd.DataFrame())
                     scoring_df = res.get("scoring_ranking", pd.DataFrame())
+
                     if used_date != date_str:
                         st.warning(f"{date_str} 未获取到有效龙虎榜数据，已自动切换到最近可用日期：{used_date}。")
                     st.success(f"✓ 成功获取 {used_date} 的龙虎榜数据。数据源：{source}。")
+
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("记录总数", f"{info.get('total_records', 0)}")
                     m2.metric("涉及股票", f"{info.get('total_stocks', 0)}")
                     m3.metric("涉及游资", f"{info.get('total_youzi', 0)}")
                     m4.metric("净流入合计", f"{safe_float(summary.get('total_net_inflow'))/100000000:.2f} 亿")
+
                     if res.get("errors"):
                         with st.expander("查看数据源回溯记录", expanded=False):
                             st.write("\n".join(res.get("errors", [])[-30:]))
+
                     st.markdown("### 🧮 智瞰量化评分排名")
                     if scoring_df is not None and not scoring_df.empty:
                         display_cols = [c for c in ["股票代码", "股票名称", "智瞰评分", "信号标签", "净流入金额", "买入金额", "卖出金额", "上榜次数", "游资数量", "概念"] if c in scoring_df.columns]
                         st.dataframe(scoring_df[display_cols].head(20), width="stretch", hide_index=True)
                     else:
                         st.info("暂无可评分数据。")
+
                     st.markdown("### 🎯 次日重点观察池")
                     recs = res.get("recommended_stocks", [])
                     if recs:
@@ -3661,9 +3977,11 @@ with tab5:
                         st.dataframe(rec_df, width="stretch", hide_index=True)
                     else:
                         st.info("暂无推荐候选。")
+
                     tab_overview, tab_youzi, tab_stock, tab_theme, tab_risk, tab_chief, tab_raw = st.tabs([
                         "📊 数据概况", "🎯 游资画像", "📈 个股潜力", "🔥 题材追踪", "⚠️ 风险控制", "👔 首席策略", "🧾 明细数据"
                     ])
+
                     with tab_overview:
                         c1, c2 = st.columns(2)
                         with c1:
@@ -3680,6 +3998,7 @@ with tab5:
                                 st.dataframe(pd.DataFrame([{"概念": k, "出现次数": v} for k, v in hot_concepts.items()]), width="stretch", hide_index=True)
                             else:
                                 st.info("当前数据源未提供明确概念字段。")
+
                     agents = res.get("agents_analysis", {})
                     with tab_youzi:
                         if agents.get("youzi"):
@@ -3718,8 +4037,10 @@ with tab5:
                         else:
                             st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
 # ================= Tab 6: 主力资金选股 =================
+
 with tab6:
     render_main_force_tab()
+
 # ================= Tab 7: 高端情报终端 Pro =================
 with tab7:
     with st.container(border=True):
