@@ -4863,7 +4863,21 @@ def _loads_json_or_jsonp(text: str):
         return json.loads(m.group(1))
     return None
 
-def fetch_eastmoney_native(url, params=None, timeout=10, retries=2, cache_key=None, cache_ttl=1800, referer=None, silent=True):
+_EASTMONEY_LAST_REQUEST_AT = 0.0
+
+def _eastmoney_rate_limit(min_interval=0.55):
+    """严格按说明文档控制东财访问频率：同一进程约不超过 2 次/秒。"""
+    global _EASTMONEY_LAST_REQUEST_AT
+    try:
+        now = time.time()
+        wait = float(min_interval) - (now - float(_EASTMONEY_LAST_REQUEST_AT or 0.0))
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.03, 0.18))
+        _EASTMONEY_LAST_REQUEST_AT = time.time()
+    except Exception:
+        time.sleep(random.uniform(0.5, 1.0))
+
+def fetch_eastmoney_native(url, params=None, timeout=10, retries=2, cache_key=None, cache_ttl=3600, referer=None, silent=True):
     """东方财富原生请求：专用 headers + JSONP 清洗 + 熔断 + 真实缓存。"""
     if params:
         sep = "&" if "?" in url else "?"
@@ -4881,6 +4895,7 @@ def fetch_eastmoney_native(url, params=None, timeout=10, retries=2, cache_key=No
             headers = _eastmoney_headers(url, referer or "https://quote.eastmoney.com/center/gridlist.html")
             # 每次轻微变换 UA，降低云端重复请求被拦截概率
             headers["User-Agent"] = random.choice(USER_AGENTS) if "USER_AGENTS" in globals() else headers["User-Agent"]
+            _eastmoney_rate_limit(0.55)
             res = SESSION.get(url, headers=headers, timeout=(4, timeout), verify=False)
             if res.status_code in (403, 429, 502, 503, 504):
                 last_err = f"HTTP {res.status_code}"
@@ -4914,7 +4929,7 @@ def _em_market_fs(include_bj=True):
     fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
     return fs if include_bj else "m:0+t:6,m:0+t:80,m:1+t:2"
 
-def _em_clist(fields=None, fid="f3", pz_list=(5000, 3000, 1200, 600, 260), fs=None, cache_key="em_clist_core", cache_ttl=1800):
+def _em_clist(fields=None, fid="f3", pz_list=(5000, 3000, 1200, 600, 260), fs=None, cache_key="em_clist_core", cache_ttl=3600):
     """东财全市场 clist。先按说明文档 pz=5000 获取全量，失败后降级，避免页面空白。"""
     fields = fields or "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
     fs = fs or _em_market_fs(include_bj=True)
@@ -4945,7 +4960,7 @@ def _em_clist(fields=None, fid="f3", pz_list=(5000, 3000, 1200, 600, 260), fs=No
         time.sleep(random.uniform(0.35, 0.9))
     return [], f"东方财富 clist 未返回有效数据：{last_msg}"
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_em_spot_snapshot_map() -> dict:
     """东方财富全市场快照 v7.1：按说明文档补齐 f100/f62/f184/f23。"""
     fields = "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
@@ -5016,16 +5031,34 @@ def _quote_from_em_single(symbol: str) -> dict | None:
     return _quote_from_eastmoney_single_v7(symbol)
 
 def _em_fundflow_daykline(symbol: str, days=10):
-    """东财个股资金流向历史 K 线：/api/qt/stock/fflow/daykline/get。"""
+    """东财个股资金流向历史 K 线：严格优先使用说明文档 push2 路径，push2his 仅作同源备用。"""
     symbol = str(symbol).zfill(6)
-    base = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    bases = [
+        "https://push2.eastmoney.com/api/qt/stock/fflow/daykline/get",
+        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+    ]
     params = {
         "secid": _secid_for_symbol(symbol),
         "ut": "7eea3edcaed734bea9cbfc24409ed989",
         "fields1": "f1,f2,f3",
         "fields2": "f51,f52,f53,f54,f55",
     }
-    data = fetch_eastmoney_native(base, params=params, timeout=10, retries=2, cache_key=f"em_fflow_{symbol}", cache_ttl=3600, referer=f"https://quote.eastmoney.com/{'sh' if symbol.startswith('6') else 'sz'}{symbol}.html")
+    data = None
+    last_source = ""
+    for base in bases:
+        data = fetch_eastmoney_native(
+            base,
+            params=params,
+            timeout=10,
+            retries=2,
+            cache_key=f"em_fflow_{symbol}_{urlparse(base).netloc}",
+            cache_ttl=3600,
+            referer=f"https://quote.eastmoney.com/{'sh' if symbol.startswith('6') else 'sz'}{symbol}.html",
+        )
+        klines = data.get("data", {}).get("klines", []) if isinstance(data, dict) else []
+        if klines:
+            last_source = "东方财富push2个股资金流历史K" if "push2.eastmoney.com" in base else "东方财富push2his个股资金流历史K"
+            break
     klines = data.get("data", {}).get("klines", []) if isinstance(data, dict) else []
     rows = []
     for line in klines[-int(days):]:
@@ -5037,7 +5070,7 @@ def _em_fundflow_daykline(symbol: str, days=10):
                 "小单净流入": safe_float(parts[2], 0),
                 "中单净流入": safe_float(parts[3], 0),
                 "大单净流入": safe_float(parts[4], 0),
-                "数据源": "东方财富个股资金流历史K",
+                "数据源": last_source or "东方财富个股资金流历史K",
             })
     return pd.DataFrame(rows)
 
@@ -5133,7 +5166,7 @@ def _normalize_em_block_from_clist(rows):
     cols = ["板块名称", "热点分", "涨跌幅", "主力净流入", "上涨家数", "下跌家数", "领涨股票", "数据源"]
     return out[cols].to_dict("records")
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_hot_blocks():
     """资金热点 v7.1：AKShare板块资金 + 东财clist f100/f62/f184聚合；失败用真实缓存。"""
     cache_path = _cache_file("blocks", f"hot_blocks_v71_{datetime.now().strftime('%Y%m%d')}.json")
@@ -5283,7 +5316,7 @@ except Exception:
 def render_eastmoney_doc_status():
     """调试模式下展示本次东财专项优化启用状态。"""
     if DEBUG_MODE:
-        st.caption("东方财富 v7.1 已启用：clist(f12/f14/f2/f9/f23/f62/f184/f100) + fflow/daykline + datacenter龙虎榜 + JSONP清洗 + Host/Referer伪装 + pz降级 + 真实缓存。")
+        st.caption("东方财富 v8.1 已启用：严格按说明文档配置 clist(f12/f14/f2/f9/f23/f62/f184/f100)、push2 fflow/daykline、datacenter 龙虎榜、Host/Referer/User-Agent、JSONP清洗、≤2次/秒限速、@st.cache_data(ttl=3600)、pz降级与真实缓存。")
 
 
 
