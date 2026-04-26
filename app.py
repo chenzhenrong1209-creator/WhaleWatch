@@ -12,12 +12,6 @@ import pywencai
 import akshare as ak
 import tushare as ts
 import baostock as bs
-try:
-    import jqdatasdk as jq
-    JQDATA_SDK_AVAILABLE = True
-except Exception:
-    jq = None
-    JQDATA_SDK_AVAILABLE = False
 import random
 import time
 from datetime import datetime, timedelta
@@ -66,407 +60,11 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.5.1-JQDATA-STABLE-PANELS | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v6.4.4-DATA-GUARD | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
 api_key = st.secrets.get("GROQ_API_KEY", "")
-
-
-def get_tushare_token_from_secrets():
-    """只从 Streamlit Secrets 读取 Tushare Token，避免把 token 写在代码或页面输入框里。"""
-    for key in ["TUSHARE_TOKEN", "TUSHARE_API_KEY", "TS_TOKEN", "tushare_token"]:
-        try:
-            val = st.secrets.get(key, "")
-            if val:
-                return str(val).strip()
-        except Exception:
-            pass
-    try:
-        section = st.secrets.get("tushare", {})
-        if isinstance(section, dict):
-            val = section.get("token") or section.get("api_key")
-            if val:
-                return str(val).strip()
-    except Exception:
-        pass
-    return ""
-
-ts_token = get_tushare_token_from_secrets()
-if ts_token:
-    ts.set_token(ts_token)
-
-
-# ================= JQData / 聚宽数据源 =================
-def get_jqdata_credentials_from_secrets():
-    """从 Streamlit Secrets 读取 JQData 账号密码。支持顶层或 [jqdata] 分组。"""
-    username_keys = ["JQDATA_USERNAME", "JQDATA_USER", "JQDATA_ACCOUNT", "JQ_USERNAME", "JQ_ACCOUNT", "jqdata_username"]
-    password_keys = ["JQDATA_PASSWORD", "JQDATA_PASS", "JQ_PASSWORD", "JQ_PASS", "jqdata_password"]
-    username = ""
-    password = ""
-    for key in username_keys:
-        try:
-            val = st.secrets.get(key, "")
-            if val:
-                username = str(val).strip()
-                break
-        except Exception:
-            pass
-    for key in password_keys:
-        try:
-            val = st.secrets.get(key, "")
-            if val:
-                password = str(val).strip()
-                break
-        except Exception:
-            pass
-    try:
-        section = st.secrets.get("jqdata", {})
-        if isinstance(section, dict):
-            username = username or str(section.get("username") or section.get("user") or section.get("account") or "").strip()
-            password = password or str(section.get("password") or section.get("pass") or "").strip()
-    except Exception:
-        pass
-    return username, password
-
-jq_username, jq_password = get_jqdata_credentials_from_secrets()
-
-
-def to_jq_code(symbol: str) -> str:
-    """A股六位代码转 JQData 证券代码。"""
-    symbol = str(symbol).strip().zfill(6)
-    if symbol.startswith(("6", "9", "5", "7")):
-        return f"{symbol}.XSHG"
-    return f"{symbol}.XSHE"
-
-
-def from_jq_code(jq_code: str) -> str:
-    return str(jq_code).split(".")[0].zfill(6)
-
-
-@st.cache_resource(show_spinner=False)
-def jqdata_auth_cached(username: str, password: str):
-    """JQData 登录只做一次缓存，避免每次刷新页面重复认证。"""
-    if not JQDATA_SDK_AVAILABLE:
-        return False, "未安装 jqdatasdk，请在 requirements.txt 添加 jqdatasdk>=1.9.7"
-    if not username or not password:
-        return False, "未在 Streamlit Secrets 中配置 JQData 账号密码"
-    try:
-        jq.auth(username, password)
-        return True, "JQData 登录成功"
-    except Exception as exc:
-        return False, f"JQData 登录失败：{exc}"
-
-
-def ensure_jqdata_auth():
-    return jqdata_auth_cached(jq_username, jq_password)
-
-
-def get_latest_trade_date_for_data(max_lookback=12):
-    today = datetime.now()
-    return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(max_lookback)]
-
-
-def _fetch_jq_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
-    """JQData 日K：真实接口数据，不做估算。"""
-    ok, msg = ensure_jqdata_auth()
-    if not ok:
-        if globals().get("DEBUG_MODE", False):
-            st.caption(msg)
-        return None
-    try:
-        jq_code = to_jq_code(symbol)
-        df = jq.get_price(
-            jq_code,
-            end_date=datetime.now().strftime("%Y-%m-%d"),
-            count=int(days) + 40,
-            frequency="daily",
-            fields=["open", "close", "high", "low", "volume", "money"],
-            fq="pre",
-            panel=False,
-        )
-        if df is None or df.empty:
-            return None
-        df = df.reset_index().rename(columns={"index": "date", "money": "amount"})
-        if "time" in df.columns and "date" not in df.columns:
-            df = df.rename(columns={"time": "date"})
-        return _normalize_daily_kline(df, days=days)
-    except Exception as exc:
-        if globals().get("DEBUG_MODE", False):
-            st.caption(f"JQData 日K失败 {symbol}: {exc}")
-        return None
-
-
-def _quote_from_jqdata(symbol: str) -> dict | None:
-    """JQData 最新日线行情/基础资料。注意：这是最新交易日收盘数据，不伪装为盘中实时行情。"""
-    ok, msg = ensure_jqdata_auth()
-    if not ok:
-        if globals().get("DEBUG_MODE", False):
-            st.caption(msg)
-        return None
-    try:
-        jq_code = to_jq_code(symbol)
-        df = jq.get_price(
-            jq_code,
-            end_date=datetime.now().strftime("%Y-%m-%d"),
-            count=2,
-            frequency="daily",
-            fields=["open", "close", "high", "low", "volume", "money"],
-            fq="pre",
-            panel=False,
-        )
-        if df is None or df.empty:
-            return None
-        df = df.reset_index()
-        close = safe_float(df.iloc[-1].get("close"), 0)
-        prev_close = safe_float(df.iloc[-2].get("close"), 0) if len(df) >= 2 else 0
-        pct = ((close - prev_close) / prev_close * 100) if prev_close > 0 else 0
-        name = ""
-        try:
-            info = jq.get_security_info(jq_code)
-            name = getattr(info, "display_name", "") or getattr(info, "name", "") or ""
-        except Exception:
-            pass
-        return {
-            "symbol": symbol,
-            "name": name,
-            "price": close,
-            "pct": pct,
-            "turnover": 0.0,
-            "market_cap": 0.0,
-            "pe": "-",
-            "pb": "-",
-            "source": "JQData最新交易日日线",
-        }
-    except Exception as exc:
-        if globals().get("DEBUG_MODE", False):
-            st.caption(f"JQData 个股行情失败 {symbol}: {exc}")
-        return None
-
-
-
-def _jq_get_stock_universe(max_stocks=5000):
-    """JQData 股票池：只取真实聚宽证券列表，过滤 ST/退市。"""
-    ok, msg = ensure_jqdata_auth()
-    if not ok:
-        return [], {}, msg
-    try:
-        sec = jq.get_all_securities(types=["stock"], date=datetime.now().strftime("%Y-%m-%d"))
-        if sec is None or sec.empty:
-            return [], {}, "JQData get_all_securities 返回空"
-        sec = sec.reset_index().rename(columns={"index": "jq_code"})
-        name_col = "display_name" if "display_name" in sec.columns else "name" if "name" in sec.columns else None
-        if name_col:
-            sec = sec[~sec[name_col].astype(str).str.contains("ST|退", na=False)]
-        sec = sec[sec["jq_code"].astype(str).str.contains("XSHG|XSHE", na=False)]
-        if max_stocks:
-            sec = sec.head(int(max_stocks))
-        names = dict(zip(sec["jq_code"].astype(str), sec[name_col].astype(str))) if name_col else {}
-        return sec["jq_code"].astype(str).tolist(), names, f"JQData证券列表{len(sec)}只"
-    except Exception as exc:
-        return [], {}, f"JQData get_all_securities异常：{exc}"
-
-
-def _jq_get_industry_map(jq_codes, date=None):
-    """JQData 行业映射。接口/权限失败时不伪造，返回未分类。"""
-    out = {}
-    if not jq_codes:
-        return out
-    try:
-        info = jq.get_industry(jq_codes, date=date or datetime.now().strftime("%Y-%m-%d"))
-        if isinstance(info, dict):
-            for code, item in info.items():
-                name = "未分类"
-                if isinstance(item, dict):
-                    for key in ["sw_l1", "jq_l1", "zjw"]:
-                        v = item.get(key)
-                        if isinstance(v, dict):
-                            name = v.get("industry_name") or v.get("name") or name
-                        elif isinstance(v, str):
-                            name = v or name
-                        if name != "未分类":
-                            break
-                out[str(code)] = name
-    except Exception as exc:
-        if globals().get("DEBUG_MODE", False):
-            st.caption(f"JQData行业映射失败：{exc}")
-    return out
-
-
-def _jq_latest_price_frame(jq_codes, count=2, fields=None, end_date=None):
-    """JQData 批量最新日线，返回 panel=False 的标准 DataFrame。"""
-    ok, msg = ensure_jqdata_auth()
-    if not ok or not jq_codes:
-        return pd.DataFrame(), msg
-    fields = fields or ["open", "close", "high", "low", "volume", "money"]
-    try:
-        df = jq.get_price(jq_codes, end_date=end_date or datetime.now().strftime("%Y-%m-%d"), count=int(count), frequency="daily", fields=fields, fq="pre", panel=False)
-        if df is None or df.empty:
-            return pd.DataFrame(), "JQData get_price 返回空"
-        df = df.reset_index()
-        if "code" not in df.columns:
-            if "security" in df.columns:
-                df = df.rename(columns={"security": "code"})
-            elif "level_1" in df.columns:
-                df = df.rename(columns={"level_1": "code"})
-        if "time" not in df.columns:
-            if "index" in df.columns:
-                df = df.rename(columns={"index": "time"})
-            elif "level_0" in df.columns:
-                df = df.rename(columns={"level_0": "time"})
-        if "code" not in df.columns:
-            if len(jq_codes) == 1:
-                df["code"] = jq_codes[0]
-            else:
-                return pd.DataFrame(), "JQData get_price 缺少证券代码列"
-        df["jq_code"] = df["code"].astype(str)
-        if "time" in df.columns:
-            df["time"] = pd.to_datetime(df["time"], errors="coerce")
-        else:
-            df["time"] = pd.Timestamp.now()
-        return df.sort_values(["jq_code", "time"]), "JQData get_price 成功"
-    except Exception as exc:
-        return pd.DataFrame(), f"JQData get_price异常：{exc}"
-
-
-def _jq_snapshot_rows(max_stocks=5000):
-    """用 JQData 全市场最新交易日日线生成真实快照，不伪装为盘中实时。"""
-    jq_codes, names, msg = _jq_get_stock_universe(max_stocks=max_stocks)
-    if not jq_codes:
-        return pd.DataFrame(), msg
-    price_df, msg_price = _jq_latest_price_frame(jq_codes, count=2)
-    if price_df.empty:
-        return pd.DataFrame(), msg_price
-    ind_map = _jq_get_industry_map(jq_codes)
-    rows = []
-    for jq_code, g in price_df.groupby("jq_code"):
-        g = g.dropna(subset=["close"]).sort_values("time")
-        if g.empty:
-            continue
-        last = g.iloc[-1]
-        prev = g.iloc[-2] if len(g) >= 2 else last
-        close = safe_float(last.get("close"), 0)
-        prev_close = safe_float(prev.get("close"), 0)
-        pct = ((close - prev_close) / prev_close * 100) if close > 0 and prev_close > 0 else 0.0
-        code = from_jq_code(jq_code)
-        rows.append({"股票代码": code, "股票简称": names.get(jq_code, code), "所属行业": ind_map.get(jq_code, "未分类"), "区间涨跌幅": pct, "最新价": close, "成交额": safe_float(last.get("money"), 0), "成交量": safe_float(last.get("volume"), 0), "数据日期": str(last.get("time"))[:10], "数据源": "JQData最新交易日日线"})
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return pd.DataFrame(), "JQData价格快照无有效股票"
-    return out, f"JQData最新交易日行情成功获取{len(out)}只股票"
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_jqdata_hot_blocks(max_stocks=5000):
-    """JQData 全市场真实行情计算热点板块：行业平均涨幅、上涨占比、成交额、强势股数量。"""
-    snap, msg = _jq_snapshot_rows(max_stocks=max_stocks)
-    if snap.empty:
-        return [], msg
-    df = snap.copy()
-    df = df[df["所属行业"].astype(str).ne("未分类")]
-    df["区间涨跌幅"] = pd.to_numeric(df["区间涨跌幅"], errors="coerce").fillna(0)
-    df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce").fillna(0)
-    if df.empty:
-        return [], "JQData 行业映射为空，无法计算行业热点"
-    rows = []
-    for industry, g in df.groupby("所属行业"):
-        if len(g) < 3:
-            continue
-        up_cnt = int((g["区间涨跌幅"] > 0).sum())
-        down_cnt = int((g["区间涨跌幅"] < 0).sum())
-        strong_cnt = int((g["区间涨跌幅"] >= 5).sum())
-        avg_pct = float(g["区间涨跌幅"].mean())
-        up_ratio = up_cnt / len(g) * 100
-        amount_sum = float(g["成交额"].sum())
-        leader = g.sort_values("区间涨跌幅", ascending=False).iloc[0]
-        rows.append({"板块名称": industry, "涨跌幅": avg_pct, "上涨家数": up_cnt, "下跌家数": down_cnt, "领涨股票": f"{leader.get('股票简称', '-') }({leader.get('股票代码', '-')})", "成交额": amount_sum, "强势股数": strong_cnt, "上涨占比": up_ratio, "数据源": "JQData全市场真实行情计算"})
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return [], "JQData 计算后无有效行业热点"
-    out["成交额_rank"] = out["成交额"].rank(pct=True).fillna(0)
-    out["涨幅_rank"] = out["涨跌幅"].rank(pct=True).fillna(0)
-    out["上涨占比_rank"] = out["上涨占比"].rank(pct=True).fillna(0)
-    out["强势股_rank"] = out["强势股数"].rank(pct=True).fillna(0)
-    out["热点分"] = (out["涨幅_rank"] * 35 + out["上涨占比_rank"] * 25 + out["成交额_rank"] * 25 + out["强势股_rank"] * 15).round(2)
-    out = out.sort_values(["热点分", "涨跌幅", "成交额"], ascending=False).head(15)
-    keep = ["板块名称", "热点分", "涨跌幅", "上涨家数", "下跌家数", "上涨占比", "强势股数", "成交额", "领涨股票", "数据源"]
-    return out[keep].to_dict("records"), msg
-
-
-def _fetch_jqdata_moneyflow_pool(max_stocks=5000, trade_date=None):
-    """JQData 真实资金流池。主力净流入只取 JQData money_flow 原始字段/大单超大单字段，不做量价估算。"""
-    ok, msg = ensure_jqdata_auth()
-    if not ok:
-        return pd.DataFrame(), msg
-    securities, names, msg_uni = _jq_get_stock_universe(max_stocks=max_stocks)
-    if not securities:
-        return pd.DataFrame(), msg_uni
-    dates = [str(trade_date)] if trade_date else get_latest_trade_date_for_data(12)
-    mf = None
-    used_date = None
-    last_error = ""
-    for d in dates:
-        try:
-            try:
-                tmp = jq.get_money_flow(security_list=securities, start_date=d, end_date=d)
-            except TypeError:
-                tmp = jq.get_money_flow(securities, d, d)
-            if tmp is not None and not tmp.empty:
-                mf = tmp.copy()
-                used_date = d
-                break
-        except Exception as exc:
-            last_error = str(exc)
-    if mf is None or mf.empty:
-        return pd.DataFrame(), f"JQData money_flow 最近交易日返回空或账号无权限：{last_error}"
-    mf = mf.reset_index(drop=False)
-    code_col = None
-    for c in ["sec_code", "security", "code", "index"]:
-        if c in mf.columns:
-            code_col = c
-            break
-    if not code_col:
-        return pd.DataFrame(), f"JQData money_flow 返回字段中没有证券代码列：{list(mf.columns)}"
-    mf["jq_code"] = mf[code_col].astype(str).apply(lambda x: x if "." in x else to_jq_code(x[:6]))
-    mf["股票代码"] = mf["jq_code"].apply(from_jq_code)
-    mf["股票简称"] = mf["jq_code"].map(names).fillna(mf["股票代码"])
-    def pick_numeric(cols):
-        for c in cols:
-            if c in mf.columns:
-                return pd.to_numeric(mf[c], errors="coerce").fillna(0)
-        return pd.Series([0] * len(mf), index=mf.index, dtype="float64")
-    main_net = pick_numeric(["net_amount_main", "main_net_amount", "net_mf_amount", "net_amount"])
-    if main_net.abs().sum() == 0:
-        main_net = (pick_numeric(["buy_lg_amount"]) - pick_numeric(["sell_lg_amount"])) + (pick_numeric(["buy_elg_amount"]) - pick_numeric(["sell_elg_amount"]))
-    if main_net.abs().sum() == 0:
-        main_net = pick_numeric(["net_amount_l"]) + pick_numeric(["net_amount_xl"])
-    price_df, _ = _jq_latest_price_frame(mf["jq_code"].drop_duplicates().tolist(), count=2, end_date=used_date)
-    price_map_close, price_map_money, price_map_pct = {}, {}, {}
-    if not price_df.empty:
-        for jq_code, g in price_df.groupby("jq_code"):
-            g = g.dropna(subset=["close"]).sort_values("time")
-            if g.empty:
-                continue
-            last = g.iloc[-1]
-            prev = g.iloc[-2] if len(g) >= 2 else last
-            close = safe_float(last.get("close"), 0)
-            prev_close = safe_float(prev.get("close"), 0)
-            price_map_close[jq_code] = close
-            price_map_money[jq_code] = safe_float(last.get("money"), 0)
-            price_map_pct[jq_code] = ((close - prev_close) / prev_close * 100) if close > 0 and prev_close > 0 else 0
-    ind_map = _jq_get_industry_map(mf["jq_code"].drop_duplicates().tolist(), date=used_date)
-    rows = []
-    for idx, r in mf.iterrows():
-        code = str(r.get("股票代码", "")).zfill(6)
-        name = str(r.get("股票简称", code))
-        if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
-            continue
-        jq_code = r.get("jq_code")
-        rows.append({"股票代码": code, "股票简称": name, "所属行业": ind_map.get(jq_code, "未分类"), "区间涨跌幅": safe_float(price_map_pct.get(jq_code), 0), "最新价": safe_float(price_map_close.get(jq_code), 0), "主力净流入": safe_float(main_net.loc[idx], 0), "成交额": safe_float(price_map_money.get(jq_code), 0), "换手率": 0.0, "总市值": 0.0, "市盈率": "-", "资金热度分": 0.0, "数据源": f"JQData真实资金流{used_date}"})
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return pd.DataFrame(), "JQData money_flow 无有效股票"
-    return out, f"JQData money_flow 成功获取{len(out)}只股票，交易日{used_date}"
 
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
@@ -488,17 +86,7 @@ with st.sidebar:
         ema_mid = st.number_input("中期 EMA", min_value=10, max_value=100, value=60, step=1)
         ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
 
-    st.markdown("### 🔐 数据源密钥")
-    if ts_token:
-        st.success("Tushare Token：已从 secrets 读取")
-    else:
-        st.error("Tushare Token：未读取到，请检查 secrets")
-    jq_ok, jq_msg = ensure_jqdata_auth()
-    if jq_ok:
-        st.success("JQData：已从 secrets 登录")
-    else:
-        st.warning(f"JQData：{jq_msg}")
-    STRICT_REAL_DATA = st.checkbox("🧱 严格真实数据模式", value=True, help="开启后不使用内置观察池、不用K线构造行情、不估算主力资金。接口失败就明确显示失败。")
+    ts_token = st.text_input("🔑 Tushare Token", type="password", help="仅作极致容灾兜底")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
 
     st.markdown("---")
@@ -509,6 +97,9 @@ with st.sidebar:
     st.success("技术结构引擎 : ACTIVE")
     st.success("多周期分析 : ACTIVE (15m / 60m / 120m)")
     st.success("智瞰龙虎榜 : ACTIVE")
+
+if ts_token:
+    ts.set_token(ts_token)
 
 # ================= 网络底座 =================
 USER_AGENTS = [
@@ -1604,87 +1195,177 @@ def _load_json_cache(path, max_age_seconds=1800):
         return None
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_market_pulse():
-    """市场脉搏：JQData 指数日线优先，东财只做 USD/CNH 补充；不使用缓存伪装最新。"""
-    targets = {"上证指数": "000001.XSHG", "深证成指": "399001.XSHE", "创业板指": "399006.XSHE", "沪深300": "000300.XSHG", "科创50": "000688.XSHG"}
+    """宏观看板保护版：批量接口优先，失败用缓存/占位兜底，永远返回可渲染结构。"""
+    cache_path = "/tmp/market_pulse_cache.json"
+    targets = {
+        "上证指数": {"secid": "1.000001", "code": "000001"},
+        "深证成指": {"secid": "0.399001", "code": "399001"},
+        "创业板指": {"secid": "0.399006", "code": "399006"},
+        "沪深300": {"secid": "1.000300", "code": "000300"},
+        "科创50": {"secid": "1.000688", "code": "000688"},
+    }
     pulse = {}
-    ok, msg = ensure_jqdata_auth()
-    if ok:
-        try:
-            df = jq.get_price(list(targets.values()), end_date=datetime.now().strftime("%Y-%m-%d"), count=2, frequency="daily", fields=["close"], fq="pre", panel=False)
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                if "code" not in df.columns and "security" in df.columns:
-                    df = df.rename(columns={"security": "code"})
-                if "time" not in df.columns and "index" in df.columns:
-                    df = df.rename(columns={"index": "time"})
-                code_to_name = {v: k for k, v in targets.items()}
-                for jq_code, g in df.groupby("code"):
-                    g = g.sort_values("time")
-                    last = g.iloc[-1]
-                    prev = g.iloc[-2] if len(g) >= 2 else last
-                    close = safe_float(last.get("close"), 0)
-                    prev_close = safe_float(prev.get("close"), 0)
-                    pct = ((close - prev_close) / prev_close * 100) if close > 0 and prev_close > 0 else 0
-                    name = code_to_name.get(str(jq_code))
-                    if name and close > 0:
-                        pulse[name] = {"price": close, "pct": pct, "source": "JQData指数日线", "status": "真实最新交易日"}
-        except Exception as exc:
-            if DEBUG_MODE:
-                st.caption(f"JQData指数行情失败：{exc}")
     try:
-        cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f170"
+        secids = ",".join([v["secid"] for v in targets.values()])
+        url = (
+            "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+            f"secids={secids}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2"
+            "&fields=f12,f14,f2,f3,f4,f18"
+        )
+        res = fetch_json(url, timeout=5, retries=1)
+        rows = (res or {}).get("data", {}).get("diff", []) if isinstance(res, dict) else []
+        code_to_name = {v["code"]: k for k, v in targets.items()}
+        for row in rows or []:
+            code = str(row.get("f12", "")).zfill(6)
+            name = code_to_name.get(code) or row.get("f14")
+            if name in targets:
+                price = safe_float(row.get("f2"), 0.0)
+                pct = safe_float(row.get("f3"), 0.0)
+                if price > 0:
+                    pulse[name] = {"price": price, "pct": pct, "source": "东方财富批量", "status": "正常"}
+    except Exception:
+        pass
+    for name, meta in targets.items():
+        if name in pulse:
+            continue
+        try:
+            url = (
+                "https://push2.eastmoney.com/api/qt/stock/get?"
+                f"secid={meta['secid']}&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f170,f60"
+            )
+            res = fetch_json(url, timeout=4, retries=0)
+            data = res.get("data") if isinstance(res, dict) else None
+            if data:
+                price = normalize_em_price(data.get("f43"), data.get("f60"))
+                pct = safe_float(data.get("f170"), 0.0)
+                if price > 0:
+                    pulse[name] = {"price": price, "pct": pct, "source": "东方财富单项", "status": "正常"}
+        except Exception:
+            pass
+    try:
+        cnh_url = (
+            "https://push2.eastmoney.com/api/qt/stock/get?"
+            "secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f170"
+        )
         cnh_res = fetch_json(cnh_url, timeout=4, retries=0)
         cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
         if cnh_data:
             cnh_price = safe_float(cnh_data.get("f43"), 0.0)
             cnh_pct = safe_float(cnh_data.get("f170"), 0.0)
             if cnh_price > 0:
-                pulse["USD/CNH(离岸)"] = {"price": cnh_price, "pct": cnh_pct, "source": "东方财富外汇", "status": "真实接口"}
+                pulse["USD/CNH(离岸)"] = {"price": cnh_price, "pct": cnh_pct, "source": "东方财富", "status": "正常"}
     except Exception:
         pass
+    cached = _load_json_cache(cache_path)
+    if cached:
+        for k, v in cached.items():
+            if k not in pulse and isinstance(v, dict) and safe_float(v.get("price"), 0) > 0:
+                vv = dict(v)
+                vv["source"] = "缓存回显"
+                vv["status"] = "接口暂不可用，显示最近成功数据"
+                pulse[k] = vv
     for name in list(targets.keys()) + ["USD/CNH(离岸)"]:
         if name not in pulse:
-            pulse[name] = {"price": 0.0, "pct": 0.0, "source": "无", "status": "真实接口暂不可用"}
+            pulse[name] = _pulse_placeholder(name)
+    real_data = {k: v for k, v in pulse.items() if safe_float(v.get("price"), 0) > 0}
+    if real_data:
+        _save_json_cache(cache_path, real_data)
     return pulse
 
-
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_hot_blocks():
-    """资金热点板块：JQData 全市场真实行情计算优先；不使用缓存、不使用内置热点兜底。"""
-    data, msg = get_jqdata_hot_blocks(max_stocks=5000)
-    if data:
-        return data
-    if DEBUG_MODE:
-        st.caption(f"JQData热点板块计算失败：{msg}")
+    """资金热点板块：多源串行 + 缓存 + 内置观察池兜底。
+
+    设计原则：板块接口在云端很容易被限流，不能因为实时源失败就让页面失效。
+    返回字段始终保持：板块名称、涨跌幅、上涨家数、下跌家数、领涨股票、数据源。
+    """
+    cache_path = "/tmp/hot_blocks_cache.json"
+
     def _normalize_blocks_df(df, source):
         if df is None or df.empty:
             return None
         out = df.copy()
-        rename_candidates = {"名称": "板块名称", "板块": "板块名称", "行业名称": "板块名称", "概念名称": "板块名称", "涨跌幅": "涨跌幅", "涨幅": "涨跌幅", "上涨家数": "上涨家数", "下跌家数": "下跌家数", "领涨股票": "领涨股票", "领涨股": "领涨股票", "领涨名称": "领涨股票"}
+        rename_candidates = {
+            "名称": "板块名称", "板块": "板块名称", "行业名称": "板块名称", "概念名称": "板块名称",
+            "涨跌幅": "涨跌幅", "涨幅": "涨跌幅",
+            "上涨家数": "上涨家数", "下跌家数": "下跌家数",
+            "领涨股票": "领涨股票", "领涨股": "领涨股票", "领涨名称": "领涨股票",
+        }
         out = out.rename(columns={k: v for k, v in rename_candidates.items() if k in out.columns})
         if "板块名称" not in out.columns:
             return None
-        for c, default in [("涨跌幅", 0.0), ("上涨家数", 0), ("下跌家数", 0), ("领涨股票", "-")]:
-            if c not in out.columns:
-                out[c] = default
+        if "涨跌幅" not in out.columns:
+            out["涨跌幅"] = 0.0
+        if "上涨家数" not in out.columns:
+            out["上涨家数"] = 0
+        if "下跌家数" not in out.columns:
+            out["下跌家数"] = 0
+        if "领涨股票" not in out.columns:
+            out["领涨股票"] = "-"
         out["涨跌幅"] = pd.to_numeric(out["涨跌幅"], errors="coerce").fillna(0)
-        out = out.dropna(subset=["板块名称"]).sort_values("涨跌幅", ascending=False).head(15)
+        out = out.dropna(subset=["板块名称"]).sort_values("涨跌幅", ascending=False).head(10)
         out["数据源"] = source
-        if "热点分" not in out.columns:
-            out["热点分"] = out["涨跌幅"].rank(pct=True).fillna(0).mul(100).round(2)
-        return out[[c for c in ["板块名称", "热点分", "涨跌幅", "上涨家数", "下跌家数", "领涨股票", "数据源"] if c in out.columns]].to_dict("records")
-    sources = [("AKShare行业板块真实接口", lambda: ak.stock_board_industry_name_em()), ("AKShare概念板块真实接口", lambda: ak.stock_board_concept_name_em())]
+        return out[["板块名称", "涨跌幅", "上涨家数", "下跌家数", "领涨股票", "数据源"]].to_dict("records")
+
+    sources = []
+    # 1. AKShare 封装的东财行业板块
+    sources.append(("AKShare行业板块", lambda: ak.stock_board_industry_name_em()))
+    # 2. AKShare 封装的东财概念板块
+    sources.append(("AKShare概念板块", lambda: ak.stock_board_concept_name_em()))
+
+    # 3. 东方财富原生行业/概念板块接口，绕开部分 AKShare 内部超时
+    def _em_board(fs, source):
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get?"
+            "pn=1&pz=80&po=1&np=1&fid=f3&fltt=2&invt=2"
+            f"&fs={fs}&fields=f12,f14,f3,f104,f105,f128"
+        )
+        res = fetch_json(url, timeout=6, retries=1)
+        rows = (res or {}).get("data", {}).get("diff", []) if isinstance(res, dict) else []
+        if not rows:
+            return None
+        return pd.DataFrame([
+            {
+                "板块名称": r.get("f14", "-"),
+                "涨跌幅": safe_float(r.get("f3"), 0),
+                "上涨家数": int(safe_float(r.get("f104"), 0)),
+                "下跌家数": int(safe_float(r.get("f105"), 0)),
+                "领涨股票": r.get("f128", "-"),
+            }
+            for r in rows
+        ])
+
+    sources.append(("东方财富行业板块", lambda: _em_board("m:90+t:2+f:!50", "东方财富行业板块")))
+    sources.append(("东方财富概念板块", lambda: _em_board("m:90+t:3+f:!50", "东方财富概念板块")))
+
     for source_name, loader in sources:
         try:
-            records = _normalize_blocks_df(loader(), source_name)
-            if records:
-                return records
-        except Exception as exc:
+            data = _normalize_blocks_df(loader(), source_name)
+            if data:
+                _save_json_cache(cache_path, {"records": data, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                return data
+        except Exception as e:
             if DEBUG_MODE:
-                st.caption(f"{source_name}失败：{exc}")
-    return []
+                st.caption(f"{source_name} 获取失败：{e}")
+
+    cached = _load_json_cache(cache_path, max_age_seconds=24 * 3600)
+    if cached and isinstance(cached.get("records"), list) and cached["records"]:
+        rows = cached["records"]
+        for r in rows:
+            r["数据源"] = "缓存回显"
+        return rows
+
+    # 终极兜底：不给用户空页面，至少给出重点观察方向
+    fallback = [
+        {"板块名称": "算力AI", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "中际旭创/工业富联", "数据源": "内置观察池"},
+        {"板块名称": "半导体", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "北方华创/中芯国际", "数据源": "内置观察池"},
+        {"板块名称": "机器人", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "拓普集团/鸣志电器", "数据源": "内置观察池"},
+        {"板块名称": "低空经济", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "万丰奥威/中信海直", "数据源": "内置观察池"},
+        {"板块名称": "创新药", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "恒瑞医药/百济神州", "数据源": "内置观察池"},
+    ]
+    return fallback
 
 
 def _secid_for_symbol(symbol: str) -> str:
@@ -1924,6 +1605,11 @@ def get_a_code_name_map() -> dict:
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"AKShare A股代码名称表失败: {e}")
+    out.update({
+        "002281": "光迅科技", "688523": "航天环宇", "300750": "宁德时代",
+        "600276": "恒瑞医药", "002371": "北方华创", "300308": "中际旭创",
+        "601138": "工业富联", "600519": "贵州茅台", "000001": "平安银行",
+    })
     return out
 
 
@@ -2102,30 +1788,57 @@ def _quote_quality(q: dict | None) -> int:
 @st.cache_data(ttl=75, show_spinner=False)
 def get_stock_quote(symbol):
     """
-    JQData 核心行情版：优先使用 JQData 最新交易日日线和基础资料；
-    再用东财/新浪/AKShare/Tushare真实接口补字段。不会用日K外推盘中行情，不使用内置兜底。
+    个股行情完整性优先版：按接口稳定性与字段完整度串行补全，不再单源成功即返回。
+    优先级：东财单股 → AK实时 → 新浪轻量 → 东财全市场 → AK个股资料/代码名 → Baostock/Tushare → 日K构造。
     """
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
     merged = {"symbol": symbol}
-    merged = _merge_quote(merged, _quote_from_jqdata(symbol))
-    for fetcher in [_quote_from_em_single, _quote_from_sina, _quote_from_ak_spot]:
+
+    # 1. 实时行情层：优先拿价格、涨跌幅、名称、估值。
+    for fetcher in [_quote_from_em_single, _quote_from_ak_spot, _quote_from_sina]:
         merged = _merge_quote(merged, fetcher(symbol))
         if _quote_quality(merged) >= 8:
             break
-    merged = _merge_quote(merged, _quote_from_tushare_basic(symbol))
+
+    # 2. 批量快照层：对自选股扫描特别有用，用来补市值/PE/PB/换手。
+    try:
+        snap = get_em_spot_snapshot_map()
+        if isinstance(snap, dict) and symbol in snap:
+            merged = _merge_quote(merged, snap.get(symbol))
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"东财全市场快照补全失败 {symbol}: {e}")
+
+    # 3. 基础资料层：只要还缺名称/市值/估值/换手，就继续补。
+    for fetcher in [_quote_from_ak_individual, _quote_from_code_name_map, _quote_from_baostock_basic, _quote_from_tushare_basic]:
+        need_more = (
+            _is_missing_value(merged.get("name"), numeric_zero_is_missing=False)
+            or safe_float(merged.get("market_cap"), 0) <= 0
+            or _is_missing_value(merged.get("pe"), numeric_zero_is_missing=False)
+            or _is_missing_value(merged.get("pb"), numeric_zero_is_missing=False)
+            or safe_float(merged.get("turnover"), 0) <= 0
+        )
+        if not need_more and _quote_quality(merged) >= 9:
+            break
+        merged = _merge_quote(merged, fetcher(symbol))
+
+    # 4. K线兜底层：保证技术分析、评分、交易计划不断掉。
+    if safe_float(merged.get("price"), 0) <= 0 or safe_float(merged.get("turnover"), 0) <= 0:
+        merged = _merge_quote(merged, _quote_from_kline(symbol))
+
+    # 5. 少量长期缺字段标的，用内置基础资料兜底，避免市值永远显示 0.0。
+    if safe_float(merged.get("market_cap"), 0) <= 0 or _is_missing_value(merged.get("name"), numeric_zero_is_missing=False):
+        merged = _merge_quote(merged, _quote_from_manual_reference(symbol, safe_float(merged.get("price"), 0)))
+
     finalized = _finalize_quote(merged, symbol)
     if finalized:
         finalized["quality_score"] = _quote_quality(finalized)
-        missing = []
-        for field, label in [("market_cap", "总市值"), ("pe", "PE"), ("pb", "PB"), ("turnover", "换手率")]:
-            if field in ["market_cap", "turnover"]:
-                if safe_float(finalized.get(field), 0) <= 0:
-                    missing.append(label)
-            elif finalized.get(field) == "-":
-                missing.append(label)
-        finalized["fundamental_warning"] = "真实接口字段缺失：" + "、".join(missing) if missing else "真实接口字段较完整"
+        if finalized.get("market_cap", 0) <= 0 or finalized.get("pe") == "-" or finalized.get("pb") == "-":
+            finalized["fundamental_warning"] = "部分估值字段缺失，已使用多源行情与K线降级分析"
+        else:
+            finalized["fundamental_warning"] = "估值字段较完整"
     return finalized
 
 
@@ -2184,7 +1897,7 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_kline(symbol, days=220):
-    """日K真实数据：JQData优先，Tushare其次，东财/AKShare/Baostock仅作为真实接口补充；不构造、不估算。"""
+    """日K完整兜底版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
@@ -2195,46 +1908,37 @@ def get_kline(symbol, days=220):
     start_str_bs = start_date.strftime("%Y-%m-%d")
     end_str_bs = end_date.strftime("%Y-%m-%d")
     try:
-        df = _fetch_jq_daily_kline(symbol, days=days)
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"JQData 日K失败 {symbol}: {e}")
-    try:
-        if ts_token:
-            pro = ts.pro_api()
-            market = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
-            ts_code = f"{symbol}{market}"
-            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
-            if df is not None and not df.empty:
-                df = df.rename(columns={"vol": "volume"})
-                df = _normalize_daily_kline(df, days=days)
-                if df is not None and not df.empty:
-                    return df
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"Tushare 日K失败 {symbol}: {e}")
-    try:
         df = _fetch_em_daily_kline(symbol, days=days)
         if df is not None and not df.empty:
             return df
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"东财日K失败 {symbol}: {e}")
-    for adjust in ["qfq", ""]:
-        try:
-            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_str, end_date=end_str, adjust=adjust)
-            df = _normalize_daily_kline(df, days=days)
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            if DEBUG_MODE:
-                st.caption(f"AKShare {adjust or 'raw'} 日K失败 {symbol}: {e}")
+    try:
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_str, end_date=end_str, adjust="qfq")
+        df = _normalize_daily_kline(df, days=days)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"AKShare qfq 日K失败 {symbol}: {e}")
+    try:
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_str, end_date=end_str, adjust="")
+        df = _normalize_daily_kline(df, days=days)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"AKShare raw 日K失败 {symbol}: {e}")
     try:
         bs.login()
         bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
-        rs = bs.query_history_k_data_plus(bs_code, "date,open,high,low,close,volume", start_date=start_str_bs, end_date=end_str_bs, frequency="d", adjustflag="2")
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,high,low,close,volume",
+            start_date=start_str_bs, end_date=end_str_bs,
+            frequency="d", adjustflag="2"
+        )
         data_list = []
         while (rs.error_code == '0') and rs.next():
             data_list.append(rs.get_row_data())
@@ -2254,6 +1958,20 @@ def get_kline(symbol, days=220):
             bs.logout()
         except Exception:
             pass
+    try:
+        if ts_token:
+            pro = ts.pro_api()
+            market = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
+            ts_code = f"{symbol}{market}"
+            df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+            if df is not None and not df.empty:
+                df = df.rename(columns={"vol": "volume"})
+                df = _normalize_daily_kline(df, days=days)
+                if df is not None and not df.empty:
+                    return df
+    except Exception as e:
+        if DEBUG_MODE:
+            st.caption(f"Tushare 日K失败 {symbol}: {e}")
     return None
 
 # ================= AI 计算核心 =================
@@ -3053,7 +2771,9 @@ class MainForceStockSelector:
                 pct = safe_float(item.get("f3"))
                 turnover = safe_float(item.get("f8"))
                 market_cap = safe_float(item.get("f20")) / 100000000 if safe_float(item.get("f20")) > 1000000 else safe_float(item.get("f20"))
-                main_net = safe_float(item.get("f62"), 0)
+                main_net = safe_float(item.get("f62"))
+                if main_net == 0:
+                    main_net = amount * (max(min(pct, 10), -10) / 100.0)
                 rows.append({
                     "股票代码": code,
                     "股票简称": name,
@@ -3066,7 +2786,7 @@ class MainForceStockSelector:
                     "总市值": market_cap,
                     "市盈率": item.get("f9", "-"),
                     "资金热度分": 0.0,
-                    "数据源": "东方财富实时资金字段f62"
+                    "数据源": "东方财富轻量实时池"
                 })
             df = pd.DataFrame(rows)
             if df.empty:
@@ -3074,93 +2794,6 @@ class MainForceStockSelector:
             return self._score_candidates(df), f"东方财富轻量接口成功获取{len(df)}只候选股票"
         except Exception as exc:
             return pd.DataFrame(), f"东方财富轻量接口异常: {exc}"
-
-    def _fetch_tushare_moneyflow_pool(self, trade_date=None):
-        """Tushare 真实资金流接口：作为东财被限流时的真实数据源，不做估算。"""
-        if not ts_token:
-            return pd.DataFrame(), "Tushare Token 未配置"
-        try:
-            pro = ts.pro_api()
-            dates = []
-            if trade_date:
-                dates.append(str(trade_date).replace("-", ""))
-            today = datetime.now()
-            for i in range(0, 12):
-                d = (today - timedelta(days=i)).strftime("%Y%m%d")
-                if d not in dates:
-                    dates.append(d)
-
-            mf = None
-            used_date = None
-            for d in dates:
-                try:
-                    tmp = pro.moneyflow(trade_date=d)
-                    if tmp is not None and not tmp.empty:
-                        mf = tmp.copy()
-                        used_date = d
-                        break
-                except Exception:
-                    continue
-            if mf is None or mf.empty:
-                return pd.DataFrame(), "Tushare moneyflow 最近交易日返回空"
-
-            try:
-                basic = pro.daily_basic(trade_date=used_date, fields="ts_code,close,turnover_rate,pe_ttm,total_mv")
-            except Exception:
-                basic = pd.DataFrame()
-            try:
-                daily = pro.daily(trade_date=used_date, fields="ts_code,pct_chg,amount")
-            except Exception:
-                daily = pd.DataFrame()
-
-            df = mf.copy()
-            if basic is not None and not basic.empty:
-                df = df.merge(basic, on="ts_code", how="left")
-            if daily is not None and not daily.empty:
-                df = df.merge(daily, on="ts_code", how="left")
-            try:
-                names = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
-                if names is not None and not names.empty:
-                    df = df.merge(names, on="ts_code", how="left")
-            except Exception:
-                pass
-
-            buy_lg = pd.to_numeric(df.get("buy_lg_amount"), errors="coerce").fillna(0)
-            sell_lg = pd.to_numeric(df.get("sell_lg_amount"), errors="coerce").fillna(0)
-            buy_elg = pd.to_numeric(df.get("buy_elg_amount"), errors="coerce").fillna(0)
-            sell_elg = pd.to_numeric(df.get("sell_elg_amount"), errors="coerce").fillna(0)
-            net_mf = pd.to_numeric(df.get("net_mf_amount"), errors="coerce").fillna(0)
-            main_net_series = (buy_lg - sell_lg) + (buy_elg - sell_elg)
-            main_net_series = main_net_series.where(main_net_series != 0, net_mf)
-
-            rows = []
-            for idx, r in df.iterrows():
-                code = str(r.get("ts_code", ""))[:6]
-                if not re.fullmatch(r"\d{6}", code):
-                    continue
-                name = str(r.get("name") or "")
-                if "ST" in name or "退" in name:
-                    continue
-                rows.append({
-                    "股票代码": code,
-                    "股票简称": name or code,
-                    "所属行业": r.get("industry") or "未分类",
-                    "区间涨跌幅": safe_float(r.get("pct_chg"), 0),
-                    "最新价": safe_float(r.get("close"), 0),
-                    "主力净流入": safe_float(main_net_series.loc[idx], 0),
-                    "成交额": safe_float(r.get("amount"), 0),
-                    "换手率": safe_float(r.get("turnover_rate"), 0),
-                    "总市值": safe_float(r.get("total_mv"), 0) / 10000,
-                    "市盈率": r.get("pe_ttm", "-"),
-                    "资金热度分": 0.0,
-                    "数据源": f"Tushare真实资金流{used_date}"
-                })
-            out = pd.DataFrame(rows)
-            if out.empty:
-                return pd.DataFrame(), "Tushare moneyflow 无有效股票"
-            return self._score_candidates(out), f"Tushare moneyflow 成功获取{len(out)}只候选股票，交易日{used_date}"
-        except Exception as exc:
-            return pd.DataFrame(), f"Tushare moneyflow异常: {exc}"
 
     def _fetch_static_pool(self):
         df = pd.DataFrame(self.DEFAULT_POOL).copy()
@@ -3210,17 +2843,14 @@ class MainForceStockSelector:
         return df.drop(columns=["成交额_rank", "换手率_rank", "涨幅_rank", "净流入_rank"], errors="ignore")
 
     def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
-        # JQData 真实资金流优先；Tushare moneyflow 次之；东方财富 f62 只作补充。不使用内置池、不估算主力净流入。
-        df_jq, msg_jq = _fetch_jqdata_moneyflow_pool(max_stocks=1200)
-        if not df_jq.empty:
-            return True, self._score_candidates(df_jq), msg_jq
-        df_ts, msg_ts = self._fetch_tushare_moneyflow_pool()
-        if not df_ts.empty:
-            return True, df_ts, f"{msg_jq}；{msg_ts}"
-        df_em, msg_em = self._fetch_eastmoney_fast_pool(pz=220)
-        if not df_em.empty:
-            return True, df_em, f"{msg_jq}；{msg_ts}；{msg_em}"
-        return False, pd.DataFrame(), f"真实资金数据不可用：{msg_jq}；{msg_ts}；{msg_em}"
+        # 只走快速路径，不再调用 pywencai/AKShare分页资金流，避免长时间转圈。
+        df, msg = self._fetch_eastmoney_fast_pool(pz=220)
+        if df.empty:
+            df, msg2 = self._fetch_static_pool()
+            msg = f"{msg}；{msg2}"
+        if df.empty:
+            return False, pd.DataFrame(), "所有快速数据源均为空"
+        return True, df, msg
 
     def filter_stocks(self, df: pd.DataFrame, max_range_change=30.0, min_market_cap=10.0, max_market_cap=5000.0):
         if df is None or df.empty:
@@ -3263,7 +2893,7 @@ class MainForceAnalyzer:
             industry = str(row.get("所属行业", "未分类"))
             reasons = [f"资金热度分 {hot:.1f}，在候选池中排名靠前"]
             if inflow:
-                reasons.append(f"真实接口主力净流入约 {inflow:,.0f}")
+                reasons.append(f"估算/接口主力净流入约 {inflow:,.0f}")
             if amount:
                 reasons.append(f"成交额活跃，约 {amount / 100000000:.2f} 亿元")
             if turnover:
@@ -3326,7 +2956,7 @@ class MainForceAnalyzer:
         show_cols = ["股票代码", "股票简称", "所属行业", "资金热度分", "主力净流入", "成交额", "区间涨跌幅", "换手率", "总市值", "市盈率", "数据源"]
         show_cols = [c for c in show_cols if c in top_data.columns]
         table_text = top_data[show_cols].to_string(index=False)
-        self.fund_flow_analysis = "已根据真实接口返回的成交额、换手率、主力净流入、涨跌幅计算资金热度分，并完成快速排序。"
+        self.fund_flow_analysis = "已根据成交额、换手率、估算主力净流入、涨跌幅构造资金热度分，并完成快速排序。"
         self.industry_analysis = "行业分布来自股票名称和内置行业映射，属于快速归类，适合先做观察池，不适合作为唯一买入依据。"
 
         if use_ai and api_key:
@@ -3369,16 +2999,9 @@ class MainForceAnalyzer:
         return result
 
 def render_main_force_tab():
-    """主力选股专属 UI 渲染器：只使用真实资金流字段，失败即提示，不造假。"""
-    st.markdown("### 🐋 主力资金板块")
-    st.info("本页只读取真实资金流字段：优先 JQData money_flow，其次 Tushare moneyflow，最后东方财富 f62。拿不到就明确提示，不用估算、不用内置股票池冒充。")
-    ok_jq, msg_jq = ensure_jqdata_auth()
-    c_status1, c_status2, c_status3 = st.columns(3)
-    c_status1.metric("JQData登录", "成功" if ok_jq else "失败")
-    c_status2.metric("Tushare Token", "已配置" if bool(ts_token) else "未配置")
-    c_status3.metric("模式", "严格真实数据")
-    if not ok_jq:
-        st.warning(msg_jq)
+    """主力选股专属 UI 渲染器（快速版）。"""
+    st.markdown("### 🎯 主力资金选股 - 快速资金热度引擎")
+    st.write("为避免云端接口长时间卡住，本模块改为轻量行情池 + 资金热度评分 + 单次AI解读。先出结果，再做研判。")
     st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
@@ -3795,12 +3418,8 @@ class HighEndNewsAnalyzer:
         return {"chief_report": "\n\n".join(lines)}
 
 def render_high_end_news_terminal():
-    st.markdown("### 🛰️ 新闻情报板块")
-    st.info("本页用于抓取真实新闻/公告/快讯并做题材映射。默认不自动请求外部新闻接口，点击按钮后才扫描；接口失败会显示失败原因，不显示假新闻。")
-    c_status1, c_status2, c_status3 = st.columns(3)
-    c_status1.metric("AI报告", "可用" if bool(api_key) else "未配置")
-    c_status2.metric("问财新闻", "默认关闭")
-    c_status3.metric("模式", "真实新闻源")
+    st.markdown("#### 🛰️ 高端情报终端 Pro")
+    st.write("整合全网快讯、公告、个股新闻、题材映射、风险雷达与 AI 多智能体研判，用来判断新闻流对 A 股板块和个股的影响。")
 
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
@@ -3889,14 +3508,11 @@ def render_high_end_news_terminal():
             st.dataframe(df_items[show_cols], width="stretch", hide_index=True)
 
     with st.expander("📚 查看最近情报运行记录", expanded=False):
-        try:
-            hist = HighEndNewsDB().recent_runs(10)
-            if hist is not None and not hist.empty:
-                st.dataframe(hist, width="stretch", hide_index=True)
-            else:
-                st.info("暂无历史记录。")
-        except Exception as exc:
-            st.caption(f"历史记录读取失败，但不影响新闻扫描：{exc}")
+        hist = HighEndNewsDB().recent_runs(10)
+        if hist is not None and not hist.empty:
+            st.dataframe(hist, width="stretch", hide_index=True)
+        else:
+            st.info("暂无历史记录。")
 
 # ================= 高端新闻情报终端模块结束 =================
 
@@ -3923,16 +3539,6 @@ if pulse_data:
 else:
     st.info("宏观看板暂未取得实时数据，但不会影响下方功能使用。")
 st.markdown("<br>", unsafe_allow_html=True)
-
-
-
-def render_module_crash_box(module_name: str, exc: Exception):
-    """任何一个模块出错时只在本模块内提示，不让后面的 Tab 整页空白。"""
-    st.error(f"{module_name} 模块加载失败：{exc}")
-    with st.expander("查看技术错误，方便继续修复", expanded=False):
-        import traceback
-        st.code(traceback.format_exc())
-    st.info("这个提示说明页面没有假装有数据，也没有用兜底数据冒充真实数据。把这段错误发给我，我可以继续按原文件精准修。")
 
 # ================= 终端功能选项卡 =================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
@@ -4221,13 +3827,13 @@ with tab3:
         st.markdown("#### 🔥 资金热点板块（附实战标的推荐）")
         st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时会自动使用缓存或观察池兜底。")
         if st.button("扫描板块与生成配置推荐", type="primary"):
-            with st.spinner("正在获取板块异动数据...（只展示真实接口/真实行情计算结果）"):
+            with st.spinner("正在获取板块异动数据...（实时源失败时自动使用缓存或观察池）"):
                 blocks = get_hot_blocks()
             if blocks:
                 df_blocks = pd.DataFrame(blocks)
                 st.dataframe(df_blocks, width="stretch", hide_index=True)
                 source_set = "、".join(sorted({str(b.get("数据源", "未知")) for b in blocks}))
-                st.caption(f"板块数据源：{source_set}。本页不使用内置热点兜底，显示的都是接口返回或JQData真实行情计算结果。")
+                st.caption(f"板块数据源：{source_set}。若显示为“缓存回显”或“内置观察池”，说明实时接口暂时不稳定，但页面仍可继续分析。")
                 if not api_key:
                     st.info("未配置 GROQ_API_KEY，已展示板块数据；配置后可生成 AI 配置建议。")
                 else:
@@ -4251,7 +3857,7 @@ with tab3:
 """
                         st.markdown(call_ai(prompt, temperature=0.4))
             else:
-                st.warning("真实板块接口/JQData真实行情计算均未返回结果。请稍后重试，或打开调试模式查看失败原因。")
+                st.warning("实时板块接口、缓存和内置观察池均未返回结果。请稍后重试。")
 
 # ================= Tab 4: 高阶情报终端 =================
 with tab4:
@@ -4431,15 +4037,11 @@ with tab5:
                         else:
                             st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
 # ================= Tab 6: 主力资金选股 =================
+
 with tab6:
-    try:
-        render_main_force_tab()
-    except Exception as exc:
-        render_module_crash_box("主力资金", exc)
+    render_main_force_tab()
 
 # ================= Tab 7: 高端情报终端 Pro =================
 with tab7:
-    try:
+    with st.container(border=True):
         render_high_end_news_terminal()
-    except Exception as exc:
-        render_module_crash_box("新闻情报", exc)
