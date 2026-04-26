@@ -66,29 +66,29 @@ st.markdown(
 
 api_key = st.secrets.get("GROQ_API_KEY", "")
 
-# ================= Secrets 读取：兼容 Streamlit Cloud / 本地 secrets.toml =================
-def read_secret_value(*names: str, default: str = "") -> str:
-    """从 st.secrets 读取配置，兼容大写 key、小写 key、嵌套表三种写法。"""
-    for name in names:
+
+def get_tushare_token_from_secrets():
+    """只从 Streamlit Secrets 读取 Tushare Token，避免把 token 写在代码或页面输入框里。"""
+    for key in ["TUSHARE_TOKEN", "TUSHARE_API_KEY", "TS_TOKEN", "tushare_token"]:
         try:
-            value = st.secrets.get(name, "")
-            if value:
-                return str(value).strip()
+            val = st.secrets.get(key, "")
+            if val:
+                return str(val).strip()
         except Exception:
             pass
-    # 兼容 [tushare] token="..." / [tushare] api_key="..."
     try:
-        tushare_cfg = st.secrets.get("tushare", {})
-        if isinstance(tushare_cfg, dict):
-            for key in ["token", "api_key", "TUSHARE_TOKEN", "TUSHARE_API_KEY"]:
-                value = tushare_cfg.get(key, "")
-                if value:
-                    return str(value).strip()
+        section = st.secrets.get("tushare", {})
+        if isinstance(section, dict):
+            val = section.get("token") or section.get("api_key")
+            if val:
+                return str(val).strip()
     except Exception:
         pass
-    return default
+    return ""
 
-TUSHARE_SECRET_TOKEN = read_secret_value("TUSHARE_TOKEN", "TUSHARE_API_KEY", "TS_TOKEN", "tushare_token")
+ts_token = get_tushare_token_from_secrets()
+if ts_token:
+    ts.set_token(ts_token)
 
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
@@ -110,17 +110,12 @@ with st.sidebar:
         ema_mid = st.number_input("中期 EMA", min_value=10, max_value=100, value=60, step=1)
         ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
 
-    ts_token_input = st.text_input(
-        "🔑 Tushare Token（可选覆盖 secrets）",
-        type="password",
-        value="",
-        help="已支持从 Streamlit secrets 自动读取；这里留空即可。只有临时覆盖时才填写。"
-    )
-    TUSHARE_TOKEN = (ts_token_input.strip() if ts_token_input else TUSHARE_SECRET_TOKEN)
-    if TUSHARE_TOKEN:
-        st.success("Tushare Token : ACTIVE（已从 secrets/侧边栏读取）")
+    st.markdown("### 🔐 数据源密钥")
+    if ts_token:
+        st.success("Tushare Token：已从 secrets 读取")
     else:
-        st.warning("Tushare Token : 未读取到，Tushare 兜底将跳过")
+        st.error("Tushare Token：未读取到，请检查 secrets")
+    STRICT_REAL_DATA = st.checkbox("🧱 严格真实数据模式", value=True, help="开启后不使用内置观察池、不用K线构造行情、不估算主力资金。接口失败就明确显示失败。")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
 
     st.markdown("---")
@@ -131,21 +126,6 @@ with st.sidebar:
     st.success("技术结构引擎 : ACTIVE")
     st.success("多周期分析 : ACTIVE (15m / 60m / 120m)")
     st.success("智瞰龙虎榜 : ACTIVE")
-
-if TUSHARE_TOKEN:
-    ts.set_token(TUSHARE_TOKEN)
-
-@st.cache_resource(show_spinner=False)
-def get_tushare_pro(token: str):
-    """缓存 Tushare Pro 对象，避免每次 rerun 重建连接。"""
-    if not token:
-        return None
-    ts.set_token(token)
-    return ts.pro_api(token)
-
-
-def get_ts_pro():
-    return get_tushare_pro(TUSHARE_TOKEN) if TUSHARE_TOKEN else None
 
 # ================= 网络底座 =================
 USER_AGENTS = [
@@ -1396,22 +1376,9 @@ def get_hot_blocks():
             if DEBUG_MODE:
                 st.caption(f"{source_name} 获取失败：{e}")
 
-    cached = _load_json_cache(cache_path, max_age_seconds=24 * 3600)
-    if cached and isinstance(cached.get("records"), list) and cached["records"]:
-        rows = cached["records"]
-        for r in rows:
-            r["数据源"] = "缓存回显"
-        return rows
-
-    # 终极兜底：不给用户空页面，至少给出重点观察方向
-    fallback = [
-        {"板块名称": "算力AI", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "中际旭创/工业富联", "数据源": "内置观察池"},
-        {"板块名称": "半导体", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "北方华创/中芯国际", "数据源": "内置观察池"},
-        {"板块名称": "机器人", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "拓普集团/鸣志电器", "数据源": "内置观察池"},
-        {"板块名称": "低空经济", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "万丰奥威/中信海直", "数据源": "内置观察池"},
-        {"板块名称": "创新药", "涨跌幅": 0.0, "上涨家数": 0, "下跌家数": 0, "领涨股票": "恒瑞医药/百济神州", "数据源": "内置观察池"},
-    ]
-    return fallback
+    # 严格真实数据模式：不使用缓存回显、不使用内置观察池。
+    # 如果东方财富/AKShare 板块接口失败，直接返回空，让页面明确提示“实时数据不可用”。
+    return []
 
 
 def _secid_for_symbol(symbol: str) -> str:
@@ -1651,11 +1618,6 @@ def get_a_code_name_map() -> dict:
     except Exception as e:
         if DEBUG_MODE:
             st.caption(f"AKShare A股代码名称表失败: {e}")
-    out.update({
-        "002281": "光迅科技", "688523": "航天环宇", "300750": "宁德时代",
-        "600276": "恒瑞医药", "002371": "北方华创", "300308": "中际旭创",
-        "601138": "工业富联", "600519": "贵州茅台", "000001": "平安银行",
-    })
     return out
 
 
@@ -1762,11 +1724,9 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
 def _quote_from_tushare_basic(symbol: str) -> dict | None:
     """Tushare 可选兜底：有 token 时补名称、市值、PE、PB、换手。"""
     try:
-        if not TUSHARE_TOKEN:
+        if not ts_token:
             return None
-        pro = get_ts_pro()
-        if pro is None:
-            return None
+        pro = ts.pro_api()
         suffix = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
         ts_code = f"{symbol}{suffix}"
         result = {"symbol": symbol, "source": "Tushare基础/估值"}
@@ -1836,21 +1796,20 @@ def _quote_quality(q: dict | None) -> int:
 @st.cache_data(ttl=75, show_spinner=False)
 def get_stock_quote(symbol):
     """
-    个股行情完整性优先版：按接口稳定性与字段完整度串行补全，不再单源成功即返回。
-    优先级：东财单股 → AK实时 → 新浪轻量 → 东财全市场 → AK个股资料/代码名 → Baostock/Tushare → 日K构造。
+    严格真实数据版：只使用明确来自真实接口的行情字段。
+    不再使用“日K构造行情”和“内置基础资料”补全，避免把兜底数据误当作实时判断依据。
+    链路：东财单股 → AKShare实时 → 新浪实时 → 东财全市场快照 → Tushare日终基础估值/名称补字段。
     """
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
     merged = {"symbol": symbol}
 
-    # 1. 实时行情层：优先拿价格、涨跌幅、名称、估值。
     for fetcher in [_quote_from_em_single, _quote_from_ak_spot, _quote_from_sina]:
         merged = _merge_quote(merged, fetcher(symbol))
         if _quote_quality(merged) >= 8:
             break
 
-    # 2. 批量快照层：对自选股扫描特别有用，用来补市值/PE/PB/换手。
     try:
         snap = get_em_spot_snapshot_map()
         if isinstance(snap, dict) and symbol in snap:
@@ -1859,34 +1818,20 @@ def get_stock_quote(symbol):
         if DEBUG_MODE:
             st.caption(f"东财全市场快照补全失败 {symbol}: {e}")
 
-    # 3. 基础资料层：只要还缺名称/市值/估值/换手，就继续补。
-    for fetcher in [_quote_from_ak_individual, _quote_from_code_name_map, _quote_from_baostock_basic, _quote_from_tushare_basic]:
-        need_more = (
-            _is_missing_value(merged.get("name"), numeric_zero_is_missing=False)
-            or safe_float(merged.get("market_cap"), 0) <= 0
-            or _is_missing_value(merged.get("pe"), numeric_zero_is_missing=False)
-            or _is_missing_value(merged.get("pb"), numeric_zero_is_missing=False)
-            or safe_float(merged.get("turnover"), 0) <= 0
-        )
-        if not need_more and _quote_quality(merged) >= 9:
-            break
-        merged = _merge_quote(merged, fetcher(symbol))
-
-    # 4. K线兜底层：保证技术分析、评分、交易计划不断掉。
-    if safe_float(merged.get("price"), 0) <= 0 or safe_float(merged.get("turnover"), 0) <= 0:
-        merged = _merge_quote(merged, _quote_from_kline(symbol))
-
-    # 5. 少量长期缺字段标的，用内置基础资料兜底，避免市值永远显示 0.0。
-    if safe_float(merged.get("market_cap"), 0) <= 0 or _is_missing_value(merged.get("name"), numeric_zero_is_missing=False):
-        merged = _merge_quote(merged, _quote_from_manual_reference(symbol, safe_float(merged.get("price"), 0)))
+    # 只用 Tushare 的真实日终基础数据补名称、PE/PB、市值、换手率；不拿K线构造实时价格。
+    merged = _merge_quote(merged, _quote_from_tushare_basic(symbol))
 
     finalized = _finalize_quote(merged, symbol)
     if finalized:
         finalized["quality_score"] = _quote_quality(finalized)
-        if finalized.get("market_cap", 0) <= 0 or finalized.get("pe") == "-" or finalized.get("pb") == "-":
-            finalized["fundamental_warning"] = "部分估值字段缺失，已使用多源行情与K线降级分析"
-        else:
-            finalized["fundamental_warning"] = "估值字段较完整"
+        missing = []
+        for field, label in [("market_cap", "总市值"), ("pe", "PE"), ("pb", "PB"), ("turnover", "换手率")]:
+            if field in ["market_cap", "turnover"]:
+                if safe_float(finalized.get(field), 0) <= 0:
+                    missing.append(label)
+            elif finalized.get(field) == "-":
+                missing.append(label)
+        finalized["fundamental_warning"] = "真实接口字段缺失：" + "、".join(missing) if missing else "真实接口字段较完整"
     return finalized
 
 
@@ -1942,46 +1887,10 @@ def _fetch_em_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
             })
     return _normalize_daily_kline(pd.DataFrame(rows), days=days)
 
-def _fetch_tushare_daily_kline(symbol: str, start_str: str, end_str: str, days=220) -> pd.DataFrame | None:
-    """Tushare 日K主数据源：使用 daily + daily_basic 合并换手率，避免东财/AKShare 云端 502 或反爬时断档。"""
-    if not TUSHARE_TOKEN:
-        return None
-    pro = get_ts_pro()
-    if pro is None:
-        return None
-    suffix = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
-    ts_code = f"{symbol}{suffix}"
-
-    daily = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
-    if daily is None or daily.empty:
-        return None
-
-    daily = daily.rename(columns={"trade_date": "date", "vol": "volume"}).copy()
-
-    # daily_basic 主要用于补换手率；失败不影响 K 线使用
-    try:
-        basic = pro.daily_basic(
-            ts_code=ts_code,
-            start_date=start_str,
-            end_date=end_str,
-            fields="ts_code,trade_date,turnover_rate,pe_ttm,pb,total_mv"
-        )
-        if basic is not None and not basic.empty:
-            basic = basic.rename(columns={"trade_date": "date"})
-            keep_cols = [c for c in ["date", "turnover_rate"] if c in basic.columns]
-            if "date" in keep_cols:
-                daily = daily.merge(basic[keep_cols], on="date", how="left")
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"Tushare daily_basic 补换手率失败 {symbol}: {e}")
-
-    return _normalize_daily_kline(daily, days=days)
-
-
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_kline(symbol, days=220):
-    """日K完整兜底版：Tushare Token 存在时优先，其后东财/AKShare/Baostock 多层兜底。"""
+    """日K完整兜底版：东财原生接口优先，AKShare/Baostock/Tushare 多层兜底。"""
     symbol = str(symbol).strip()
     if not re.fullmatch(r"\d{6}", symbol):
         return None
@@ -1991,15 +1900,6 @@ def get_kline(symbol, days=220):
     end_str = end_date.strftime("%Y%m%d")
     start_str_bs = start_date.strftime("%Y-%m-%d")
     end_str_bs = end_date.strftime("%Y-%m-%d")
-    # 0. 如果已配置 Tushare Token，优先使用 Tushare Pro，减少东财/AKShare 在云端 502、限流导致的失败。
-    try:
-        df = _fetch_tushare_daily_kline(symbol, start_str, end_str, days=days)
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        if DEBUG_MODE:
-            st.caption(f"Tushare 日K失败 {symbol}: {e}")
-
     try:
         df = _fetch_em_daily_kline(symbol, days=days)
         if df is not None and not df.empty:
@@ -2052,10 +1952,8 @@ def get_kline(symbol, days=220):
         except Exception:
             pass
     try:
-        if TUSHARE_TOKEN:
-            pro = get_ts_pro()
-        if pro is None:
-            return None
+        if ts_token:
+            pro = ts.pro_api()
             market = ".SH" if symbol.startswith(("6", "9", "5", "7")) else ".SZ"
             ts_code = f"{symbol}{market}"
             df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
@@ -2866,9 +2764,7 @@ class MainForceStockSelector:
                 pct = safe_float(item.get("f3"))
                 turnover = safe_float(item.get("f8"))
                 market_cap = safe_float(item.get("f20")) / 100000000 if safe_float(item.get("f20")) > 1000000 else safe_float(item.get("f20"))
-                main_net = safe_float(item.get("f62"))
-                if main_net == 0:
-                    main_net = amount * (max(min(pct, 10), -10) / 100.0)
+                main_net = safe_float(item.get("f62"), 0)
                 rows.append({
                     "股票代码": code,
                     "股票简称": name,
@@ -2881,7 +2777,7 @@ class MainForceStockSelector:
                     "总市值": market_cap,
                     "市盈率": item.get("f9", "-"),
                     "资金热度分": 0.0,
-                    "数据源": "东方财富轻量实时池"
+                    "数据源": "东方财富实时资金字段f62"
                 })
             df = pd.DataFrame(rows)
             if df.empty:
@@ -2889,6 +2785,93 @@ class MainForceStockSelector:
             return self._score_candidates(df), f"东方财富轻量接口成功获取{len(df)}只候选股票"
         except Exception as exc:
             return pd.DataFrame(), f"东方财富轻量接口异常: {exc}"
+
+    def _fetch_tushare_moneyflow_pool(self, trade_date=None):
+        """Tushare 真实资金流接口：作为东财被限流时的真实数据源，不做估算。"""
+        if not ts_token:
+            return pd.DataFrame(), "Tushare Token 未配置"
+        try:
+            pro = ts.pro_api()
+            dates = []
+            if trade_date:
+                dates.append(str(trade_date).replace("-", ""))
+            today = datetime.now()
+            for i in range(0, 12):
+                d = (today - timedelta(days=i)).strftime("%Y%m%d")
+                if d not in dates:
+                    dates.append(d)
+
+            mf = None
+            used_date = None
+            for d in dates:
+                try:
+                    tmp = pro.moneyflow(trade_date=d)
+                    if tmp is not None and not tmp.empty:
+                        mf = tmp.copy()
+                        used_date = d
+                        break
+                except Exception:
+                    continue
+            if mf is None or mf.empty:
+                return pd.DataFrame(), "Tushare moneyflow 最近交易日返回空"
+
+            try:
+                basic = pro.daily_basic(trade_date=used_date, fields="ts_code,close,turnover_rate,pe_ttm,total_mv")
+            except Exception:
+                basic = pd.DataFrame()
+            try:
+                daily = pro.daily(trade_date=used_date, fields="ts_code,pct_chg,amount")
+            except Exception:
+                daily = pd.DataFrame()
+
+            df = mf.copy()
+            if basic is not None and not basic.empty:
+                df = df.merge(basic, on="ts_code", how="left")
+            if daily is not None and not daily.empty:
+                df = df.merge(daily, on="ts_code", how="left")
+            try:
+                names = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
+                if names is not None and not names.empty:
+                    df = df.merge(names, on="ts_code", how="left")
+            except Exception:
+                pass
+
+            buy_lg = pd.to_numeric(df.get("buy_lg_amount"), errors="coerce").fillna(0)
+            sell_lg = pd.to_numeric(df.get("sell_lg_amount"), errors="coerce").fillna(0)
+            buy_elg = pd.to_numeric(df.get("buy_elg_amount"), errors="coerce").fillna(0)
+            sell_elg = pd.to_numeric(df.get("sell_elg_amount"), errors="coerce").fillna(0)
+            net_mf = pd.to_numeric(df.get("net_mf_amount"), errors="coerce").fillna(0)
+            main_net_series = (buy_lg - sell_lg) + (buy_elg - sell_elg)
+            main_net_series = main_net_series.where(main_net_series != 0, net_mf)
+
+            rows = []
+            for idx, r in df.iterrows():
+                code = str(r.get("ts_code", ""))[:6]
+                if not re.fullmatch(r"\d{6}", code):
+                    continue
+                name = str(r.get("name") or "")
+                if "ST" in name or "退" in name:
+                    continue
+                rows.append({
+                    "股票代码": code,
+                    "股票简称": name or code,
+                    "所属行业": r.get("industry") or "未分类",
+                    "区间涨跌幅": safe_float(r.get("pct_chg"), 0),
+                    "最新价": safe_float(r.get("close"), 0),
+                    "主力净流入": safe_float(main_net_series.loc[idx], 0),
+                    "成交额": safe_float(r.get("amount"), 0),
+                    "换手率": safe_float(r.get("turnover_rate"), 0),
+                    "总市值": safe_float(r.get("total_mv"), 0) / 10000,
+                    "市盈率": r.get("pe_ttm", "-"),
+                    "资金热度分": 0.0,
+                    "数据源": f"Tushare真实资金流{used_date}"
+                })
+            out = pd.DataFrame(rows)
+            if out.empty:
+                return pd.DataFrame(), "Tushare moneyflow 无有效股票"
+            return self._score_candidates(out), f"Tushare moneyflow 成功获取{len(out)}只候选股票，交易日{used_date}"
+        except Exception as exc:
+            return pd.DataFrame(), f"Tushare moneyflow异常: {exc}"
 
     def _fetch_static_pool(self):
         df = pd.DataFrame(self.DEFAULT_POOL).copy()
@@ -2938,13 +2921,14 @@ class MainForceStockSelector:
         return df.drop(columns=["成交额_rank", "换手率_rank", "涨幅_rank", "净流入_rank"], errors="ignore")
 
     def get_main_force_stocks(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
-        # 只走快速路径，不再调用 pywencai/AKShare分页资金流，避免长时间转圈。
+        # 严格真实数据：东财实时资金字段失败后，转 Tushare moneyflow；不使用内置池、不估算主力净流入。
         df, msg = self._fetch_eastmoney_fast_pool(pz=220)
         if df.empty:
-            df, msg2 = self._fetch_static_pool()
+            df2, msg2 = self._fetch_tushare_moneyflow_pool()
             msg = f"{msg}；{msg2}"
+            df = df2
         if df.empty:
-            return False, pd.DataFrame(), "所有快速数据源均为空"
+            return False, pd.DataFrame(), f"真实资金数据不可用：{msg}"
         return True, df, msg
 
     def filter_stocks(self, df: pd.DataFrame, max_range_change=30.0, min_market_cap=10.0, max_market_cap=5000.0):
