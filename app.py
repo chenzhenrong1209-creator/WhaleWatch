@@ -4808,4 +4808,514 @@ def render_data_source_health_panel():
     tq = _tushare_quota_state()
     rows.append({"数据源": "tushare", "失败次数": "-", "状态": f"低频保护 已用{tq.get('used',0)}/300", "最后错误": ""})
     rows.append({"数据源": "jqdata", "失败次数": "-", "状态": "最低优先级/默认不参与核心链路", "最后错误": ""})
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "🎯 个股解析",
+    "📈 宏观推演",
+    "🔥 资金热点",
+    "🦅 高阶情报",
+    "🐉 智瞰龙虎榜",
+    "🐋 主力资金",
+    "🛰️ 新闻情报"
+])
+
+# ================= Tab 1: 个股解析 =================
+with tab1:
+    with st.container(border=True):
+        st.markdown("#### 🔎 个股解析（多维买卖点测算版）")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            symbol_input = st.text_input("标的代码", placeholder="例：600519")
+            analyze_btn = st.button("启动核心算法", type="primary", width="stretch")
+        if analyze_btn:
+            if not api_key:
+                st.error("配置缺失: GROQ_API_KEY")
+            elif len(symbol_input.strip()) != 6:
+                st.warning("代码规范验证失败")
+            else:
+                with st.spinner("量子计算与数据提取中 (启用四重行情数据引擎 + 多周期分析)..."):
+                    quote = get_stock_quote(symbol_input)
+                    df_kline = get_kline(symbol_input, days=220)
+                    mtf = get_multi_timeframe_analysis(symbol_input)
+                if not quote:
+                    st.error("无法捕获行情资产。")
+                else:
+                    st.markdown("---")
+                    name, price, pct = quote["name"], quote["price"], quote["pct"]
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric(f"{name}", f"{price:.2f}", f"{pct:.2f}%")
+                    c2.metric("总市值(亿)", fmt_num(quote.get("market_cap"), 1))
+                    c3.metric("动态 PE", fmt_metric_value(quote.get("pe"), 2))
+                    c4.metric("换手率", f"{fmt_num(quote.get("turnover"), 2)}%")
+                    st.caption(f"行情数据源链路：{quote.get('source', '未知')}｜完整度评分：{quote.get('quality_score', 0)}/10｜{quote.get('fundamental_warning', '')}")
+
+                    # 新增：先给出结构化评分和交易计划，再进入详细技术图与 AI 解读
+                    assessment = score_stock_analysis(quote, df_kline, mtf)
+                    render_score_panel(assessment)
+                    render_trade_plan_card(assessment)
+
+                    if df_kline is None or len(df_kline) < 15:
+                        st.warning("获取到的有效 K 线极少，仅能通过最新行情进行轻量化推演。")
+                        with st.spinner("🧠 首席策略官撰写资产评估报告..."):
+                            prompt = f"""
+作为顶级私募经理，请基于股票 {name}({symbol_input}) 当前状态：
+现价 {price}，涨跌幅 {pct}%，市值 {quote['market_cap']} 亿，动态 PE {quote['pe']}，换手率 {quote['turnover']}%。
+【请重点进行以下维度的分析】：
+1. 🏦 基本面诊断与资金意图盲猜
+2. ⚔️ 布局进入与离场推演：
+   - 【短期波段】进入点与离场点建议
+   - 【中长期配置】建仓点位与长线离场目标
+3. 结论定调：[看多 / 观察 / 谨慎 / 偏空]
+"""
+                            st.markdown(call_ai(prompt))
+                    else:
+                        df_kline = add_indicators(df_kline)
+                        tech = summarize_technicals(df_kline)
+                        smc = tech["smc"]
+                        fig = build_price_figure(df_kline)
+                        st.plotly_chart(fig, width="stretch")
+
+                        st.markdown("##### 🔬 核心技术指标与阻力测算")
+                        t1, t2, t3, t4 = st.columns(4)
+                        t1.metric("趋势", tech["trend"])
+                        t2.metric("RSI14", f"{tech['rsi14']:.2f}" if pd.notna(tech["rsi14"]) else "N/A")
+                        t3.metric("ATR14", f"{tech['atr14']:.2f}" if pd.notna(tech["atr14"]) else "N/A")
+                        t4.metric("MACD 状态", tech["macd_state"])
+                        t5, t6, t7, t8 = st.columns(4)
+                        t5.metric("布林状态", tech["bb_state"])
+                        t6.metric("量能状态", tech["vol_state"])
+                        t7.metric("BOS", tech["bos_state"])
+                        t8.metric("流动性扫盘", tech["sweep_state"])
+
+                        st.markdown("##### 🧩 FVG / ICT / SMC 结构信息")
+                        f1, f2 = st.columns(2)
+                        with f1:
+                            bull_fvg = tech["nearest_bull_fvg"]
+                            if bull_fvg:
+                                st.success(f"最近多头 FVG：{bull_fvg['date']} | 区间 {bull_fvg['bottom']:.2f} - {bull_fvg['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显多头 FVG")
+                            if smc["latest_bull_ob"]:
+                                st.success(f"最近多头 OB：{smc['latest_bull_ob']['date']} | 区间 {smc['latest_bull_ob']['bottom']:.2f} - {smc['latest_bull_ob']['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显多头 OB")
+                        with f2:
+                            bear_fvg = tech["nearest_bear_fvg"]
+                            if bear_fvg:
+                                st.error(f"最近空头 FVG：{bear_fvg['date']} | 区间 {bear_fvg['bottom']:.2f} - {bear_fvg['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显空头 FVG")
+                            if smc["latest_bear_ob"]:
+                                st.error(f"最近空头 OB：{smc['latest_bear_ob']['date']} | 区间 {smc['latest_bear_ob']['bottom']:.2f} - {smc['latest_bear_ob']['top']:.2f}")
+                            else:
+                                st.info("最近未检测到明显空头 OB")
+
+                        st.markdown("##### 🏗️ 市场结构补充")
+                        s1, s2, s3 = st.columns(3)
+                        eqh_count = len(smc["eqh"]) if smc["eqh"] else 0
+                        eql_count = len(smc["eql"]) if smc["eql"] else 0
+                        pd_zone = smc["pd_zone"]["zone"] if smc["pd_zone"] else "N/A"
+                        s1.metric("MSS", smc["mss"])
+                        s2.metric("EQH / EQL", f"{eqh_count} / {eql_count}")
+                        s3.metric("P/D Zone", pd_zone)
+                        latest_close = tech["latest_close"]
+
+                        support_zone = min(tech["ema_short"], tech["ema_mid"])
+                        pressure_zone = max(tech["ema_short"], tech["ema_mid"])
+                        st.markdown("##### 🎯 动态支撑 / 压力")
+                        z1, z2, z3 = st.columns(3)
+                        z1.metric("最新收盘", f"{latest_close:.2f}")
+                        z2.metric("动态支撑参考", f"{support_zone:.2f}")
+                        z3.metric("动态压力参考", f"{pressure_zone:.2f}")
+
+                    st.markdown("##### ⏱️ 多周期技术分析")
+                    st.caption(f"数据质量：{mtf.get('data_quality', '未知')}｜综合分：{mtf.get('score', 0)}")
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        render_tf_card(mtf["15m"], "15分钟级别")
+                    with m2:
+                        render_tf_card(mtf["60m"], "60分钟级别")
+                    with m3:
+                        render_tf_card(mtf["120m"], "120分钟级别")
+
+                    st.markdown("##### 🧠 多周期综合结论")
+                    v1, v2, v3, v4 = st.columns(4)
+                    v1.metric("综合结论", mtf.get("final_view", "无法判断"))
+                    v2.metric("操作倾向", mtf.get("action", "等待确认"))
+                    v3.metric("关键支撑", f"{mtf['key_support']:.2f}" if mtf.get("key_support") is not None else "N/A")
+                    v4.metric("关键压力", f"{mtf['key_pressure']:.2f}" if mtf.get("key_pressure") is not None else "N/A")
+                    st.info(f"综合结论：**{mtf.get('final_view', '无法判断')}**；执行建议：**{mtf.get('action', '等待确认')}**")
+
+                    # 新增：量化交易计划卡片，便于直接转化为盘中观察点
+                    st.markdown("##### 🎯 交易计划辅助")
+                    current_px = mtf.get("current_close") or price
+                    key_support = mtf.get("key_support")
+                    key_pressure = mtf.get("key_pressure")
+                    if key_support and key_pressure and current_px:
+                        risk = max(current_px - key_support, current_px * 0.01)
+                        reward = max(key_pressure - current_px, 0)
+                        rr = reward / risk if risk > 0 else 0
+                        p1, p2, p3, p4 = st.columns(4)
+                        p1.metric("当前参考价", f"{current_px:.2f}")
+                        p2.metric("回撤观察区", f"{key_support:.2f} - {current_px:.2f}")
+                        p3.metric("突破确认位", f"{key_pressure:.2f}")
+                        p4.metric("估算盈亏比", f"{rr:.2f}")
+                        if rr < 1:
+                            st.warning("当前价格距离压力较近，盈亏比一般，适合等回踩或放量突破后再判断。")
+                        elif rr >= 2:
+                            st.success("当前盈亏比较好，但仍需结合成交量与大盘环境确认。")
+                        else:
+                            st.info("盈亏比中性，适合小仓位观察或等待更清晰信号。")
+                    else:
+                        st.warning("关键支撑/压力尚不完整，建议先以日线结构和成交量为主。")
+
+                    # 新增：多周期结构明细表，方便手机端复制与复盘
+                    tf_table = pd.DataFrame([
+                        {
+                            "周期": "15分钟",
+                            "偏向": mtf["15m"].get("bias"),
+                            "趋势": mtf["15m"].get("trend"),
+                            "MACD": mtf["15m"].get("macd_state"),
+                            "RSI": round(mtf["15m"].get("rsi"), 2) if mtf["15m"].get("rsi") is not None else "-",
+                            "支撑": round(mtf["15m"].get("support"), 2) if mtf["15m"].get("support") is not None else "-",
+                            "压力": round(mtf["15m"].get("pressure"), 2) if mtf["15m"].get("pressure") is not None else "-",
+                            "样本": mtf["15m"].get("bars"),
+                            "数据源": mtf["15m"].get("source")
+                        },
+                        {
+                            "周期": "60分钟",
+                            "偏向": mtf["60m"].get("bias"),
+                            "趋势": mtf["60m"].get("trend"),
+                            "MACD": mtf["60m"].get("macd_state"),
+                            "RSI": round(mtf["60m"].get("rsi"), 2) if mtf["60m"].get("rsi") is not None else "-",
+                            "支撑": round(mtf["60m"].get("support"), 2) if mtf["60m"].get("support") is not None else "-",
+                            "压力": round(mtf["60m"].get("pressure"), 2) if mtf["60m"].get("pressure") is not None else "-",
+                            "样本": mtf["60m"].get("bars"),
+                            "数据源": mtf["60m"].get("source")
+                        },
+                        {
+                            "周期": "120分钟",
+                            "偏向": mtf["120m"].get("bias"),
+                            "趋势": mtf["120m"].get("trend"),
+                            "MACD": mtf["120m"].get("macd_state"),
+                            "RSI": round(mtf["120m"].get("rsi"), 2) if mtf["120m"].get("rsi") is not None else "-",
+                            "支撑": round(mtf["120m"].get("support"), 2) if mtf["120m"].get("support") is not None else "-",
+                            "压力": round(mtf["120m"].get("pressure"), 2) if mtf["120m"].get("pressure") is not None else "-",
+                            "样本": mtf["120m"].get("bars"),
+                            "数据源": mtf["120m"].get("source")
+                        }
+                    ])
+                    st.dataframe(tf_table, width="stretch", hide_index=True)
+
+                    with st.spinner(f"🧠 首席策略官正在使用 {selected_model} 进行多维深度解构..."):
+                        if df_kline is not None and len(df_kline) >= 15:
+                            tech = summarize_technicals(add_indicators(df_kline))
+                            smc = tech["smc"]
+                            ema_mid_val = f"{tech['ema_mid']:.2f}" if pd.notna(tech['ema_mid']) else "数据不足"
+                            ema_long_val = f"{tech['ema_long']:.2f}" if pd.notna(tech['ema_long']) else "数据不足"
+                            prompt = f"""
+你现在是顶级私募基金的操盘手（精通基本面、量价资金博弈、多周期共振）。
+请对股票 {name}({symbol_input}) 做一份极具实战价值的【估值 + 资金流 + 支撑/压力 + 精准买卖点 + 多周期共振】综合研判。
+【基础与资金博弈数据】
+- 现价: {price} (日涨跌幅: {pct}%)
+- 总市值: {quote['market_cap']} 亿 | 动态 PE: {quote['pe']} | 市净率 PB: {quote['pb']}
+- 当日换手率: {quote['turnover']}%
+- 数据源链路: {quote.get('source', '未知')} | 数据完整度: {quote.get('quality_score', 0)}/10 | 估值提示: {quote.get('fundamental_warning', '')}
+- 近期量能状态: {tech['vol_state']}
+【核心日线技术与结构数据】
+- 趋势状态: {tech['trend']} | RSI14: {tech['rsi14']}
+- 最新收盘: {tech['latest_close']}
+- 短期生命线 (EMA{ema_short}): {tech['ema_short']}
+- 中长期基准 (EMA{ema_mid}/{ema_long}): {ema_mid_val} / {ema_long_val}
+- 结构特征: BOS({tech['bos_state']}), MSS({smc['mss']})
+- 异常流动性: 扫盘({tech['sweep_state']})
+- 核心磁区 (FVG/OB):
+  近期多头 FVG: {tech['nearest_bull_fvg']}
+  近期空头 FVG: {tech['nearest_bear_fvg']}
+  近期多头 OB: {smc['latest_bull_ob']}
+  近期空头 OB: {smc['latest_bear_ob']}
+【多周期分析】
+- 15分钟: {mtf['15m']}
+- 60分钟: {mtf['60m']}
+- 120分钟: {mtf['120m']}
+- 多周期综合结论: {mtf['final_view']}
+【请务必输出】
+1. 🏦 基本面与估值定位
+2. 🌊 资金面穿透
+3. 🎯 支撑与压力测算
+4. ⚔️ 布局进入与离场推演
+   - 【短期波段】
+   - 【中长期配置】
+5. ⏱️ 多周期共振判断
+   - 15分钟、60分钟、120分钟是否共振
+   - 是适合追涨、低吸、等回踩，还是观望
+6. 最后给出一句明确结论：强势看多 / 偏多观察 / 震荡等待 / 谨慎偏空
+要求：语言要专业、直接、机构化，不能空话，尽量像真正交易员盘前计划。如果 PE/PB/市值等字段仍有缺失，不要简单说“无法分析”，而要说明数据源限制，并结合已有价格、涨跌幅、换手率、K线结构、多周期结果进行降级研判。
+"""
+                            st.markdown(call_ai(prompt))
+                        else:
+                            prompt = f"""
+你现在是顶级私募基金操盘手。
+请基于股票 {name}({symbol_input}) 当前基础数据与多周期结论做综合研判。
+【基础数据】
+- 现价: {price}
+- 日涨跌幅: {pct}%
+- 市值: {quote['market_cap']} 亿
+- 动态 PE: {quote['pe']}
+- 市净率 PB: {quote['pb']}
+- 换手率: {quote['turnover']}%
+【多周期分析】
+- 15分钟: {mtf['15m']}
+- 60分钟: {mtf['60m']}
+- 120分钟: {mtf['120m']}
+- 多周期综合结论: {mtf['final_view']}
+请输出：
+1. 当前股性判断
+2. 多周期共振解读
+3. 短线交易建议
+4. 中线观察建议
+5. 最后一行给明确结论：看多 / 观察 / 谨慎 / 偏空
+"""
+                            st.markdown(call_ai(prompt))
+
+    st.markdown("---")
+    with st.container(border=True):
+        render_watchlist_scanner()
+
+# ================= Tab 2: 宏观大盘推演 (已升级为多智能体版本) =================
+with tab2:
+    with st.container(border=True):
+        st.markdown("#### 📊 全局宏观基本面推演")
+        display_macro_analysis_ui()
+
+
+# ================= Tab 3: 热点资金板块 =================
+with tab3:
+    with st.container(border=True):
+        st.markdown("#### 🔥 资金热点板块（附实战标的推荐）")
+        st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时会自动使用真实缓存兜底，不再使用观察池或 JQData 冒充实时热点。")
+        if st.button("扫描板块与生成配置推荐", type="primary"):
+            with st.spinner("正在获取板块异动数据...（只展示真实接口/真实行情计算结果）"):
+                blocks = get_hot_blocks()
+            if blocks:
+                df_blocks = pd.DataFrame(blocks)
+                st.dataframe(df_blocks, width="stretch", hide_index=True)
+                source_set = "、".join(sorted({str(b.get("数据源", "未知")) for b in blocks}))
+                st.caption(f"板块数据源：{source_set}。本页不使用内置热点兜底，显示的都是 AKShare/东方财富接口返回或真实缓存。")
+                if not api_key:
+                    st.info("未配置 GROQ_API_KEY，已展示板块数据；配置后可生成 AI 配置建议。")
+                else:
+                    with st.spinner("🧠 首席游资操盘手拆解逻辑并筛选跟进标的..."):
+                        blocks_str = "\n".join([
+                            f"{b.get('板块名称', '-')} (涨幅:{b.get('涨跌幅', 0)}%, 领涨龙头:{b.get('领涨股票', '-')}, 数据源:{b.get('数据源', '-')})"
+                            for b in blocks[:5]
+                        ])
+                        prompt = f"""
+作为顶级游资操盘手，请深度解读今日最强的 5 个板块及其领涨龙头：
+{blocks_str}
+请输出：
+1. 【核心驱动】这些板块背后的底层逻辑或共振政策利好是什么？
+2. 【行情定性】这是存量博弈的一日游情绪宣泄，还是具备中线发酵潜力的主线？
+3. 🎯 【个股配置与实战推荐】：
+   基于上述板块逻辑和领涨股票，为散户推荐 2-3 只可以进行重点配置或埋伏的股票。
+   对于推荐的每一只股票，请务必写明：
+   - 股票名称与行业归属
+   - 核心配置理由
+   - 建议的入场姿势
+"""
+                        st.markdown(call_ai(prompt, temperature=0.4))
+            else:
+                st.warning("AKShare/东方财富真实板块接口均未返回结果，且没有可用真实缓存。请稍后重试，或打开调试模式查看失败原因。")
+
+# ================= Tab 4: 高阶情报终端 =================
+with tab4:
+    st.markdown("#### 📡 机构级事件图谱与智能评级矩阵")
+    st.write("追踪彭博、推特、美联储、特朗普等宏观变量。已深度适配移动端，引入极客量化风控模块。")
+    if st.button("🚨 截获并解析全球突发", type="primary"):
+        if not api_key:
+            st.error("配置缺失: GROQ_API_KEY")
+        else:
+            with st.spinner("监听全网节点并执行深度 NLP 解析..."):
+                global_news = get_global_news()
+                if not global_news:
+                    st.warning("当前信号静默或被防火墙拦截。")
+                else:
+                    news_text = "\n".join(global_news)
+                    with st.expander("🕵️‍♂️ 查看底层监听流 (Raw Data)"):
+                        st.text(news_text)
+                    with st.spinner("🧠 情报官正在生成自适应移动端的情报卡片..."):
+                        prompt = f"""
+你现在是华尔街顶级对冲基金的【首席宏观情报官】与【高阶量化风控专家】。
+我截获了全球金融市场的底层快讯流。请你挑选出最具爆炸性和市场影响力的 5-8 条动态。
+重点寻猎靶标：彭博社 (Bloomberg)、推特 (X)、特朗普 (Trump)、马斯克 (Musk)、美联储，以及任何可能引发流动性危机或资金抱团退潮的事件。
+⚠️ 【排版严令：禁止使用 Markdown 表格】 ⚠️
+为了适配移动端设备的终端显示，你绝对不能使用表格！必须为每一个事件生成一个独立的情报卡片。
+输出格式必须如下：
+### [评级 Emoji] [[信源/人物]] [真实事件标题]
+* ⏰ **时间截获**: [提取对应时间]
+* 📝 **情报简述**: [说明发生了什么]
+* 🎯 **受波及资产**: [指出利好/利空资产]
+* 🧠 **沙盘推演**: [一句话指出实质影响]
+* ☢️ **风控预警**: [一个简短硬核预警]
+---
+评级标准：
+🔴 核心：直接引发巨震的突发、大选级人物强硬表态、黑天鹅事件
+🟡 重要：关键经济数据、行业重磅政策、流动性显著异动
+🔵 一般：常规宏观事件
+底层情报数据流：
+{news_text}
+"""
+                        report = call_ai(prompt, temperature=0.2)
+                        st.markdown("---")
+                        st.markdown(report)
+
+# ================= Tab 5: 智瞰龙虎榜解析 =================
+with tab5:
+    with st.container(border=True):
+        st.markdown("#### 🐉 智瞰龙虎榜 AI 分析集群 2.0")
+        st.write("整合龙虎榜数据采集、量化评分、游资行为、个股潜力、题材追踪、风险控制与首席策略师综合研判。")
+
+        col_date, col_lookback, col_depth = st.columns([1, 1, 1])
+        with col_date:
+            lhb_date = st.date_input("选择龙虎榜日期", datetime.now() - timedelta(days=1))
+        with col_lookback:
+            lookback_days = st.slider("无数据时自动回溯天数", 3, 20, 10, 1)
+        with col_depth:
+            ai_depth = st.selectbox("AI 分析深度", ["标准", "深度"], index=0, help="标准更快：个股潜力+风险控制+首席策略；深度会增加游资画像和题材追踪。")
+
+        col_opt1, col_opt2 = st.columns([1, 1])
+        with col_opt1:
+            run_ai_lhb = st.checkbox("生成 AI 分析报告", value=True, help="关闭后只显示数据、评分和候选股票，速度最快。")
+        with col_opt2:
+            show_raw_lhb = st.checkbox("显示原始明细数据", value=False)
+
+        run_lhb_btn = st.button("🚀 启动智瞰龙虎分析集群", type="primary", width="stretch")
+
+        if run_lhb_btn:
+            if run_ai_lhb and not api_key:
+                st.error("配置缺失: GROQ_API_KEY。你可以先关闭“生成 AI 分析报告”，只查看龙虎榜数据和量化评分。")
+            else:
+                date_str = lhb_date.strftime("%Y-%m-%d")
+                with st.spinner(f"正在获取 {date_str} 龙虎榜数据，并自动回溯最近可用交易日..."):
+                    engine = LonghubangEngine(model=selected_model)
+                    res = engine.run_comprehensive_analysis(
+                        date=date_str,
+                        lookback_days=lookback_days,
+                        ai_depth=ai_depth,
+                        run_ai=run_ai_lhb,
+                    )
+
+                if not res.get("success"):
+                    st.error(f"未能获取到 {date_str} 及最近 {lookback_days} 天的龙虎榜数据。可能是 API 受限、云端访问不稳定，或近期无交易日数据。")
+                    with st.expander("查看失败明细", expanded=False):
+                        st.write("\n".join(res.get("errors", [])))
+                else:
+                    used_date = res.get("used_date") or date_str
+                    source = res.get("source", "未知数据源")
+                    info = res.get("data_info", {})
+                    summary = info.get("summary", {})
+                    df_lhb = res.get("dataframe", pd.DataFrame())
+                    scoring_df = res.get("scoring_ranking", pd.DataFrame())
+
+                    if used_date != date_str:
+                        st.warning(f"{date_str} 未获取到有效龙虎榜数据，已自动切换到最近可用日期：{used_date}。")
+                    st.success(f"✓ 成功获取 {used_date} 的龙虎榜数据。数据源：{source}。")
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("记录总数", f"{info.get('total_records', 0)}")
+                    m2.metric("涉及股票", f"{info.get('total_stocks', 0)}")
+                    m3.metric("涉及游资", f"{info.get('total_youzi', 0)}")
+                    m4.metric("净流入合计", f"{safe_float(summary.get('total_net_inflow'))/100000000:.2f} 亿")
+
+                    if res.get("errors"):
+                        with st.expander("查看数据源回溯记录", expanded=False):
+                            st.write("\n".join(res.get("errors", [])[-30:]))
+
+                    st.markdown("### 🧮 智瞰量化评分排名")
+                    if scoring_df is not None and not scoring_df.empty:
+                        display_cols = [c for c in ["股票代码", "股票名称", "智瞰评分", "信号标签", "净流入金额", "买入金额", "卖出金额", "上榜次数", "游资数量", "概念"] if c in scoring_df.columns]
+                        st.dataframe(scoring_df[display_cols].head(20), width="stretch", hide_index=True)
+                    else:
+                        st.info("暂无可评分数据。")
+
+                    st.markdown("### 🎯 次日重点观察池")
+                    recs = res.get("recommended_stocks", [])
+                    if recs:
+                        rec_df = pd.DataFrame(recs)
+                        st.dataframe(rec_df, width="stretch", hide_index=True)
+                    else:
+                        st.info("暂无推荐候选。")
+
+                    tab_overview, tab_youzi, tab_stock, tab_theme, tab_risk, tab_chief, tab_raw = st.tabs([
+                        "📊 数据概况", "🎯 游资画像", "📈 个股潜力", "🔥 题材追踪", "⚠️ 风险控制", "👔 首席策略", "🧾 明细数据"
+                    ])
+
+                    with tab_overview:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.markdown("##### 活跃游资 TOP")
+                            top_youzi = summary.get("top_youzi", {})
+                            if top_youzi:
+                                st.dataframe(pd.DataFrame([{"游资名称": k, "净流入金额": v} for k, v in top_youzi.items()]), width="stretch", hide_index=True)
+                            else:
+                                st.info("当前数据源未提供明确游资席位。")
+                        with c2:
+                            st.markdown("##### 热门概念 TOP")
+                            hot_concepts = summary.get("hot_concepts", {})
+                            if hot_concepts:
+                                st.dataframe(pd.DataFrame([{"概念": k, "出现次数": v} for k, v in hot_concepts.items()]), width="stretch", hide_index=True)
+                            else:
+                                st.info("当前数据源未提供明确概念字段。")
+
+                    agents = res.get("agents_analysis", {})
+                    with tab_youzi:
+                        if agents.get("youzi"):
+                            st.markdown(agents["youzi"].get("analysis", ""))
+                        elif ai_depth != "深度":
+                            st.info("当前为标准模式，未运行游资画像分析。选择 AI 分析深度为“深度”后可生成。")
+                        else:
+                            st.info("暂无游资画像报告。")
+                    with tab_stock:
+                        if agents.get("stock"):
+                            st.markdown(agents["stock"].get("analysis", ""))
+                        else:
+                            st.info("暂无个股潜力报告。")
+                    with tab_theme:
+                        if agents.get("theme"):
+                            st.markdown(agents["theme"].get("analysis", ""))
+                        elif ai_depth != "深度":
+                            st.info("当前为标准模式，未运行题材追踪分析。选择 AI 分析深度为“深度”后可生成。")
+                        else:
+                            st.info("暂无题材追踪报告。")
+                    with tab_risk:
+                        if agents.get("risk"):
+                            st.markdown(agents["risk"].get("analysis", ""))
+                        else:
+                            st.info("暂无风险控制报告。")
+                    with tab_chief:
+                        if agents.get("chief"):
+                            st.markdown(agents["chief"].get("analysis", ""))
+                        elif not run_ai_lhb:
+                            st.info("你已关闭 AI 报告，本页仅展示量化评分与数据概况。")
+                        else:
+                            st.info("暂无首席策略报告。")
+                    with tab_raw:
+                        if show_raw_lhb and df_lhb is not None and not df_lhb.empty:
+                            st.dataframe(df_lhb, width="stretch", hide_index=True)
+                        else:
+                            st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
+# ================= Tab 6: 主力资金选股 =================
+with tab6:
+    try:
+        render_main_force_tab()
+    except Exception as exc:
+        render_module_crash_box("主力资金", exc)
+
+# ================= Tab 7: 高端情报终端 Pro =================
+with tab7:
+    try:
+        render_high_end_news_terminal()
+    except Exception as exc:
+        render_module_crash_box("新闻情报", exc)
