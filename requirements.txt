@@ -11,4 +11,3 @@ pywencai
 jqdatasdk
 lxml
 beautifulsoup4
-efinance
