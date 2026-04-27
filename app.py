@@ -117,11 +117,7 @@ with st.sidebar:
         st.success("Tushare Token：已从 secrets 读取")
     else:
         st.error("Tushare Token：未读取到，请检查 secrets")
-    jq_ok, jq_msg = ensure_jqdata_auth()
-    if jq_ok:
-        st.success("JQData：已从 secrets 登录")
-    else:
-        st.warning(f"JQData：{jq_msg}")
+
     STRICT_REAL_DATA = st.checkbox("🧱 严格真实数据模式", value=True, help="开启后不使用内置观察池、不用K线构造行情、不估算主力资金。接口失败就明确显示失败。")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
 
