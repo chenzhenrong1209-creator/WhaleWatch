@@ -5974,4 +5974,51 @@ with tab5:
 
                     agents = res.get("agents_analysis", {})
                     with tab_youzi:
-                        if 
+                        if agents.get("youzi"):
+                            st.markdown(agents["youzi"].get("analysis", ""))
+                        elif ai_depth != "深度":
+                            st.info("当前为标准模式，未运行游资画像分析。选择 AI 分析深度为“深度”后可生成。")
+                        else:
+                            st.info("暂无游资画像报告。")
+                    with tab_stock:
+                        if agents.get("stock"):
+                            st.markdown(agents["stock"].get("analysis", ""))
+                        else:
+                            st.info("暂无个股潜力报告。")
+                    with tab_theme:
+                        if agents.get("theme"):
+                            st.markdown(agents["theme"].get("analysis", ""))
+                        elif ai_depth != "深度":
+                            st.info("当前为标准模式，未运行题材追踪分析。选择 AI 分析深度为“深度”后可生成。")
+                        else:
+                            st.info("暂无题材追踪报告。")
+                    with tab_risk:
+                        if agents.get("risk"):
+                            st.markdown(agents["risk"].get("analysis", ""))
+                        else:
+                            st.info("暂无风险控制报告。")
+                    with tab_chief:
+                        if agents.get("chief"):
+                            st.markdown(agents["chief"].get("analysis", ""))
+                        elif not run_ai_lhb:
+                            st.info("你已关闭 AI 报告，本页仅展示量化评分与数据概况。")
+                        else:
+                            st.info("暂无首席策略报告。")
+                    with tab_raw:
+                        if show_raw_lhb and df_lhb is not None and not df_lhb.empty:
+                            st.dataframe(df_lhb, width="stretch", hide_index=True)
+                        else:
+                            st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
+# ================= Tab 6: 主力资金选股 =================
+with tab6:
+    try:
+        render_main_force_tab()
+    except Exception as exc:
+        render_module_crash_box("主力资金", exc)
+
+# ================= Tab 7: 高端情报终端 Pro =================
+with tab7:
+    try:
+        render_high_end_news_terminal()
+    except Exception as exc:
+        render_module_crash_box("新闻情报", exc)
