@@ -26,6 +26,7 @@ from collections import Counter
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
+import hashlib
 
 warnings.filterwarnings('ignore')
 
@@ -66,7 +67,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v6.5.1-JQDATA-STABLE-PANELS | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v10.0-STABLE-SOURCES | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -493,11 +494,8 @@ with st.sidebar:
         st.success("Tushare Token：已从 secrets 读取")
     else:
         st.error("Tushare Token：未读取到，请检查 secrets")
-    jq_ok, jq_msg = ensure_jqdata_auth()
-    if jq_ok:
-        st.success("JQData：已从 secrets 登录")
-    else:
-        st.warning(f"JQData：{jq_msg}")
+    # JQData 当前账号近期权限受限，降为最低优先级；不在侧边栏主动登录，避免刷新时反复触发权限报错。
+    st.info("JQData：已降级为手动验证源，默认不参与宏观/资金/热点核心链路")
     STRICT_REAL_DATA = st.checkbox("🧱 严格真实数据模式", value=True, help="开启后不使用内置观察池、不用K线构造行情、不估算主力资金。接口失败就明确显示失败。")
     DEBUG_MODE = st.checkbox("🛠️ 开启底层日志嗅探")
 
@@ -1606,53 +1604,178 @@ def _load_json_cache(path, max_age_seconds=1800):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_market_pulse():
-    """市场脉搏：JQData 指数日线优先，东财只做 USD/CNH 补充；不使用缓存伪装最新。"""
-    targets = {"上证指数": "000001.XSHG", "深证成指": "399001.XSHE", "创业板指": "399006.XSHE", "沪深300": "000300.XSHG", "科创50": "000688.XSHG"}
-    pulse = {}
-    ok, msg = ensure_jqdata_auth()
-    if ok:
+    """宏观实时看板稳定版：完全跳过 JQData，按 AKShare/东方财富/新浪/腾讯取真实指数行情；失败时只展示最近一次真实缓存。"""
+    targets = {
+        "上证指数": {"em": "1.000001", "sina": "s_sh000001", "tencent": "sh000001", "ak_codes": ["000001", "sh000001"]},
+        "深证成指": {"em": "0.399001", "sina": "s_sz399001", "tencent": "sz399001", "ak_codes": ["399001", "sz399001"]},
+        "创业板指": {"em": "0.399006", "sina": "s_sz399006", "tencent": "sz399006", "ak_codes": ["399006", "sz399006"]},
+        "沪深300": {"em": "1.000300", "sina": "s_sh000300", "tencent": "sh000300", "ak_codes": ["000300", "sh000300"]},
+        "科创50": {"em": "1.000688", "sina": "s_sh000688", "tencent": "sh000688", "ak_codes": ["000688", "sh000688"]},
+    }
+    cache_path = ".stock_terminal_cache/market_pulse/market_pulse_v10.json"
+
+    def _norm_price(v):
+        x = safe_float(v, 0.0)
+        # 东财指数/外汇部分字段常见为放大 100 倍的整数；但真实指数点位一般 1000-10000，不直接除以 100。
+        if x > 100000:
+            return x / 100
+        return x
+
+    def _save_pulse_cache(payload):
         try:
-            df = jq.get_price(list(targets.values()), end_date=datetime.now().strftime("%Y-%m-%d"), count=2, frequency="daily", fields=["close"], fq="pre", panel=False)
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                if "code" not in df.columns and "security" in df.columns:
-                    df = df.rename(columns={"security": "code"})
-                if "time" not in df.columns and "index" in df.columns:
-                    df = df.rename(columns={"index": "time"})
-                code_to_name = {v: k for k, v in targets.items()}
-                for jq_code, g in df.groupby("code"):
-                    g = g.sort_values("time")
-                    last = g.iloc[-1]
-                    prev = g.iloc[-2] if len(g) >= 2 else last
-                    close = safe_float(last.get("close"), 0)
-                    prev_close = safe_float(prev.get("close"), 0)
-                    pct = ((close - prev_close) / prev_close * 100) if close > 0 and prev_close > 0 else 0
-                    name = code_to_name.get(str(jq_code))
-                    if name and close > 0:
-                        pulse[name] = {"price": close, "pct": pct, "source": "JQData指数日线", "status": "真实最新交易日"}
+            import os
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            _save_json_cache(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "data": payload})
+        except Exception:
+            pass
+
+    def _load_pulse_cache():
+        cached = _load_json_cache(cache_path, max_age_seconds=2 * 3600)
+        if cached and isinstance(cached.get("data"), dict):
+            data = cached["data"]
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    v["source"] = f"{v.get('source','真实缓存')}｜缓存 {cached.get('time','')}"
+                    v["status"] = "真实缓存"
+            return data
+        return None
+
+    def _from_ak_index(name, cfg):
+        for fn in ["stock_zh_index_spot_em", "stock_zh_index_spot_sina"]:
+            if not hasattr(ak, fn):
+                continue
+            try:
+                df = getattr(ak, fn)()
+                if df is None or df.empty:
+                    continue
+                dff = df.copy()
+                cols = {str(c): c for c in dff.columns}
+                code_col = next((cols[c] for c in cols if c in ["代码", "code", "指数代码", "symbol"] or "代码" in c.lower()), None)
+                name_col = next((cols[c] for c in cols if c in ["名称", "name", "指数名称"] or "名称" in c.lower()), None)
+                price_col = next((cols[c] for c in cols if c in ["最新价", "最新", "close", "最新点位"] or "最新" in c), None)
+                pct_col = next((cols[c] for c in cols if c in ["涨跌幅", "pct_chg", "涨跌幅%"] or "涨跌幅" in c), None)
+                if price_col is None:
+                    continue
+                mask = pd.Series(False, index=dff.index)
+                if name_col is not None:
+                    mask = mask | dff[name_col].astype(str).str.contains(name, na=False)
+                if code_col is not None:
+                    for code in cfg.get("ak_codes", []):
+                        raw = str(code).replace("sh", "").replace("sz", "")
+                        mask = mask | dff[code_col].astype(str).str.contains(raw, na=False)
+                hit = dff[mask]
+                if not hit.empty:
+                    row = hit.iloc[0]
+                    price = safe_float(row.get(price_col), 0)
+                    pct = safe_float(row.get(pct_col), 0) if pct_col is not None else 0
+                    if price > 0:
+                        return {"price": price, "pct": pct, "source": f"AKShare-{fn}", "status": "真实接口"}
+            except Exception as exc:
+                if globals().get("DEBUG_MODE", False):
+                    st.caption(f"AKShare指数失败 {name}/{fn}: {exc}")
+        return None
+
+    def _from_em_index(secid):
+        try:
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
+            params = {"secid": secid, "ut": "fa5fd1943c7b386f172d6893dbfba10b", "fltt": 2, "invt": 2, "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f107,f116,f170"}
+            if "fetch_eastmoney_native" in globals():
+                res = fetch_eastmoney_native(url, params=params, timeout=6, retries=1, cache_key=f"pulse_{secid}", cache_ttl=900, referer="https://quote.eastmoney.com/center/gridlist.html")
+            else:
+                res = fetch_json(url + "?" + "&".join([f"{k}={v}" for k, v in params.items()]), timeout=5, retries=1, extra_headers={"Referer": "https://quote.eastmoney.com/center/gridlist.html"})
+            data = res.get("data") if isinstance(res, dict) else None
+            if data:
+                price = _norm_price(data.get("f43"))
+                pct = safe_float(data.get("f170"), 0)
+                pct = pct / 100 if abs(pct) > 100 else pct
+                if price > 0:
+                    return {"price": price, "pct": pct, "source": "东方财富指数实时", "status": "真实接口"}
         except Exception as exc:
-            if DEBUG_MODE:
-                st.caption(f"JQData指数行情失败：{exc}")
+            if globals().get("DEBUG_MODE", False):
+                st.caption(f"东财指数失败 {secid}: {exc}")
+        return None
+
+    def _from_sina_index(sina_code):
+        try:
+            url = f"https://hq.sinajs.cn/list={sina_code}"
+            res = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS), "Referer": "https://finance.sina.com.cn/"}, timeout=5)
+            m = re.search(r'="(.*?)"', res.text)
+            if not m:
+                return None
+            arr = m.group(1).split(",")
+            if sina_code.startswith("s_") and len(arr) >= 4:
+                price = safe_float(arr[1], 0)
+                pct = safe_float(arr[3], 0)
+            elif len(arr) >= 4:
+                price = safe_float(arr[3], 0)
+                prev = safe_float(arr[2], 0)
+                pct = (price - prev) / prev * 100 if price > 0 and prev > 0 else 0
+            else:
+                return None
+            if price > 0:
+                return {"price": price, "pct": pct, "source": "新浪指数实时", "status": "真实接口"}
+        except Exception as exc:
+            if globals().get("DEBUG_MODE", False):
+                st.caption(f"新浪指数失败 {sina_code}: {exc}")
+        return None
+
+    def _from_tencent_index(tencent_code):
+        try:
+            url = f"https://qt.gtimg.cn/q={tencent_code}"
+            res = requests.get(url, headers={"User-Agent": random.choice(USER_AGENTS), "Referer": "https://gu.qq.com/"}, timeout=5)
+            text = res.text or ""
+            m = re.search(r'="(.*?)"', text)
+            if not m:
+                return None
+            arr = m.group(1).split("~")
+            price = safe_float(arr[3] if len(arr) > 3 else 0, 0)
+            pct = safe_float(arr[32] if len(arr) > 32 else 0, 0)
+            if price > 0:
+                return {"price": price, "pct": pct, "source": "腾讯指数实时", "status": "真实接口"}
+        except Exception as exc:
+            if globals().get("DEBUG_MODE", False):
+                st.caption(f"腾讯指数失败 {tencent_code}: {exc}")
+        return None
+
+    pulse = {}
+    for name, cfg in targets.items():
+        item = _from_ak_index(name, cfg) or _from_em_index(cfg["em"]) or _from_sina_index(cfg["sina"]) or _from_tencent_index(cfg["tencent"])
+        if item:
+            pulse[name] = item
+        else:
+            pulse[name] = {"price": 0.0, "pct": 0.0, "source": "AKShare/东方财富/新浪/腾讯均不可用", "status": "真实接口暂不可用"}
+
+    # USD/CNH：优先东财；失败后不伪造，使用真实缓存。
     try:
-        cnh_url = "https://push2.eastmoney.com/api/qt/stock/get?secid=133.USDCNH&ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f43,f170"
-        cnh_res = fetch_json(cnh_url, timeout=4, retries=0)
-        cnh_data = cnh_res.get("data") if isinstance(cnh_res, dict) else None
-        if cnh_data:
-            cnh_price = safe_float(cnh_data.get("f43"), 0.0)
-            cnh_pct = safe_float(cnh_data.get("f170"), 0.0)
-            if cnh_price > 0:
-                pulse["USD/CNH(离岸)"] = {"price": cnh_price, "pct": cnh_pct, "source": "东方财富外汇", "status": "真实接口"}
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {"secid": "133.USDCNH", "ut": "fa5fd1943c7b386f172d6893dbfba10b", "fltt": 2, "invt": 2, "fields": "f43,f58,f60,f170"}
+        if "fetch_eastmoney_native" in globals():
+            res = fetch_eastmoney_native(url, params=params, timeout=6, retries=1, cache_key="pulse_usdcnh", cache_ttl=900, referer="https://quote.eastmoney.com/")
+        else:
+            res = fetch_json(url + "?" + "&".join([f"{k}={v}" for k, v in params.items()]), timeout=5, retries=1, extra_headers={"Referer": "https://quote.eastmoney.com/"})
+        data = res.get("data") if isinstance(res, dict) else None
+        if data:
+            price = _norm_price(data.get("f43"))
+            pct = safe_float(data.get("f170"), 0)
+            pct = pct / 100 if abs(pct) > 100 else pct
+            if price > 0:
+                pulse["USD/CNH(离岸)"] = {"price": price, "pct": pct, "source": "东方财富外汇", "status": "真实接口"}
     except Exception:
         pass
-    for name in list(targets.keys()) + ["USD/CNH(离岸)"]:
-        if name not in pulse:
-            pulse[name] = {"price": 0.0, "pct": 0.0, "source": "无", "status": "真实接口暂不可用"}
-    return pulse
+    if "USD/CNH(离岸)" not in pulse:
+        pulse["USD/CNH(离岸)"] = {"price": 0.0, "pct": 0.0, "source": "东方财富外汇不可用", "status": "真实接口暂不可用"}
 
+    if any(isinstance(v, dict) and safe_float(v.get("price"), 0) > 0 for v in pulse.values()):
+        _save_pulse_cache(pulse)
+        return pulse
+    cached = _load_pulse_cache()
+    if cached:
+        return cached
+    return pulse
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_hot_blocks():
-    """资金热点板块：JQData 全市场真实行情计算优先；不使用缓存、不使用内置热点兜底。"""
+    """资金热点板块：旧函数占位，实际运行前会被稳定版 get_hot_blocks 覆盖。"""
     data, msg = get_jqdata_hot_blocks(max_stocks=5000)
     if data:
         return data
@@ -4930,34 +5053,40 @@ def _em_market_fs(include_bj=True):
     return fs if include_bj else "m:0+t:6,m:0+t:80,m:1+t:2"
 
 def _em_clist(fields=None, fid="f3", pz_list=(5000, 3000, 1200, 600, 260), fs=None, cache_key="em_clist_core", cache_ttl=3600):
-    """东财全市场 clist。先按说明文档 pz=5000 获取全量，失败后降级，避免页面空白。"""
+    """东财 clist 稳定版：多 fs、多 ut、多 pz；只返回真实接口或真实缓存。"""
     fields = fields or "f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184"
-    fs = fs or _em_market_fs(include_bj=True)
+    fs_candidates = []
+    if fs:
+        fs_candidates.append(fs)
+    fs_candidates.extend([
+        "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+        "m:0+t:6,m:0+t:80,m:1+t:2",
+        "m:1+t:2,m:1+t:23,m:0+t:6,m:0+t:80",
+    ])
+    fs_candidates = list(dict.fromkeys(fs_candidates))
+    ut_candidates = ["bd1d9ddb04089700cf9c27f6f7426281", "fa5fd1943c7b386f172d6893dbfba10b"]
     base = "https://push2.eastmoney.com/api/qt/clist/get"
     last_msg = ""
-    for pz in pz_list:
-        params = {
-            "pn": 1,
-            "pz": int(pz),
-            "po": 1,
-            "np": 1,
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": 2,
-            "invt": 2,
-            "fid": fid,
-            "fs": fs,
-            "fields": fields,
-        }
-        data = fetch_eastmoney_native(
-            base, params=params, timeout=10, retries=2,
-            cache_key=f"{cache_key}_{fid}_{pz}_{datetime.now().strftime('%Y%m%d')}",
-            cache_ttl=cache_ttl, referer="https://quote.eastmoney.com/center/gridlist.html"
-        )
-        rows = data.get("data", {}).get("diff", []) if isinstance(data, dict) else []
-        if rows:
-            return rows, f"东方财富 clist 成功 pz={pz}" + ("｜真实缓存" if data.get("_from_cache") else "")
-        last_msg = f"pz={pz} 返回空"
-        time.sleep(random.uniform(0.35, 0.9))
+    for fs_item in fs_candidates:
+        for ut in ut_candidates:
+            for pz in pz_list:
+                params = {"pn": 1, "pz": int(pz), "po": 1, "np": 1, "ut": ut, "fltt": 2, "invt": 2, "fid": fid, "fs": fs_item, "fields": fields}
+                key_raw = f"{cache_key}_{fid}_{pz}_{hashlib.md5((fs_item+ut+fields).encode()).hexdigest()[:8]}_{datetime.now().strftime('%Y%m%d')}"
+                data = fetch_eastmoney_native(base, params=params, timeout=8, retries=1, cache_key=key_raw, cache_ttl=cache_ttl, referer="https://quote.eastmoney.com/center/gridlist.html")
+                rows = []
+                if isinstance(data, dict):
+                    diff = data.get("data", {}).get("diff", []) if isinstance(data.get("data"), dict) else []
+                    if isinstance(diff, dict):
+                        rows = list(diff.values())
+                    elif isinstance(diff, list):
+                        rows = diff
+                if rows:
+                    msg = f"东方财富 clist 成功 pz={pz} fs={fs_item[:24]}"
+                    if isinstance(data, dict) and data.get("_from_cache"):
+                        msg += "｜真实缓存"
+                    return rows, msg
+                last_msg = f"pz={pz} fs={fs_item[:24]} 返回空或接口不可用"
+                time.sleep(random.uniform(0.18, 0.45))
     return [], f"东方财富 clist 未返回有效数据：{last_msg}"
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -5166,41 +5295,43 @@ def _normalize_em_block_from_clist(rows):
     cols = ["板块名称", "热点分", "涨跌幅", "主力净流入", "上涨家数", "下跌家数", "领涨股票", "数据源"]
     return out[cols].to_dict("records")
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_hot_blocks():
-    """资金热点 v7.1：AKShare板块资金 + 东财clist f100/f62/f184聚合；失败用真实缓存。"""
-    cache_path = _cache_file("blocks", f"hot_blocks_v71_{datetime.now().strftime('%Y%m%d')}.json")
+    """资金热点稳定版：AKShare东财板块资金优先，东财clist行业聚合补充，失败只用真实缓存。"""
+    cache_path = _cache_file("blocks", f"hot_blocks_stable_{datetime.now().strftime('%Y%m%d')}.json")
     all_records = []
-    # 1. AKShare封装的东财板块/资金流接口
-    loaders = []
+    ak_calls = []
     if hasattr(ak, "stock_sector_fund_flow_rank"):
-        loaders.extend([
-            ("AKShare东财行业资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")),
-            ("AKShare东财概念资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")),
-        ])
-    loaders.extend([
-        ("AKShare东财行业板块涨幅", lambda: ak.stock_board_industry_name_em()),
-        ("AKShare东财概念板块涨幅", lambda: ak.stock_board_concept_name_em()),
-    ])
-    for source, loader in loaders:
+        for indicator in ["今日", "5日", "10日"]:
+            for sector_type in ["行业资金流", "概念资金流", "地域资金流"]:
+                ak_calls.append((f"AKShare东财{sector_type}-{indicator}", lambda indicator=indicator, sector_type=sector_type: ak.stock_sector_fund_flow_rank(indicator=indicator, sector_type=sector_type)))
+    if hasattr(ak, "stock_board_industry_name_em"):
+        ak_calls.append(("AKShare东财行业板块涨幅", lambda: ak.stock_board_industry_name_em()))
+    if hasattr(ak, "stock_board_concept_name_em"):
+        ak_calls.append(("AKShare东财概念板块涨幅", lambda: ak.stock_board_concept_name_em()))
+    for source, loader in ak_calls:
         try:
             recs = _normalize_block_records(loader(), source)
             if recs:
                 all_records.extend(recs)
         except Exception as e:
-            if DEBUG_MODE:
+            if globals().get("DEBUG_MODE", False):
                 st.caption(f"{source}失败：{e}")
-    # 2. 原生clist按f100行业聚合，直接使用说明文档中的核心字段
-    rows, msg = _em_clist(fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184", fid="f62", pz_list=(5000, 3000, 1200, 600), cache_key="em_hot_block_clist", cache_ttl=1800)
+    rows, msg = _em_clist(fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184", fid="f62", pz_list=(5000, 3000, 1200, 600, 260), cache_key="em_hot_block_clist_stable", cache_ttl=1800)
     recs = _normalize_em_block_from_clist(rows)
     if recs:
         all_records.extend(recs)
+    elif globals().get("DEBUG_MODE", False):
+        st.caption(msg)
     if all_records:
         df = pd.DataFrame(all_records)
-        for col in ["热点分", "涨跌幅", "主力净流入"]:
+        for col in ["热点分", "涨跌幅", "主力净流入", "成交额"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        df = df.sort_values(["热点分", "主力净流入", "涨跌幅"], ascending=False).drop_duplicates(subset=["板块名称"]).head(25)
+        if "热点分" not in df.columns:
+            df["热点分"] = 0.0
+        sort_cols = [c for c in ["热点分", "主力净流入", "涨跌幅", "成交额"] if c in df.columns]
+        df = df.sort_values(sort_cols, ascending=False).drop_duplicates(subset=["板块名称"]).head(30)
         data = df.to_dict("records")
         _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": data})
         return data
@@ -5255,51 +5386,65 @@ except Exception:
 
 # Monkey patch 主力资金选择器：东财 f62/f184/f100 为核心，不扫 Tushare 全市场
 def _mfs_fetch_eastmoney_money_rank_v71(self, pz=5000):
-    cache_path = _cache_file("main_force", f"em_money_rank_v71_{datetime.now().strftime('%Y%m%d')}.json")
-    rows, msg = _em_clist(
-        fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184",
-        fid="f62",
-        pz_list=(5000, 3000, 1200, 600, 260),
-        cache_key="main_force_em_clist_v71",
-        cache_ttl=1800
-    )
-    if not rows:
-        cached = _json_load(cache_path, max_age_seconds=8 * 3600)
-        if cached and isinstance(cached.get("records"), list):
-            df = pd.DataFrame(cached["records"])
-            if not df.empty:
-                df["数据源"] = f"东方财富真实资金字段f62/f184｜真实缓存 {cached.get('time','')}"
-                return self._score_candidates(df), f"东方财富实时资金接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
-        return pd.DataFrame(), msg
-    out = []
-    for item in rows:
-        code = self._normalize_code(item.get("f12", ""))
-        name = str(item.get("f14", ""))
-        if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
-            continue
-        main_net = safe_float(item.get("f62"), 0)
-        main_pct = safe_float(item.get("f184"), 0)
-        out.append({
-            "股票代码": code,
-            "股票简称": name,
-            "所属行业": item.get("f100") or self._infer_industry(name),
-            "区间涨跌幅": safe_float(item.get("f3"), 0),
-            "最新价": safe_float(item.get("f2"), 0),
-            "主力净流入": main_net,
-            "主力净占比": main_pct,
-            "成交额": safe_float(item.get("f6"), 0),
-            "换手率": safe_float(item.get("f8"), 0),
-            "总市值": _normalize_market_cap_yi(item.get("f20")),
-            "市盈率": item.get("f9", "-"),
-            "市净率": item.get("f23", "-"),
-            "资金热度分": 0.0,
-            "数据源": "东方财富真实资金字段f62/f184/f100",
-        })
-    df = pd.DataFrame(out)
-    if df.empty:
-        return pd.DataFrame(), "东方财富资金字段返回但无有效A股记录"
-    _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": df.to_dict("records")})
-    return self._score_candidates(df), f"{msg}，主力资金字段 f62/f184 成功解析 {len(df)} 只"
+    """主力资金稳定版：AKShare东财个股资金排名 + 东财clist f62/f184；不使用估算/观察池。"""
+    cache_path = _cache_file("main_force", f"em_money_rank_stable_{datetime.now().strftime('%Y%m%d')}.json")
+    frames = []
+    msgs = []
+    if hasattr(ak, "stock_individual_fund_flow_rank"):
+        for indicator in ["今日", "3日", "5日", "10日"]:
+            try:
+                df_ak = ak.stock_individual_fund_flow_rank(indicator=indicator)
+                if df_ak is not None and not df_ak.empty:
+                    tmp = df_ak.copy()
+                    colmap = {str(c): c for c in tmp.columns}
+                    code_col = next((colmap[c] for c in colmap if "代码" in c or c.lower() in ["code", "股票代码"]), None)
+                    name_col = next((colmap[c] for c in colmap if "名称" in c or "简称" in c or c.lower() in ["name"]), None)
+                    pct_col = next((colmap[c] for c in colmap if "涨跌幅" in c), None)
+                    net_col = next((colmap[c] for c in colmap if "主力净流入" in c and "净占比" not in c), None)
+                    pct_main_col = next((colmap[c] for c in colmap if "主力净占比" in c), None)
+                    price_col = next((colmap[c] for c in colmap if "最新价" in c or c == "现价"), None)
+                    amount_col = next((colmap[c] for c in colmap if "成交额" in c), None)
+                    if code_col and net_col:
+                        out=[]
+                        for _, r in tmp.iterrows():
+                            code = self._normalize_code(r.get(code_col, ""))
+                            name = str(r.get(name_col, "")) if name_col else code
+                            if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+                                continue
+                            out.append({"股票代码": code, "股票简称": name, "所属行业": self._infer_industry(name), "区间涨跌幅": safe_float(r.get(pct_col), 0) if pct_col else 0, "最新价": safe_float(r.get(price_col), 0) if price_col else 0, "主力净流入": safe_float(r.get(net_col), 0), "主力净占比": safe_float(r.get(pct_main_col), 0) if pct_main_col else 0, "成交额": safe_float(r.get(amount_col), 0) if amount_col else 0, "换手率": 0, "总市值": 0, "市盈率": "-", "市净率": "-", "资金热度分": 0.0, "数据源": f"AKShare东方财富个股资金流-{indicator}"})
+                        if out:
+                            frames.append(pd.DataFrame(out))
+                            msgs.append(f"AKShare个股资金流{indicator}成功{len(out)}只")
+                            break
+            except Exception as e:
+                if globals().get("DEBUG_MODE", False):
+                    st.caption(f"AKShare个股资金流{indicator}失败：{e}")
+    rows, msg = _em_clist(fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184", fid="f62", pz_list=(5000, 3000, 1200, 600, 260), cache_key="main_force_em_clist_stable", cache_ttl=1800)
+    msgs.append(msg)
+    if rows:
+        out = []
+        for item in rows:
+            code = self._normalize_code(item.get("f12", ""))
+            name = str(item.get("f14", ""))
+            if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+                continue
+            out.append({"股票代码": code, "股票简称": name, "所属行业": item.get("f100") or self._infer_industry(name), "区间涨跌幅": safe_float(item.get("f3"), 0), "最新价": safe_float(item.get("f2"), 0), "主力净流入": safe_float(item.get("f62"), 0), "主力净占比": safe_float(item.get("f184"), 0), "成交额": safe_float(item.get("f6"), 0), "换手率": safe_float(item.get("f8"), 0), "总市值": _normalize_market_cap_yi(item.get("f20")), "市盈率": item.get("f9", "-"), "市净率": item.get("f23", "-"), "资金热度分": 0.0, "数据源": "东方财富真实资金字段f62/f184/f100"})
+        if out:
+            frames.append(pd.DataFrame(out))
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        df["主力净流入"] = pd.to_numeric(df["主力净流入"], errors="coerce").fillna(0)
+        df = df.sort_values("主力净流入", ascending=False).drop_duplicates(subset=["股票代码"]).head(800)
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": df.to_dict("records")})
+        return self._score_candidates(df), "；".join(msgs)
+    cached = _json_load(cache_path, max_age_seconds=8 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        df = pd.DataFrame(cached["records"])
+        if not df.empty:
+            df["数据源"] = f"真实缓存｜{cached.get('time','')}"
+            return self._score_candidates(df), f"实时资金接口暂不可用，使用 {cached.get('time','')} 的真实缓存"
+    return pd.DataFrame(), "真实主力资金接口暂不可用：" + "；".join(msgs)
+
 
 def _mfs_get_main_force_v71(self, start_date=None, days_ago=None, min_market_cap=10.0, max_market_cap=5000.0):
     df_em, msg_em = self._fetch_eastmoney_money_rank(pz=5000)
@@ -5604,7 +5749,7 @@ with tab2:
 with tab3:
     with st.container(border=True):
         st.markdown("#### 🔥 资金热点板块（附实战标的推荐）")
-        st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时会自动使用缓存或观察池兜底。")
+        st.write("追踪强势行业与概念板块，识别领涨龙头，并生成配置标签清单。接口不稳定时只使用“最近一次真实缓存”，不使用内置观察池或估算数据。")
         if st.button("扫描板块与生成配置推荐", type="primary"):
             with st.spinner("正在获取板块异动数据...（只展示真实接口/真实行情计算结果）"):
                 blocks = get_hot_blocks()
@@ -5612,7 +5757,7 @@ with tab3:
                 df_blocks = pd.DataFrame(blocks)
                 st.dataframe(df_blocks, width="stretch", hide_index=True)
                 source_set = "、".join(sorted({str(b.get("数据源", "未知")) for b in blocks}))
-                st.caption(f"板块数据源：{source_set}。本页不使用内置热点兜底，显示的都是接口返回或JQData真实行情计算结果。")
+                st.caption(f"板块数据源：{source_set}。本页不使用内置热点兜底，显示的都是 AKShare/东方财富真实接口或最近一次真实缓存。")
                 if not api_key:
                     st.info("未配置 GROQ_API_KEY，已展示板块数据；配置后可生成 AI 配置建议。")
                 else:
@@ -5636,7 +5781,7 @@ with tab3:
 """
                         st.markdown(call_ai(prompt, temperature=0.4))
             else:
-                st.warning("真实板块接口/JQData真实行情计算均未返回结果。请稍后重试，或打开调试模式查看失败原因。")
+                st.warning("真实板块接口暂未返回结果，且没有可用真实缓存。请稍后重试，或打开调试模式查看失败原因。")
 
 # ================= Tab 4: 高阶情报终端 =================
 with tab4:
@@ -5825,6 +5970,3 @@ with tab6:
 # ================= Tab 7: 高端情报终端 Pro =================
 with tab7:
     try:
-        render_high_end_news_terminal()
-    except Exception as exc:
-        render_module_crash_box("新闻情报", exc)
