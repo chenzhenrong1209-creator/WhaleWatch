@@ -12,12 +12,6 @@ import pywencai
 import akshare as ak
 import tushare as ts
 import baostock as bs
-try:
-    import jqdatasdk as jq
-    JQDATA_SDK_AVAILABLE = True
-except Exception:
-    jq = None
-    JQDATA_SDK_AVAILABLE = False
 import random
 import time
 from datetime import datetime, timedelta
