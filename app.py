@@ -12,12 +12,9 @@ import pywencai
 import akshare as ak
 import tushare as ts
 import baostock as bs
-try:
-    import jqdatasdk as jq
-    JQDATA_SDK_AVAILABLE = True
-except Exception:
-    jq = None
-    JQDATA_SDK_AVAILABLE = False
+# JQData 当前账号近期数据权限受限，默认降级关闭，避免认证反复刷屏和拖慢核心页面。
+jq = None
+JQDATA_SDK_AVAILABLE = False
 import random
 import time
 from datetime import datetime, timedelta
@@ -27,8 +24,28 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 import hashlib
+import contextlib
+import io
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 warnings.filterwarnings('ignore')
+
+# BaoStock 的 bs_login_quiet()/bs_logout_quiet() 会向 stdout 打印 login success/logout success。
+# Streamlit Cloud 日志无法手动清空，所以这里从源头压制后续噪音。
+def bs_login_quiet():
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return bs.login()
+    except Exception:
+        return None
+
+def bs_logout_quiet():
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return bs.logout()
+    except Exception:
+        return None
+
 
 # ================= 页面与终端 UI 配置 =================
 st.set_page_config(
@@ -67,7 +84,7 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v10.0-STABLE-SOURCES | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v11.0-HOTBLOCK-NONBLOCKING | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
@@ -147,16 +164,8 @@ def from_jq_code(jq_code: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def jqdata_auth_cached(username: str, password: str):
-    """JQData 登录只做一次缓存，避免每次刷新页面重复认证。"""
-    if not JQDATA_SDK_AVAILABLE:
-        return False, "未安装 jqdatasdk，请在 requirements.txt 添加 jqdatasdk>=1.9.7"
-    if not username or not password:
-        return False, "未在 Streamlit Secrets 中配置 JQData 账号密码"
-    try:
-        jq.auth(username, password)
-        return True, "JQData 登录成功"
-    except Exception as exc:
-        return False, f"JQData 登录失败：{exc}"
+    """JQData 已主动降级关闭：避免受限账号反复 auth 并刷出 auth success。"""
+    return False, "JQData 已降级关闭：当前账号近期数据权限受限，不参与核心行情/热点/主力资金。"
 
 
 def ensure_jqdata_auth():
@@ -2092,7 +2101,7 @@ def _quote_from_sina(symbol: str) -> dict | None:
 def _quote_from_baostock_basic(symbol: str) -> dict | None:
     """Baostock 兜底：补名称、PE、PB、换手率、收盘价，并用总股本估算总市值。"""
     try:
-        bs.login()
+        bs_login_quiet()
         bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
         result = {"symbol": symbol, "source": "Baostock基础/日线"}
         total_shares = 0.0
@@ -2117,7 +2126,7 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
             while rs.next():
                 rows.append(rs.get_row_data())
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
         if rows:
@@ -2144,7 +2153,7 @@ def _quote_from_baostock_basic(symbol: str) -> dict | None:
         if DEBUG_MODE:
             st.caption(f"Baostock 基础补全失败 {symbol}: {e}")
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
     return None
@@ -2355,14 +2364,14 @@ def get_kline(symbol, days=220):
             if DEBUG_MODE:
                 st.caption(f"AKShare {adjust or 'raw'} 日K失败 {symbol}: {e}")
     try:
-        bs.login()
+        bs_login_quiet()
         bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
         rs = bs.query_history_k_data_plus(bs_code, "date,open,high,low,close,volume", start_date=start_str_bs, end_date=end_str_bs, frequency="d", adjustflag="2")
         data_list = []
         while (rs.error_code == '0') and rs.next():
             data_list.append(rs.get_row_data())
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
         if data_list:
@@ -2374,7 +2383,7 @@ def get_kline(symbol, days=220):
         if DEBUG_MODE:
             st.caption(f"Baostock 日K失败 {symbol}: {e}")
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
     return None
@@ -4350,7 +4359,7 @@ def _quote_from_baostock_t1(symbol: str) -> dict | None:
     cache_path = _cache_file("quote", f"baostock_{symbol}.json")
     cached = _json_load(cache_path, max_age_seconds=12 * 3600)
     try:
-        lg = bs.login()
+        lg = bs_login_quiet()
         if getattr(lg, "error_code", "") != "0":
             return cached
         bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
@@ -4384,7 +4393,7 @@ def _quote_from_baostock_t1(symbol: str) -> dict | None:
                     "pb": last.get("pbMRQ", "-"),
                 })
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
         if any(k in result for k in ["name", "price", "pe", "pb", "turnover"]):
@@ -4392,7 +4401,7 @@ def _quote_from_baostock_t1(symbol: str) -> dict | None:
             return result
     except Exception as e:
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
         if DEBUG_MODE:
@@ -4481,7 +4490,7 @@ def get_stock_quote(symbol):
 def _fetch_baostock_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
     symbol = str(symbol).zfill(6)
     try:
-        lg = bs.login()
+        lg = bs_login_quiet()
         if getattr(lg, "error_code", "") != "0":
             return None
         end_date = datetime.now().strftime("%Y-%m-%d")
@@ -4499,7 +4508,7 @@ def _fetch_baostock_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
         while getattr(rs, "error_code", "") == "0" and rs.next():
             rows.append(rs.get_row_data())
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
         if not rows:
@@ -4508,7 +4517,7 @@ def _fetch_baostock_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
         return _normalize_daily_kline(df, days=days)
     except Exception as e:
         try:
-            bs.logout()
+            bs_logout_quiet()
         except Exception:
             pass
         if DEBUG_MODE:
@@ -5295,34 +5304,66 @@ def _normalize_em_block_from_clist(rows):
     cols = ["板块名称", "热点分", "涨跌幅", "主力净流入", "上涨家数", "下跌家数", "领涨股票", "数据源"]
     return out[cols].to_dict("records")
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_hot_blocks():
-    """资金热点稳定版：AKShare东财板块资金优先，东财clist行业聚合补充，失败只用真实缓存。"""
-    cache_path = _cache_file("blocks", f"hot_blocks_stable_{datetime.now().strftime('%Y%m%d')}.json")
+    """资金热点 v11：每个接口限时，避免 AKShare/东财某一路阻塞导致 Streamlit 一直转圈。"""
+    cache_path = _cache_file("blocks", f"hot_blocks_fast_{datetime.now().strftime('%Y%m%d')}.json")
     all_records = []
+    debug_errors = []
+
+    def run_loader_with_timeout(source, loader, timeout_sec=7):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                fut = executor.submit(loader)
+                return fut.result(timeout=timeout_sec)
+        except FuturesTimeoutError:
+            debug_errors.append(f"{source} 超过 {timeout_sec}s，已跳过，避免页面卡死")
+            return None
+        except Exception as e:
+            debug_errors.append(f"{source} 失败：{e}")
+            return None
+
     ak_calls = []
     if hasattr(ak, "stock_sector_fund_flow_rank"):
-        for indicator in ["今日", "5日", "10日"]:
-            for sector_type in ["行业资金流", "概念资金流", "地域资金流"]:
-                ak_calls.append((f"AKShare东财{sector_type}-{indicator}", lambda indicator=indicator, sector_type=sector_type: ak.stock_sector_fund_flow_rank(indicator=indicator, sector_type=sector_type)))
+        ak_calls.extend([
+            ("AKShare东财行业资金流-今日", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")),
+            ("AKShare东财概念资金流-今日", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")),
+        ])
     if hasattr(ak, "stock_board_industry_name_em"):
         ak_calls.append(("AKShare东财行业板块涨幅", lambda: ak.stock_board_industry_name_em()))
     if hasattr(ak, "stock_board_concept_name_em"):
         ak_calls.append(("AKShare东财概念板块涨幅", lambda: ak.stock_board_concept_name_em()))
+
     for source, loader in ak_calls:
+        df_or_data = run_loader_with_timeout(source, loader, timeout_sec=7)
+        if df_or_data is None:
+            continue
         try:
-            recs = _normalize_block_records(loader(), source)
+            recs = _normalize_block_records(df_or_data, source)
             if recs:
                 all_records.extend(recs)
+                if len(all_records) >= 12:
+                    break
         except Exception as e:
-            if globals().get("DEBUG_MODE", False):
-                st.caption(f"{source}失败：{e}")
-    rows, msg = _em_clist(fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184", fid="f62", pz_list=(5000, 3000, 1200, 600, 260), cache_key="em_hot_block_clist_stable", cache_ttl=1800)
-    recs = _normalize_em_block_from_clist(rows)
-    if recs:
-        all_records.extend(recs)
-    elif globals().get("DEBUG_MODE", False):
-        st.caption(msg)
+            debug_errors.append(f"{source} 归一化失败：{e}")
+
+    if len(all_records) < 8:
+        try:
+            rows, msg = _em_clist(
+                fields="f1,f2,f3,f6,f8,f9,f12,f14,f20,f23,f62,f100,f184",
+                fid="f62",
+                pz_list=(1200, 600, 260),
+                cache_key="em_hot_block_clist_fast",
+                cache_ttl=1800,
+            )
+            recs = _normalize_em_block_from_clist(rows)
+            if recs:
+                all_records.extend(recs)
+            else:
+                debug_errors.append(msg)
+        except Exception as e:
+            debug_errors.append(f"东方财富clist行业聚合失败：{e}")
+
     if all_records:
         df = pd.DataFrame(all_records)
         for col in ["热点分", "涨跌幅", "主力净流入", "成交额"]:
@@ -5331,16 +5372,24 @@ def get_hot_blocks():
         if "热点分" not in df.columns:
             df["热点分"] = 0.0
         sort_cols = [c for c in ["热点分", "主力净流入", "涨跌幅", "成交额"] if c in df.columns]
-        df = df.sort_values(sort_cols, ascending=False).drop_duplicates(subset=["板块名称"]).head(30)
+        if sort_cols:
+            df = df.sort_values(sort_cols, ascending=False)
+        df = df.drop_duplicates(subset=["板块名称"]).head(30)
         data = df.to_dict("records")
         _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": data})
         return data
+
     cached = _json_load(cache_path, max_age_seconds=8 * 3600)
     if cached and isinstance(cached.get("records"), list):
         data = cached["records"]
         for r in data:
             r["数据源"] = f"{r.get('数据源','真实缓存')}｜缓存 {cached.get('time','')}"
         return data
+
+    if globals().get("DEBUG_MODE", False) and debug_errors:
+        with st.expander("资金热点接口调试信息", expanded=False):
+            for err in debug_errors[:20]:
+                st.caption(err)
     return []
 
 # Monkey patch 龙虎榜：在 ws4、AKShare之外加入东方财富 datacenter 原生接口
@@ -5925,51 +5974,4 @@ with tab5:
 
                     agents = res.get("agents_analysis", {})
                     with tab_youzi:
-                        if agents.get("youzi"):
-                            st.markdown(agents["youzi"].get("analysis", ""))
-                        elif ai_depth != "深度":
-                            st.info("当前为标准模式，未运行游资画像分析。选择 AI 分析深度为“深度”后可生成。")
-                        else:
-                            st.info("暂无游资画像报告。")
-                    with tab_stock:
-                        if agents.get("stock"):
-                            st.markdown(agents["stock"].get("analysis", ""))
-                        else:
-                            st.info("暂无个股潜力报告。")
-                    with tab_theme:
-                        if agents.get("theme"):
-                            st.markdown(agents["theme"].get("analysis", ""))
-                        elif ai_depth != "深度":
-                            st.info("当前为标准模式，未运行题材追踪分析。选择 AI 分析深度为“深度”后可生成。")
-                        else:
-                            st.info("暂无题材追踪报告。")
-                    with tab_risk:
-                        if agents.get("risk"):
-                            st.markdown(agents["risk"].get("analysis", ""))
-                        else:
-                            st.info("暂无风险控制报告。")
-                    with tab_chief:
-                        if agents.get("chief"):
-                            st.markdown(agents["chief"].get("analysis", ""))
-                        elif not run_ai_lhb:
-                            st.info("你已关闭 AI 报告，本页仅展示量化评分与数据概况。")
-                        else:
-                            st.info("暂无首席策略报告。")
-                    with tab_raw:
-                        if show_raw_lhb and df_lhb is not None and not df_lhb.empty:
-                            st.dataframe(df_lhb, width="stretch", hide_index=True)
-                        else:
-                            st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
-# ================= Tab 6: 主力资金选股 =================
-with tab6:
-    try:
-        render_main_force_tab()
-    except Exception as exc:
-        render_module_crash_box("主力资金", exc)
-
-# ================= Tab 7: 高端情报终端 Pro =================
-with tab7:
-    try:
-        render_high_end_news_terminal()
-    except Exception as exc:
-        render_module_crash_box("新闻情报", exc)
+                        if 
