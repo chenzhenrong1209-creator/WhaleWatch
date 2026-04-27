@@ -5731,6 +5731,361 @@ def get_kline(symbol, days=220):
     return None
 # ================= v13 手术式修复层结束 =================
 
+
+# ================= v14 妙想 MX 微创叠加层开始 =================
+# 设计原则：不改原页面、不替换原系统，只在真实接口为空/超时后，用妙想官方接口做低耦合补充。
+# Secrets 支持：MX_APIKEY = "..." 或 [miaoxiang] apikey = "..."
+
+_MX_BASE = "https://mkapi2.dfcfs.com/finskillshub/api/claw"
+
+
+def get_mx_apikey():
+    try:
+        key = st.secrets.get("MX_APIKEY", "")
+        if key:
+            return str(key).strip()
+    except Exception:
+        pass
+    try:
+        section = st.secrets.get("miaoxiang", {})
+        if isinstance(section, dict):
+            key = section.get("apikey") or section.get("api_key") or section.get("key")
+            if key:
+                return str(key).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _mx_post(path, payload, timeout_sec=7):
+    """妙想接口短超时请求。失败快速返回，不拖死页面。"""
+    api_key = get_mx_apikey()
+    if not api_key:
+        return None, "未配置 MX_APIKEY"
+    url = _MX_BASE + path
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": api_key,
+        "User-Agent": "Mozilla/5.0 (compatible; WhaleWatch/1.0)",
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=(2, timeout_sec), verify=False)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:120]}"
+        data = r.json()
+        if isinstance(data, dict) and data.get("status") not in (0, None):
+            return None, f"MX状态码 {data.get('status')}: {data.get('message','')}"
+        return data, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _mx_column_map(columns):
+    mp, order = {}, []
+    for c in columns or []:
+        if not isinstance(c, dict):
+            continue
+        k = c.get("field") or c.get("name") or c.get("key")
+        v = c.get("displayName") or c.get("title") or c.get("label") or k
+        if c.get("dateMsg"):
+            v = f"{v} {c.get('dateMsg')}"
+        if k:
+            order.append(str(k))
+            mp[str(k)] = str(v)
+    return mp, order
+
+
+def _parse_markdown_table(text):
+    if not isinstance(text, str) or "|" not in text:
+        return []
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    if not lines:
+        return []
+    def cells(line):
+        return [c.strip() for c in line.strip("|").split("|")]
+    header = cells(lines[0])
+    rows = []
+    for line in lines[1:]:
+        if re.fullmatch(r"[\s\|:\-]+", line):
+            continue
+        cs = cells(line)
+        if len(cs) < len(header):
+            cs += [""] * (len(header) - len(cs))
+        rows.append(dict(zip(header, cs[:len(header)])))
+    return rows
+
+
+def _mx_extract_xuangu_rows(result):
+    """兼容 mx_xuangu.py 的 dataList 与 partialResults 两种返回。"""
+    if not isinstance(result, dict):
+        return []
+    inner = (((result.get("data") or {}).get("data") or {}))
+    all_res = ((inner.get("allResults") or {}).get("result") or {})
+    data_list = all_res.get("dataList") or []
+    columns = all_res.get("columns") or []
+    if isinstance(data_list, list) and data_list:
+        name_map, order = _mx_column_map(columns)
+        if not order and isinstance(data_list[0], dict):
+            order = list(data_list[0].keys())
+        out = []
+        for row in data_list:
+            if not isinstance(row, dict):
+                continue
+            d = {}
+            for k in order:
+                if k in row:
+                    val = row.get(k)
+                    d[name_map.get(str(k), str(k))] = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else val
+            for k, val in row.items():
+                ck = name_map.get(str(k), str(k))
+                if ck not in d:
+                    d[ck] = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else val
+            out.append(d)
+        return out
+    return _parse_markdown_table(inner.get("partialResults") or "")
+
+
+def _mx_extract_data_tables(result):
+    """兼容 mx_data.py 的 dataTableDTOList，返回扁平 rows。"""
+    try:
+        dto_list = (((result.get("data") or {}).get("data") or {}).get("searchDataResultDTO") or {}).get("dataTableDTOList") or []
+    except Exception:
+        dto_list = []
+    rows = []
+    for dto in dto_list:
+        if not isinstance(dto, dict):
+            continue
+        table = dto.get("table") or {}
+        name_map = dto.get("nameMap") or {}
+        if isinstance(name_map, list):
+            name_map = {str(i): v for i, v in enumerate(name_map)}
+        if isinstance(table, list):
+            for r in table:
+                if isinstance(r, dict):
+                    rows.append({str(name_map.get(k, k)): v for k, v in r.items()})
+            continue
+        if not isinstance(table, dict):
+            continue
+        headers = table.get("headName") or []
+        keys = [k for k in table.keys() if k != "headName"]
+        if isinstance(headers, list) and headers:
+            for i, h in enumerate(headers):
+                r = {"date": h}
+                for k in keys:
+                    label = str(name_map.get(str(k), name_map.get(k, k)))
+                    vals = table.get(k)
+                    if isinstance(vals, list):
+                        r[label] = vals[i] if i < len(vals) else ""
+                    else:
+                        r[label] = vals
+                rows.append(r)
+        else:
+            r = {}
+            for k in keys:
+                label = str(name_map.get(str(k), name_map.get(k, k)))
+                r[label] = table.get(k)
+            if r:
+                rows.append(r)
+    return rows
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def mx_xuangu_query(query, max_rows=30):
+    data, err = _mx_post("/stock-screen", {"keyword": query}, timeout_sec=8)
+    if not data:
+        return [], err
+    rows = _mx_extract_xuangu_rows(data)
+    return rows[:max_rows], None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def mx_data_query(query, max_rows=20):
+    data, err = _mx_post("/query", {"toolQuery": query}, timeout_sec=7)
+    if not data:
+        return [], err
+    rows = _mx_extract_data_tables(data)
+    return rows[:max_rows], None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def mx_search_query(query, max_items=12):
+    data, err = _mx_post("/news-search", {"query": query}, timeout_sec=7)
+    if not data:
+        return [], err
+    try:
+        items = (((data.get("data") or {}).get("data") or {}).get("llmSearchResponse") or {}).get("data") or []
+    except Exception:
+        items = []
+    out = []
+    for it in items[:max_items]:
+        if isinstance(it, dict):
+            out.append({
+                "source": "妙想资讯",
+                "platform": it.get("informationType") or "MX",
+                "title": it.get("title") or "",
+                "summary": it.get("content") or "",
+                "time": it.get("date") or "",
+            })
+    return out, None
+
+
+def _pick_value(row, includes, excludes=None):
+    excludes = excludes or []
+    for k, v in row.items():
+        ks = str(k)
+        if all(x in ks for x in includes) and not any(x in ks for x in excludes):
+            return v
+    return ""
+
+
+def _normalize_mx_hot_rows(rows):
+    out = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        code = _pick_value(row, ["代码"]) or _pick_value(row, ["证券代码"]) or _pick_value(row, ["股票代码"])
+        name = _pick_value(row, ["名称"]) or _pick_value(row, ["证券简称"]) or _pick_value(row, ["股票简称"])
+        sector = _pick_value(row, ["行业"]) or _pick_value(row, ["板块"]) or _pick_value(row, ["概念"])
+        pct = _pick_value(row, ["涨跌幅"]) or _pick_value(row, ["涨幅"])
+        amount = _pick_value(row, ["成交额"])
+        main = _pick_value(row, ["主力", "净"]) or _pick_value(row, ["主力", "流入"])
+        score = 0.0
+        try:
+            score += float(str(pct).replace("%", "").replace(",", "")) * 8
+        except Exception:
+            pass
+        try:
+            score += min(abs(float(str(main).replace("%", "").replace(",", ""))) / 10000000, 50)
+        except Exception:
+            pass
+        out.append({
+            "板块名称": str(sector or name or "妙想强势标的"),
+            "涨跌幅": pct or "",
+            "主力净流入": main or "",
+            "主力净占比": _pick_value(row, ["主力", "占比"]) or "",
+            "成交额": amount or "",
+            "上涨家数": "",
+            "领涨股票": f"{name}({code})" if code or name else "",
+            "热点分": round(score, 2),
+            "数据源": "妙想智能选股",
+        })
+    return out
+
+
+# 保存 v13 原函数，然后只做兜底式覆盖。
+_get_hot_blocks_v13 = get_hot_blocks
+_get_stock_quote_v13 = get_stock_quote
+_get_kline_v13 = get_kline
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_hot_blocks():
+    """v14 微创版：先走原系统；为空时追加妙想智能选股兜底；全程短超时。"""
+    cache_path = _cache_file("blocks", f"hot_blocks_v14_mx_{datetime.now().strftime('%Y%m%d')}.json")
+    records, err = _surgical_call_with_timeout(_get_hot_blocks_v13, timeout_sec=9, default=[])
+    if records:
+        return records
+
+    mx_query = "今日A股主力资金净流入靠前、成交额靠前、涨跌幅靠前的强势行业板块和领涨股票"
+    mx_rows, mx_err = mx_xuangu_query(mx_query, max_rows=30)
+    mx_records = _normalize_mx_hot_rows(mx_rows)
+    if mx_records:
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": mx_records})
+        return mx_records
+
+    cached = _json_load(cache_path, max_age_seconds=8 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        data = cached["records"]
+        for r in data:
+            r["数据源"] = f"{r.get('数据源','妙想真实缓存')}｜缓存 {cached.get('time','')}"
+        return data
+
+    if globals().get("DEBUG_MODE", False):
+        st.caption(f"资金热点：原链路失败/为空：{err}; 妙想失败/为空：{mx_err}")
+    return []
+
+
+def _merge_mx_quote_fields(quote, symbol):
+    """用妙想金融数据补充缺失字段，不覆盖已存在的实时价格。"""
+    if not quote:
+        quote = {"symbol": symbol}
+    need = []
+    for key in ["price", "pct", "turnover", "pe", "pb", "market_cap"]:
+        if quote.get(key) in (None, "", "-") or safe_float(quote.get(key), 0) == 0:
+            need.append(key)
+    if not need or not get_mx_apikey():
+        return quote
+    q = f"{symbol} 最新价 涨跌幅 换手率 市盈率 市净率 总市值 主力资金净流入"
+    rows, err = mx_data_query(q, max_rows=10)
+    if not rows:
+        if globals().get("DEBUG_MODE", False) and err:
+            st.caption(f"妙想个股数据补充失败：{err}")
+        return quote
+    text = json.dumps(rows, ensure_ascii=False)
+    # 保守补充：只在字段缺失时填充，避免误解析覆盖实时行情。
+    for row in rows:
+        for k, v in row.items():
+            ks = str(k)
+            if quote.get("price") in (None, "", "-") and any(x in ks for x in ["最新价", "收盘价", "价格"]):
+                quote["price"] = v
+            if quote.get("pct") in (None, "", "-") and "涨跌幅" in ks:
+                quote["pct"] = v
+            if quote.get("turnover") in (None, "", "-") and "换手" in ks:
+                quote["turnover"] = v
+            if quote.get("pe") in (None, "", "-") and ("市盈" in ks or ks.upper() == "PE"):
+                quote["pe"] = v
+            if quote.get("pb") in (None, "", "-") and ("市净" in ks or ks.upper() == "PB"):
+                quote["pb"] = v
+            if quote.get("market_cap") in (None, "", "-") and "市值" in ks:
+                quote["market_cap"] = v
+    src = quote.get("source") or ""
+    if rows and "妙想金融数据" not in src:
+        quote["source"] = (src + " + 妙想金融数据补充").strip(" +")
+    return quote
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def get_stock_quote(symbol):
+    symbol = str(symbol).strip().zfill(6)
+    q, err = _surgical_call_with_timeout(lambda: _get_stock_quote_v13(symbol), timeout_sec=10, default=None)
+    if q:
+        return _merge_mx_quote_fields(q, symbol)
+    # 原行情链路整体失败时，妙想只作为低频补充，不伪装为盘中实时源。
+    q = _merge_mx_quote_fields({"symbol": symbol, "source": "妙想金融数据补充"}, symbol)
+    finalized = _finalize_quote(q, symbol) if "_finalize_quote" in globals() else q
+    return finalized if finalized and len(str(finalized)) > 20 else None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_kline(symbol, days=220):
+    """v14 微创版：K线仍使用原链路，只加外层硬超时，不让个股页卡死。"""
+    df, err = _surgical_call_with_timeout(lambda: _get_kline_v13(symbol, days), timeout_sec=12, default=None)
+    if df is not None and not getattr(df, "empty", True):
+        return df
+    if globals().get("DEBUG_MODE", False) and err:
+        st.caption(f"K线链路超时/失败：{err}")
+    return None
+
+
+# 新闻情报微创增强：不替换原采集器，只在可用时给 MX 搜索能力。
+try:
+    _original_news_fetch_all = NewsTerminalFetcher.fetch_all
+    def _news_fetch_all_with_mx(self, stock_code="", max_items=40, include_wencai=False):
+        items = _original_news_fetch_all(self, stock_code=stock_code, max_items=max_items, include_wencai=include_wencai)
+        if get_mx_apikey():
+            query = f"{stock_code} 最新公告 最新研报 机构观点" if stock_code else "今日A股重要财经新闻 政策 研报 市场热点"
+            mx_items, mx_err = mx_search_query(query, max_items=min(12, max_items))
+            if mx_items:
+                items = (mx_items + items)[:max_items]
+            elif globals().get("DEBUG_MODE", False) and mx_err:
+                st.caption(f"妙想资讯搜索跳过：{mx_err}")
+        return items
+    NewsTerminalFetcher.fetch_all = _news_fetch_all_with_mx
+except Exception:
+    pass
+
+# ================= v14 妙想 MX 微创叠加层结束 =================
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
