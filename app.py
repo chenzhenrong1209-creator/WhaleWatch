@@ -20,8 +20,13 @@ from collections import Counter
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
-
 warnings.filterwarnings('ignore')
+try:
+    import jqdatasdk as jq
+    JQDATA_SDK_AVAILABLE = True
+except Exception:
+    jq = None
+    JQDATA_SDK_AVAILABLE = False
 
 # ================= 页面与终端 UI 配置 =================
 st.set_page_config(
