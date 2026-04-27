@@ -5970,3 +5970,6 @@ with tab6:
 # ================= Tab 7: 高端情报终端 Pro =================
 with tab7:
     try:
+        render_high_end_news_terminal()
+    except Exception as exc:
+        render_module_crash_box("新闻情报", exc)
