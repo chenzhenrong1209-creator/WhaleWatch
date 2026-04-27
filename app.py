@@ -90,13 +90,14 @@ def get_tushare_token_from_secrets():
     except Exception:
         pass
     return ""
-
 ts_token = get_tushare_token_from_secrets()
 if ts_token:
     ts.set_token(ts_token)
-
-
-
+jq_ok, jq_msg = ensure_jqdata_auth()
+if jq_ok:
+    st.success("JQData：已从 secrets 登录")
+else:
+    st.warning(f"JQData：{jq_msg}")
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
     st.header("⚙️ 终端控制台")
