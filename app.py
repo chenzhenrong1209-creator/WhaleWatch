@@ -93,11 +93,349 @@ def get_tushare_token_from_secrets():
 ts_token = get_tushare_token_from_secrets()
 if ts_token:
     ts.set_token(ts_token)
-jq_ok, jq_msg = ensure_jqdata_auth()
-if jq_ok:
-    st.success("JQData：已从 secrets 登录")
-else:
-    st.warning(f"JQData：{jq_msg}")
+================ JQData / 聚宽数据源 =================
+def get_jqdata_credentials_from_secrets():
+    """从 Streamlit Secrets 读取 JQData 账号密码。支持顶层或 [jqdata] 分组。"""
+    username_keys = ["JQDATA_USERNAME", "JQDATA_USER", "JQDATA_ACCOUNT", "JQ_USERNAME", "JQ_ACCOUNT", "jqdata_username"]
+    password_keys = ["JQDATA_PASSWORD", "JQDATA_PASS", "JQ_PASSWORD", "JQ_PASS", "jqdata_password"]
+    username = ""
+    password = ""
+    for key in username_keys:
+        try:
+            val = st.secrets.get(key, "")
+            if val:
+                username = str(val).strip()
+                break
+        except Exception:
+            pass
+    for key in password_keys:
+        try:
+            val = st.secrets.get(key, "")
+            if val:
+                password = str(val).strip()
+                break
+        except Exception:
+            pass
+    try:
+        section = st.secrets.get("jqdata", {})
+        if isinstance(section, dict):
+            username = username or str(section.get("username") or section.get("user") or section.get("account") or "").strip()
+            password = password or str(section.get("password") or section.get("pass") or "").strip()
+    except Exception:
+        pass
+    return username, password
+jq_username, jq_password = get_jqdata_credentials_from_secrets()
+def to_jq_code(symbol: str) -> str:
+    """A股六位代码转 JQData 证券代码。"""
+    symbol = str(symbol).strip().zfill(6)
+    if symbol.startswith(("6", "9", "5", "7")):
+        return f"{symbol}.XSHG"
+    return f"{symbol}.XSHE"
+def from_jq_code(jq_code: str) -> str:
+    return str(jq_code).split(".")[0].zfill(6)
+@st.cache_resource(show_spinner=False)
+def jqdata_auth_cached(username: str, password: str):
+    """JQData 登录只做一次缓存，避免每次刷新页面重复认证。"""
+    if not JQDATA_SDK_AVAILABLE:
+        return False, "未安装 jqdatasdk，请在 requirements.txt 添加 jqdatasdk>=1.9.7"
+    if not username or not password:
+        return False, "未在 Streamlit Secrets 中配置 JQData 账号密码"
+    try:
+        jq.auth(username, password)
+        return True, "JQData 登录成功"
+    except Exception as exc:
+        return False, f"JQData 登录失败：{exc}"
+def ensure_jqdata_auth():
+    return jqdata_auth_cached(jq_username, jq_password)
+def get_latest_trade_date_for_data(max_lookback=12):
+    today = datetime.now()
+    return [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(max_lookback)]
+def _fetch_jq_daily_kline(symbol: str, days=220) -> pd.DataFrame | None:
+    """JQData 日K：真实接口数据，不做估算。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(msg)
+        return None
+    try:
+        jq_code = to_jq_code(symbol)
+        df = jq.get_price(
+            jq_code,
+            end_date=datetime.now().strftime("%Y-%m-%d"),
+            count=int(days) + 40,
+            frequency="daily",
+            fields=["open", "close", "high", "low", "volume", "money"],
+            fq="pre",
+            panel=False,
+        )
+        if df is None or df.empty:
+            return None
+        df = df.reset_index().rename(columns={"index": "date", "money": "amount"})
+        if "time" in df.columns and "date" not in df.columns:
+            df = df.rename(columns={"time": "date"})
+        return _normalize_daily_kline(df, days=days)
+    except Exception as exc:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"JQData 日K失败 {symbol}: {exc}")
+        return None
+def _quote_from_jqdata(symbol: str) -> dict | None:
+    """JQData 最新日线行情/基础资料。注意：这是最新交易日收盘数据，不伪装为盘中实时行情。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(msg)
+        return None
+    try:
+        jq_code = to_jq_code(symbol)
+        df = jq.get_price(
+            jq_code,
+            end_date=datetime.now().strftime("%Y-%m-%d"),
+            count=2,
+            frequency="daily",
+            fields=["open", "close", "high", "low", "volume", "money"],
+            fq="pre",
+            panel=False,
+        )
+        if df is None or df.empty:
+            return None
+        df = df.reset_index()
+        close = safe_float(df.iloc[-1].get("close"), 0)
+        prev_close = safe_float(df.iloc[-2].get("close"), 0) if len(df) >= 2 else 0
+        pct = ((close - prev_close) / prev_close * 100) if prev_close > 0 else 0
+        name = ""
+        try:
+            info = jq.get_security_info(jq_code)
+            name = getattr(info, "display_name", "") or getattr(info, "name", "") or ""
+        except Exception:
+            pass
+        return {
+            "symbol": symbol,
+            "name": name,
+            "price": close,
+            "pct": pct,
+            "turnover": 0.0,
+            "market_cap": 0.0,
+            "pe": "-",
+            "pb": "-",
+            "source": "JQData最新交易日日线",
+        }
+    except Exception as exc:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"JQData 个股行情失败 {symbol}: {exc}")
+        return None
+def _jq_get_stock_universe(max_stocks=5000):
+    """JQData 股票池：只取真实聚宽证券列表，过滤 ST/退市。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        return [], {}, msg
+    try:
+        sec = jq.get_all_securities(types=["stock"], date=datetime.now().strftime("%Y-%m-%d"))
+        if sec is None or sec.empty:
+            return [], {}, "JQData get_all_securities 返回空"
+        sec = sec.reset_index().rename(columns={"index": "jq_code"})
+        name_col = "display_name" if "display_name" in sec.columns else "name" if "name" in sec.columns else None
+        if name_col:
+            sec = sec[~sec[name_col].astype(str).str.contains("ST|退", na=False)]
+        sec = sec[sec["jq_code"].astype(str).str.contains("XSHG|XSHE", na=False)]
+        if max_stocks:
+            sec = sec.head(int(max_stocks))
+        names = dict(zip(sec["jq_code"].astype(str), sec[name_col].astype(str))) if name_col else {}
+        return sec["jq_code"].astype(str).tolist(), names, f"JQData证券列表{len(sec)}只"
+    except Exception as exc:
+        return [], {}, f"JQData get_all_securities异常：{exc}"
+def _jq_get_industry_map(jq_codes, date=None):
+    """JQData 行业映射。接口/权限失败时不伪造，返回未分类。"""
+    out = {}
+    if not jq_codes:
+        return out
+    try:
+        info = jq.get_industry(jq_codes, date=date or datetime.now().strftime("%Y-%m-%d"))
+        if isinstance(info, dict):
+            for code, item in info.items():
+                name = "未分类"
+                if isinstance(item, dict):
+                    for key in ["sw_l1", "jq_l1", "zjw"]:
+                        v = item.get(key)
+                        if isinstance(v, dict):
+                            name = v.get("industry_name") or v.get("name") or name
+                        elif isinstance(v, str):
+                            name = v or name
+                        if name != "未分类":
+                            break
+                out[str(code)] = name
+    except Exception as exc:
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"JQData行业映射失败：{exc}")
+    return out
+def _jq_latest_price_frame(jq_codes, count=2, fields=None, end_date=None):
+    """JQData 批量最新日线，返回 panel=False 的标准 DataFrame。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok or not jq_codes:
+        return pd.DataFrame(), msg
+    fields = fields or ["open", "close", "high", "low", "volume", "money"]
+    try:
+        df = jq.get_price(jq_codes, end_date=end_date or datetime.now().strftime("%Y-%m-%d"), count=int(count), frequency="daily", fields=fields, fq="pre", panel=False)
+        if df is None or df.empty:
+            return pd.DataFrame(), "JQData get_price 返回空"
+        df = df.reset_index()
+        if "code" not in df.columns:
+            if "security" in df.columns:
+                df = df.rename(columns={"security": "code"})
+            elif "level_1" in df.columns:
+                df = df.rename(columns={"level_1": "code"})
+        if "time" not in df.columns:
+            if "index" in df.columns:
+                df = df.rename(columns={"index": "time"})
+            elif "level_0" in df.columns:
+                df = df.rename(columns={"level_0": "time"})
+        if "code" not in df.columns:
+            if len(jq_codes) == 1:
+                df["code"] = jq_codes[0]
+            else:
+                return pd.DataFrame(), "JQData get_price 缺少证券代码列"
+        df["jq_code"] = df["code"].astype(str)
+        if "time" in df.columns:
+            df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        else:
+            df["time"] = pd.Timestamp.now()
+        return df.sort_values(["jq_code", "time"]), "JQData get_price 成功"
+    except Exception as exc:
+        return pd.DataFrame(), f"JQData get_price异常：{exc}"
+def _jq_snapshot_rows(max_stocks=5000):
+    """用 JQData 全市场最新交易日日线生成真实快照，不伪装为盘中实时。"""
+    jq_codes, names, msg = _jq_get_stock_universe(max_stocks=max_stocks)
+    if not jq_codes:
+        return pd.DataFrame(), msg
+    price_df, msg_price = _jq_latest_price_frame(jq_codes, count=2)
+    if price_df.empty:
+        return pd.DataFrame(), msg_price
+    ind_map = _jq_get_industry_map(jq_codes)
+    rows = []
+    for jq_code, g in price_df.groupby("jq_code"):
+        g = g.dropna(subset=["close"]).sort_values("time")
+        if g.empty:
+            continue
+        last = g.iloc[-1]
+        prev = g.iloc[-2] if len(g) >= 2 else last
+        close = safe_float(last.get("close"), 0)
+        prev_close = safe_float(prev.get("close"), 0)
+        pct = ((close - prev_close) / prev_close * 100) if close > 0 and prev_close > 0 else 0.0
+        code = from_jq_code(jq_code)
+        rows.append({"股票代码": code, "股票简称": names.get(jq_code, code), "所属行业": ind_map.get(jq_code, "未分类"), "区间涨跌幅": pct, "最新价": close, "成交额": safe_float(last.get("money"), 0), "成交量": safe_float(last.get("volume"), 0), "数据日期": str(last.get("time"))[:10], "数据源": "JQData最新交易日日线"})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(), "JQData价格快照无有效股票"
+    return out, f"JQData最新交易日行情成功获取{len(out)}只股票"
+@st.cache_data(ttl=900, show_spinner=False)
+def get_jqdata_hot_blocks(max_stocks=5000):
+    """JQData 全市场真实行情计算热点板块：行业平均涨幅、上涨占比、成交额、强势股数量。"""
+    snap, msg = _jq_snapshot_rows(max_stocks=max_stocks)
+    if snap.empty:
+        return [], msg
+    df = snap.copy()
+    df = df[df["所属行业"].astype(str).ne("未分类")]
+    df["区间涨跌幅"] = pd.to_numeric(df["区间涨跌幅"], errors="coerce").fillna(0)
+    df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce").fillna(0)
+    if df.empty:
+        return [], "JQData 行业映射为空，无法计算行业热点"
+    rows = []
+    for industry, g in df.groupby("所属行业"):
+        if len(g) < 3:
+            continue
+        up_cnt = int((g["区间涨跌幅"] > 0).sum())
+        down_cnt = int((g["区间涨跌幅"] < 0).sum())
+        strong_cnt = int((g["区间涨跌幅"] >= 5).sum())
+        avg_pct = float(g["区间涨跌幅"].mean())
+        up_ratio = up_cnt / len(g) * 100
+        amount_sum = float(g["成交额"].sum())
+        leader = g.sort_values("区间涨跌幅", ascending=False).iloc[0]
+        rows.append({"板块名称": industry, "涨跌幅": avg_pct, "上涨家数": up_cnt, "下跌家数": down_cnt, "领涨股票": f"{leader.get('股票简称', '-') }({leader.get('股票代码', '-')})", "成交额": amount_sum, "强势股数": strong_cnt, "上涨占比": up_ratio, "数据源": "JQData全市场真实行情计算"})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return [], "JQData 计算后无有效行业热点"
+    out["成交额_rank"] = out["成交额"].rank(pct=True).fillna(0)
+    out["涨幅_rank"] = out["涨跌幅"].rank(pct=True).fillna(0)
+    out["上涨占比_rank"] = out["上涨占比"].rank(pct=True).fillna(0)
+    out["强势股_rank"] = out["强势股数"].rank(pct=True).fillna(0)
+    out["热点分"] = (out["涨幅_rank"] * 35 + out["上涨占比_rank"] * 25 + out["成交额_rank"] * 25 + out["强势股_rank"] * 15).round(2)
+    out = out.sort_values(["热点分", "涨跌幅", "成交额"], ascending=False).head(15)
+    keep = ["板块名称", "热点分", "涨跌幅", "上涨家数", "下跌家数", "上涨占比", "强势股数", "成交额", "领涨股票", "数据源"]
+    return out[keep].to_dict("records"), msg
+def _fetch_jqdata_moneyflow_pool(max_stocks=5000, trade_date=None):
+    """JQData 真实资金流池。主力净流入只取 JQData money_flow 原始字段/大单超大单字段，不做量价估算。"""
+    ok, msg = ensure_jqdata_auth()
+    if not ok:
+        return pd.DataFrame(), msg
+    securities, names, msg_uni = _jq_get_stock_universe(max_stocks=max_stocks)
+    if not securities:
+        return pd.DataFrame(), msg_uni
+    dates = [str(trade_date)] if trade_date else get_latest_trade_date_for_data(12)
+    mf = None
+    used_date = None
+    last_error = ""
+    for d in dates:
+        try:
+            try:
+                tmp = jq.get_money_flow(security_list=securities, start_date=d, end_date=d)
+            except TypeError:
+                tmp = jq.get_money_flow(securities, d, d)
+            if tmp is not None and not tmp.empty:
+                mf = tmp.copy()
+                used_date = d
+                break
+        except Exception as exc:
+            last_error = str(exc)
+    if mf is None or mf.empty:
+        return pd.DataFrame(), f"JQData money_flow 最近交易日返回空或账号无权限：{last_error}"
+    mf = mf.reset_index(drop=False)
+    code_col = None
+    for c in ["sec_code", "security", "code", "index"]:
+        if c in mf.columns:
+            code_col = c
+            break
+    if not code_col:
+        return pd.DataFrame(), f"JQData money_flow 返回字段中没有证券代码列：{list(mf.columns)}"
+    mf["jq_code"] = mf[code_col].astype(str).apply(lambda x: x if "." in x else to_jq_code(x[:6]))
+    mf["股票代码"] = mf["jq_code"].apply(from_jq_code)
+    mf["股票简称"] = mf["jq_code"].map(names).fillna(mf["股票代码"])
+    def pick_numeric(cols):
+        for c in cols:
+            if c in mf.columns:
+                return pd.to_numeric(mf[c], errors="coerce").fillna(0)
+        return pd.Series([0] * len(mf), index=mf.index, dtype="float64")
+    main_net = pick_numeric(["net_amount_main", "main_net_amount", "net_mf_amount", "net_amount"])
+    if main_net.abs().sum() == 0:
+        main_net = (pick_numeric(["buy_lg_amount"]) - pick_numeric(["sell_lg_amount"])) + (pick_numeric(["buy_elg_amount"]) - pick_numeric(["sell_elg_amount"]))
+    if main_net.abs().sum() == 0:
+        main_net = pick_numeric(["net_amount_l"]) + pick_numeric(["net_amount_xl"])
+    price_df, _ = _jq_latest_price_frame(mf["jq_code"].drop_duplicates().tolist(), count=2, end_date=used_date)
+    price_map_close, price_map_money, price_map_pct = {}, {}, {}
+    if not price_df.empty:
+        for jq_code, g in price_df.groupby("jq_code"):
+            g = g.dropna(subset=["close"]).sort_values("time")
+            if g.empty:
+                continue
+            last = g.iloc[-1]
+            prev = g.iloc[-2] if len(g) >= 2 else last
+            close = safe_float(last.get("close"), 0)
+            prev_close = safe_float(prev.get("close"), 0)
+            price_map_close[jq_code] = close
+            price_map_money[jq_code] = safe_float(last.get("money"), 0)
+            price_map_pct[jq_code] = ((close - prev_close) / prev_close * 100) if close > 0 and prev_close > 0 else 0
+    ind_map = _jq_get_industry_map(mf["jq_code"].drop_duplicates().tolist(), date=used_date)
+    rows = []
+    for idx, r in mf.iterrows():
+        code = str(r.get("股票代码", "")).zfill(6)
+        name = str(r.get("股票简称", code))
+        if not re.fullmatch(r"\d{6}", code) or "ST" in name or "退" in name:
+            continue
+        jq_code = r.get("jq_code")
+        rows.append({"股票代码": code, "股票简称": name, "所属行业": ind_map.get(jq_code, "未分类"), "区间涨跌幅": safe_float(price_map_pct.get(jq_code), 0), "最新价": safe_float(price_map_close.get(jq_code), 0), "主力净流入": safe_float(main_net.loc[idx], 0), "成交额": safe_float(price_map_money.get(jq_code), 0), "换手率": 0.0, "总市值": 0.0, "市盈率": "-", "资金热度分": 0.0, "数据源": f"JQData真实资金流{used_date}"})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(), "JQData money_flow 无有效股票"
+    return out, f"JQData money_flow 成功获取{len(out)}只股票，交易日{used_date}"
+
 # ================= 侧边栏与参数调优 =================
 with st.sidebar:
     st.header("⚙️ 终端控制台")
