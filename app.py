@@ -6005,42 +6005,203 @@ def get_hot_blocks():
     return []
 
 
-def _merge_mx_quote_fields(quote, symbol):
-    """用妙想金融数据补充缺失字段，不覆盖已存在的实时价格。"""
-    if not quote:
-        quote = {"symbol": symbol}
-    need = []
-    for key in ["price", "pct", "turnover", "pe", "pb", "market_cap"]:
-        if quote.get(key) in (None, "", "-") or safe_float(quote.get(key), 0) == 0:
-            need.append(key)
-    if not need or not get_mx_apikey():
-        return quote
-    q = f"{symbol} 最新价 涨跌幅 换手率 市盈率 市净率 总市值 主力资金净流入"
-    rows, err = mx_data_query(q, max_rows=10)
+def _parse_market_cap_to_yi(value):
+    """把妙想/其他接口返回的市值统一转成“亿元”。
+    兼容：1.23万亿、1234亿、123400000000、1,234.56亿元、--。
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return _normalize_market_cap_yi(value)
+    text = str(value).strip()
+    if not text or text in ["-", "--", "None", "nan", "暂无"]:
+        return 0.0
+    text = text.replace(",", "").replace("人民币", "").replace(" ", "")
+    # 从“总市值：1234.56亿元”这类文本里取数。
+    m = re.search(r"([-+]?\d+(?:\.\d+)?)", text)
+    if not m:
+        return 0.0
+    num = safe_float(m.group(1), 0.0)
+    if num <= 0:
+        return 0.0
+    if "万亿" in text or "兆" in text:
+        return num * 10000
+    if "亿" in text:
+        return num
+    if "万元" in text or "万" in text:
+        return num / 10000
+    if "元" in text:
+        return num / 100000000
+    # 没单位时沿用原归一化规则：大数字按元，小数字按亿元。
+    return _normalize_market_cap_yi(num)
+
+
+def _extract_mx_market_cap_yi(rows):
+    """从妙想金融数据返回的 rows 中优先提取总市值，不取流通市值。"""
     if not rows:
-        if globals().get("DEBUG_MODE", False) and err:
-            st.caption(f"妙想个股数据补充失败：{err}")
-        return quote
-    text = json.dumps(rows, ensure_ascii=False)
-    # 保守补充：只在字段缺失时填充，避免误解析覆盖实时行情。
+        return 0.0, ""
+
+    # 第一优先级：列名就是总市值/市值且不含流通。
+    priority_keys = ["总市值", "A股总市值", "当前总市值", "市值"]
     for row in rows:
+        if not isinstance(row, dict):
+            continue
         for k, v in row.items():
             ks = str(k)
-            if quote.get("price") in (None, "", "-") and any(x in ks for x in ["最新价", "收盘价", "价格"]):
-                quote["price"] = v
-            if quote.get("pct") in (None, "", "-") and "涨跌幅" in ks:
-                quote["pct"] = v
-            if quote.get("turnover") in (None, "", "-") and "换手" in ks:
-                quote["turnover"] = v
-            if quote.get("pe") in (None, "", "-") and ("市盈" in ks or ks.upper() == "PE"):
-                quote["pe"] = v
-            if quote.get("pb") in (None, "", "-") and ("市净" in ks or ks.upper() == "PB"):
-                quote["pb"] = v
-            if quote.get("market_cap") in (None, "", "-") and "市值" in ks:
-                quote["market_cap"] = v
-    src = quote.get("source") or ""
-    if rows and "妙想金融数据" not in src:
-        quote["source"] = (src + " + 妙想金融数据补充").strip(" +")
+            if "流通" in ks:
+                continue
+            if any(pk in ks for pk in priority_keys):
+                cap = _parse_market_cap_to_yi(v)
+                if cap > 0:
+                    return cap, f"妙想字段：{ks}"
+
+    # 第二优先级：指标名/指标值结构。
+    name_keys = ["指标", "项目", "名称", "item", "name"]
+    value_keys = ["值", "数据", "value", "最新", "本期"]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        indicator_name = ""
+        indicator_value = None
+        for k, v in row.items():
+            ks = str(k)
+            if any(x in ks for x in name_keys):
+                indicator_name = str(v)
+            if any(x in ks for x in value_keys):
+                indicator_value = v
+        if indicator_name and "市值" in indicator_name and "流通" not in indicator_name:
+            cap = _parse_market_cap_to_yi(indicator_value)
+            if cap > 0:
+                return cap, f"妙想指标：{indicator_name}"
+
+    # 第三优先级：全文兜底搜索“总市值...数字...单位”。
+    text = json.dumps(rows, ensure_ascii=False)
+    for pat in [
+        r"总市值[^0-9一二三四五六七八九十百千万亿兆-]*([-+]?\d+(?:\.\d+)?\s*(?:万亿|亿元|亿|万元|元)?)",
+        r"市值[^0-9一二三四五六七八九十百千万亿兆-]*([-+]?\d+(?:\.\d+)?\s*(?:万亿|亿元|亿|万元|元)?)",
+    ]:
+        m = re.search(pat, text)
+        if m:
+            cap = _parse_market_cap_to_yi(m.group(1))
+            if cap > 0:
+                return cap, "妙想全文解析"
+    return 0.0, ""
+
+
+def _baostock_market_cap_fallback_yi(symbol, price=0.0):
+    """BaoStock 市值低优先级兜底。
+    BaoStock多数场景不直接给总市值；若 basic 中有总股本/流通股本字段，则用最近价估算。
+    返回值仅用于“妙想未返回总市值且其他源也缺失”时补缺。
+    """
+    symbol = str(symbol).zfill(6)
+    cache_path = _cache_file("quote", f"baostock_market_cap_{symbol}.json")
+    cached = _json_load(cache_path, max_age_seconds=24 * 3600)
+    if cached and safe_float(cached.get("market_cap"), 0) > 0:
+        return safe_float(cached.get("market_cap"), 0), cached.get("source", "BaoStock市值缓存")
+    try:
+        lg = bs_login_quiet()
+        if getattr(lg, "error_code", "") != "0":
+            return 0.0, ""
+        bs_code = f"sh.{symbol}" if symbol.startswith(("6", "9", "5", "7")) else f"sz.{symbol}"
+        basic = bs.query_stock_basic(code=bs_code)
+        rows = []
+        while getattr(basic, "error_code", "") == "0" and basic.next():
+            rows.append(basic.get_row_data())
+        try:
+            bs_logout_quiet()
+        except Exception:
+            pass
+        if not rows:
+            return 0.0, ""
+        bdf = pd.DataFrame(rows, columns=basic.fields)
+        r = bdf.iloc[0].to_dict()
+        # 不同版本字段名可能不同，做宽松兼容。
+        share_val = None
+        share_key = ""
+        for k in ["totalShares", "totalShare", "total_shares", "总股本", "流通股本", "liqaShare", "outstandingShare"]:
+            if k in r and safe_float(r.get(k), 0) > 0:
+                share_val = safe_float(r.get(k), 0)
+                share_key = k
+                break
+        px = safe_float(price, 0.0)
+        if not share_val or px <= 0:
+            return 0.0, ""
+        # 若为“股”：股数*价格/1e8；若为“万股”：结果过小时自动修正。
+        cap_yi = share_val * px / 100000000
+        if cap_yi < 1 and share_val > 0:
+            cap_yi = share_val * 10000 * px / 100000000
+        if cap_yi > 0:
+            out = {"market_cap": cap_yi, "source": f"BaoStock总股本估算({share_key})"}
+            _json_save(cache_path, out)
+            return cap_yi, out["source"]
+    except Exception as e:
+        try:
+            bs_logout_quiet()
+        except Exception:
+            pass
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"BaoStock 市值兜底失败 {symbol}: {e}")
+    return 0.0, ""
+
+
+def _merge_mx_quote_fields(quote, symbol):
+    """用妙想金融数据优先补“总市值”，并补充 PE/PB/换手率等缺失字段。
+    原则：不覆盖已有实时价格；总市值以妙想为主源，妙想没有时再走 BaoStock 低优先级补缺。
+    """
+    symbol = str(symbol).strip().zfill(6)
+    if not quote:
+        quote = {"symbol": symbol}
+
+    # 只要总市值缺失，就优先请求妙想；其他字段仍只补缺。
+    market_cap_missing = safe_float(quote.get("market_cap"), 0) <= 0
+    other_missing = any(
+        quote.get(k) in (None, "", "-") or (k in ["turnover"] and safe_float(quote.get(k), 0) == 0)
+        for k in ["turnover", "pe", "pb"]
+    )
+    if get_mx_apikey() and (market_cap_missing or other_missing):
+        name = str(quote.get("name") or "").strip()
+        query_name = f"{symbol}{name}" if name and not name.startswith("代码") else symbol
+        # 把“总市值”放在问题最前面，提高妙想返回该字段的概率。
+        q_text = f"{query_name} 总市值 最新价 涨跌幅 换手率 市盈率 市净率 主力资金净流入"
+        rows, err = mx_data_query(q_text, max_rows=20)
+        if rows:
+            cap, cap_src = _extract_mx_market_cap_yi(rows)
+            if market_cap_missing and cap > 0:
+                quote["market_cap"] = cap
+                src = quote.get("source") or ""
+                quote["source"] = (src + f" + {cap_src or '妙想总市值'}").strip(" +")
+            # 其他字段保守补充，不覆盖已有有效实时字段。
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for k, v in row.items():
+                    ks = str(k)
+                    if safe_float(quote.get("price"), 0) <= 0 and any(x in ks for x in ["最新价", "收盘价", "价格"]):
+                        val = safe_float(v, 0)
+                        if val > 0:
+                            quote["price"] = val
+                    if safe_float(quote.get("pct"), 0) == 0 and "涨跌幅" in ks:
+                        quote["pct"] = v
+                    if safe_float(quote.get("turnover"), 0) <= 0 and "换手" in ks:
+                        val = safe_float(str(v).replace("%", ""), 0)
+                        if val > 0:
+                            quote["turnover"] = val
+                    if _is_missing_value(quote.get("pe"), numeric_zero_is_missing=False) and ("市盈" in ks or ks.upper() == "PE"):
+                        quote["pe"] = v
+                    if _is_missing_value(quote.get("pb"), numeric_zero_is_missing=False) and ("市净" in ks or ks.upper() == "PB"):
+                        quote["pb"] = v
+            if rows and "妙想金融数据" not in str(quote.get("source", "")):
+                quote["source"] = ((quote.get("source") or "") + " + 妙想金融数据补充").strip(" +")
+        elif globals().get("DEBUG_MODE", False) and err:
+            st.caption(f"妙想个股数据补充失败：{err}")
+
+    # 妙想仍未给出总市值时，才使用 BaoStock 低优先级兜底。
+    if safe_float(quote.get("market_cap"), 0) <= 0:
+        cap, src2 = _baostock_market_cap_fallback_yi(symbol, price=safe_float(quote.get("price"), 0))
+        if cap > 0:
+            quote["market_cap"] = cap
+            quote["source"] = ((quote.get("source") or "") + f" + {src2}").strip(" +")
+
     return quote
 
 
