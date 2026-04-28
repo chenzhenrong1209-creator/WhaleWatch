@@ -6245,6 +6245,189 @@ try:
 except Exception:
     pass
 
+
+
+# ================= v17 个股总市值精准修复开始 =================
+# 目标：只做个股解析“总市值”补全，不改原页面和其他模块。
+# 顺序：妙想 MX 金融数据主源 → 东方财富单股 f116 真实字段兜底 → BaoStock 低优先级兜底。
+# 说明：BaoStock 通常不直接提供总市值，因此只放在最后，不能作为唯一市值来源。
+
+def _mx_recursive_market_cap_yi(obj):
+    """从妙想原始 JSON / rows 中递归提取总市值，兼容多层 table/nameMap/文本结果。"""
+    best = 0.0
+    try:
+        if obj is None:
+            return 0.0
+        if isinstance(obj, dict):
+            # 1) 键名直接命中
+            for k, v in obj.items():
+                ks = str(k)
+                if "流通" not in ks and any(x in ks for x in ["总市值", "A股总市值", "当前总市值", "市值"]):
+                    cap = _parse_market_cap_to_yi(v)
+                    if cap > 0:
+                        return cap
+            # 2) 指标名 + 指标值结构
+            name_val = ""
+            value_val = None
+            for k, v in obj.items():
+                ks = str(k)
+                if any(x in ks for x in ["指标", "项目", "名称", "name", "item"]):
+                    name_val = str(v)
+                if any(x in ks for x in ["值", "数据", "value", "最新", "本期"]):
+                    value_val = v
+            if name_val and "市值" in name_val and "流通" not in name_val:
+                cap = _parse_market_cap_to_yi(value_val)
+                if cap > 0:
+                    return cap
+            # 3) 递归子项
+            for v in obj.values():
+                cap = _mx_recursive_market_cap_yi(v)
+                if cap > best:
+                    best = cap
+            return best
+        if isinstance(obj, list):
+            for it in obj:
+                cap = _mx_recursive_market_cap_yi(it)
+                if cap > best:
+                    best = cap
+            return best
+        if isinstance(obj, str):
+            text = obj.replace(",", "")
+            # 优先“总市值”上下文，避免误抓其它数字。
+            for pat in [
+                r"总市值[^0-9-]{0,20}([-+]?\d+(?:\.\d+)?\s*(?:万亿|亿元|亿|万元|元)?)",
+                r"A股总市值[^0-9-]{0,20}([-+]?\d+(?:\.\d+)?\s*(?:万亿|亿元|亿|万元|元)?)",
+                r"当前总市值[^0-9-]{0,20}([-+]?\d+(?:\.\d+)?\s*(?:万亿|亿元|亿|万元|元)?)",
+            ]:
+                m = re.search(pat, text)
+                if m:
+                    cap = _parse_market_cap_to_yi(m.group(1))
+                    if cap > 0:
+                        return cap
+    except Exception:
+        return 0.0
+    return best
+
+
+def _mx_market_cap_query_v17(symbol, name=""):
+    """用妙想作为总市值主源。多问法短超时，避免一次自然语言未命中。"""
+    if not get_mx_apikey():
+        return 0.0, "未配置MX_APIKEY"
+    symbol = str(symbol).zfill(6)
+    name = str(name or "").strip()
+    queries = []
+    if name:
+        queries.extend([
+            f"{name} {symbol} 总市值",
+            f"{symbol} {name} A股总市值 最新总市值",
+        ])
+    queries.extend([
+        f"股票代码{symbol} 总市值",
+        f"{symbol} 总市值 市盈率 市净率 换手率",
+    ])
+    last_err = ""
+    for q in list(dict.fromkeys(queries))[:4]:
+        data, err = _mx_post("/query", {"toolQuery": q}, timeout_sec=8)
+        if data:
+            rows = _mx_extract_data_tables(data)
+            cap = _mx_recursive_market_cap_yi(rows) or _mx_recursive_market_cap_yi(data)
+            if cap > 0:
+                return cap, f"妙想总市值({q})"
+        last_err = err or "妙想无市值字段"
+    return 0.0, last_err
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _eastmoney_market_cap_single_v17(symbol):
+    """东方财富单股真实字段 f116 兜底总市值，单位统一为亿元。"""
+    symbol = str(symbol).strip().zfill(6)
+    if not re.fullmatch(r"\d{6}", symbol):
+        return 0.0, "代码无效"
+    try:
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {
+            "secid": _secid_for_symbol(symbol),
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fltt": 2,
+            "invt": 2,
+            "fields": "f57,f58,f43,f170,f116,f117,f162,f167,f168",
+        }
+        data = fetch_eastmoney_native(
+            url,
+            params=params,
+            timeout=5,
+            retries=1,
+            cache_key=f"em_single_marketcap_{symbol}",
+            cache_ttl=900,
+            referer=f"https://quote.eastmoney.com/{'sh' if symbol.startswith(('6','9','5','7')) else 'sz'}{symbol}.html",
+        )
+        d = data.get("data") if isinstance(data, dict) else None
+        if isinstance(d, dict):
+            cap = _normalize_market_cap_yi(d.get("f116"))
+            if cap > 0:
+                return cap, "东方财富单股f116总市值"
+    except Exception as e:
+        return 0.0, str(e)
+    return 0.0, "东方财富单股f116无结果"
+
+
+def _merge_market_cap_v17(quote, symbol):
+    """只补总市值；不覆盖实时价格、涨跌幅、PE、换手率等已经正常的字段。"""
+    symbol = str(symbol).strip().zfill(6)
+    if not quote:
+        quote = {"symbol": symbol}
+    if safe_float(quote.get("market_cap"), 0) > 0:
+        return quote
+    name = str(quote.get("name") or "").strip()
+
+    # 1. 妙想主源
+    cap, src = _mx_market_cap_query_v17(symbol, name)
+    if cap > 0:
+        quote["market_cap"] = cap
+        quote["source"] = ((quote.get("source") or "") + f" + {src}").strip(" +")
+        return quote
+
+    # 2. 东方财富单股真实字段兜底：这是市值字段最稳定的免费实时来源之一。
+    cap2, src2 = _eastmoney_market_cap_single_v17(symbol)
+    if cap2 > 0:
+        quote["market_cap"] = cap2
+        quote["source"] = ((quote.get("source") or "") + f" + {src2}").strip(" +")
+        return quote
+
+    # 3. BaoStock最低优先级，能取到总股本时才估算；取不到就保持缺失，不造假。
+    cap3, src3 = _baostock_market_cap_fallback_yi(symbol, price=safe_float(quote.get("price"), 0))
+    if cap3 > 0:
+        quote["market_cap"] = cap3
+        quote["source"] = ((quote.get("source") or "") + f" + {src3}").strip(" +")
+    else:
+        # 把失败原因放到内部字段，页面仍按原逻辑显示缺失，不刷屏。
+        quote["market_cap_missing_reason"] = f"妙想未返回总市值：{src}；东方财富：{src2}；BaoStock：{src3 or '无总股本字段'}"
+    return quote
+
+
+# 再次覆盖 get_stock_quote：放在 tab 渲染之前，保证个股解析页面调用的是 v17 市值修复逻辑。
+_get_stock_quote_v16_marketcap = get_stock_quote
+
+@st.cache_data(ttl=45, show_spinner=False)
+def get_stock_quote(symbol):
+    symbol = str(symbol).strip().zfill(6)
+    q = _get_stock_quote_v16_marketcap(symbol)
+    q = _merge_market_cap_v17(q or {"symbol": symbol, "source": "市值补全链路"}, symbol)
+    finalized = _finalize_quote(q, symbol) if "_finalize_quote" in globals() else q
+    if finalized:
+        finalized["quality_score"] = _quote_quality(finalized) if "_quote_quality" in globals() else finalized.get("quality_score", 0)
+        missing = []
+        if safe_float(finalized.get("market_cap"), 0) <= 0:
+            missing.append("总市值")
+        if safe_float(finalized.get("turnover"), 0) <= 0:
+            missing.append("换手率")
+        if finalized.get("pe") in (None, "", "-", "--"):
+            missing.append("PE")
+        finalized["fundamental_warning"] = "真实接口字段缺失：" + "、".join(missing) if missing else "真实接口字段较完整"
+    return finalized
+
+# ================= v17 个股总市值精准修复结束 =================
+
 # ================= v14 妙想 MX 微创叠加层结束 =================
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
