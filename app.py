@@ -7090,6 +7090,432 @@ def render_high_end_news_terminal():
 
 # ================= v14 妙想 MX 微创叠加层结束 =================
 
+# ================= v21 新闻情报：妙想一键扫描 + 日期范围 + 中文报告微创修复开始 =================
+# 目标：保留 v20 已经修好的系统结构，只对新闻情报页面做微创覆盖：
+# 1) 不再展示“标准/深度/极速/行业概念/市场热点/宏观要闻”等模式选择；
+# 2) 不再设置情报数量，改为日期范围；
+# 3) 妙想资讯搜索一次性覆盖个股、公告、研报、行业、概念、热点、宏观；
+# 4) 智能情报报告只显示中文正文，不再把 Python 字典/英文字段展示给用户。
+
+_MX_NEWS_TYPE_CN_V21 = {
+    "NEWS": "新闻",
+    "REPORT": "研报",
+    "ANNOUNCEMENT": "公告",
+    "ANN": "公告",
+    "NOTICE": "公告",
+    "ARTICLE": "资讯",
+    "OPINION": "观点",
+    "INTERACTION": "互动",
+    "UNKNOWN": "资讯",
+    "MX": "妙想资讯",
+}
+
+
+def _date_scope_to_phrase_v21(scope: str) -> str:
+    scope = str(scope or "最近3天").strip()
+    if scope == "今天":
+        return "今天"
+    if scope == "最近3天":
+        return "最近3天"
+    if scope == "最近7天":
+        return "最近7天"
+    if scope == "最近15天":
+        return "最近15天"
+    if scope == "最近30天":
+        return "最近30天"
+    return scope
+
+
+def _date_scope_to_max_items_v21(scope: str) -> int:
+    """内部自动控制结果量，不在页面暴露数量设置。"""
+    return {
+        "今天": 45,
+        "最近3天": 65,
+        "最近7天": 85,
+        "最近15天": 105,
+        "最近30天": 120,
+    }.get(str(scope or "最近3天"), 80)
+
+
+def _date_scope_to_days_v21(scope: str) -> int:
+    return {
+        "今天": 1,
+        "最近3天": 3,
+        "最近7天": 7,
+        "最近15天": 15,
+        "最近30天": 30,
+    }.get(str(scope or "最近3天"), 7)
+
+
+def _parse_news_time_v21(value):
+    """尽量解析妙想/新闻源时间；解析失败返回 None，不强行丢弃。"""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    s = s.replace("/", "-").replace("年", "-").replace("月", "-").replace("日", " ")
+    # 常见：2026-04-29 10:00:00 / 2026-04-29 / 04-29 10:00
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m-%d %H:%M", "%m-%d"]:
+        try:
+            dt = datetime.strptime(s[:len(datetime.now().strftime(fmt))], fmt)
+            if "%Y" not in fmt:
+                dt = dt.replace(year=datetime.now().year)
+            return dt
+        except Exception:
+            continue
+    try:
+        return pd.to_datetime(s, errors="coerce").to_pydatetime()
+    except Exception:
+        return None
+
+
+def _filter_items_by_date_scope_v21(items, scope):
+    """日期范围是用户的主控制项。解析不到日期的结果保留，避免妙想返回无时间字段时误删。"""
+    days = _date_scope_to_days_v21(scope)
+    start = datetime.now() - timedelta(days=max(0, days - 1))
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for it in items or []:
+        dt = _parse_news_time_v21(it.get("time") or it.get("date") or it.get("publishTime"))
+        if dt is None or dt >= start:
+            out.append(it)
+    return out
+
+
+def _normalize_news_item_chinese_v21(item):
+    """把平台/类型做中文化，避免 NEWS/REPORT/ANNOUNCEMENT 等英文字母直接出现在页面。"""
+    if not isinstance(item, dict):
+        return item
+    item = dict(item)
+    raw_platform = str(item.get("platform") or item.get("informationType") or "资讯").strip()
+    item["platform"] = _MX_NEWS_TYPE_CN_V21.get(raw_platform.upper(), raw_platform if re.search(r"[\u4e00-\u9fff]", raw_platform) else "资讯")
+    source = str(item.get("source") or "妙想资讯搜索").strip()
+    if source.upper() in _MX_NEWS_TYPE_CN_V21:
+        source = _MX_NEWS_TYPE_CN_V21.get(source.upper(), "妙想资讯")
+    item["source"] = source.replace("MX", "妙想")
+    return item
+
+
+def _resolve_stock_name_v21(stock_or_name):
+    """支持股票代码或股票名称；代码时尽量补简称，提高妙想命中率。"""
+    text = str(stock_or_name or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        code6 = text.zfill(6)
+        try:
+            q, _ = _surgical_call_with_timeout(lambda: get_stock_quote(code6), timeout_sec=4, default=None)
+            if isinstance(q, dict):
+                name = str(q.get("name") or "").strip()
+                if name and not name.startswith("代码"):
+                    return f"{code6} {name}"
+        except Exception:
+            pass
+        return code6
+    return text
+
+
+def _build_mx_news_queries_v21(stock_code="", keyword="", date_scope="最近3天"):
+    """一次性全面扫描：个股 + 公告 + 研报 + 行业/概念 + 热点 + 宏观。"""
+    date_phrase = _date_scope_to_phrase_v21(date_scope)
+    target = _resolve_stock_name_v21(stock_code)
+    kw = str(keyword or "").strip()
+    queries = []
+
+    if target:
+        queries.extend([
+            f"{date_phrase} {target} 最新消息 最新公告 重大事项 业绩变化 风险提示",
+            f"{date_phrase} {target} 最新研报 机构观点 评级变化 目标价 投资逻辑",
+            f"{date_phrase} {target} 股价异动 原因 舆情动态 市场观点 资金关注",
+            f"{date_phrase} {target} 所属行业 概念题材 产业链动态 政策催化 竞争格局",
+        ])
+
+    if kw:
+        queries.extend([
+            f"{date_phrase} {kw} 最新消息 行业动态 政策变化 产业趋势 舆情趋势",
+            f"{date_phrase} {kw} 相关上市公司 热点催化 资金关注 机构观点 风险提示",
+        ])
+
+    # 无论是否输入个股，都补充市场和宏观，使“一键扫描”更完整。
+    queries.extend([
+        f"{date_phrase} A股市场热点 题材发酵 舆论趋势 资金关注 强势板块",
+        f"{date_phrase} 中国宏观经济要闻 政策 央行 财政 汇率 对A股影响",
+    ])
+
+    # 去重并限制请求数，避免拖慢页面。每条请求都短超时。
+    seen, out = set(), []
+    for q in queries:
+        key = re.sub(r"\s+", "", q)
+        if key not in seen:
+            seen.add(key)
+            out.append(q)
+    return out[:6]
+
+
+def _dedupe_news_items_v21(items, max_items=80, date_scope="最近3天"):
+    items = [_normalize_news_item_chinese_v21(x) for x in (items or []) if isinstance(x, dict)]
+    items = _filter_items_by_date_scope_v21(items, date_scope)
+    seen, out = set(), []
+    for item in items:
+        title = str(item.get("title") or item.get("summary") or "").strip()
+        if not title:
+            continue
+        key = re.sub(r"\s+", "", title)[:100]
+        if key in seen:
+            continue
+        seen.add(key)
+        item["title"] = title
+        try:
+            item["impact_score"] = HighEndNewsFetcher()._score_item(item)
+            item["matched_sectors"] = HighEndNewsFetcher()._match_sectors(title + " " + str(item.get("summary", "")))
+        except Exception:
+            item["impact_score"] = safe_float(item.get("impact_score"), 50)
+            item["matched_sectors"] = item.get("matched_sectors", [])
+        out.append(item)
+    out = sorted(out, key=lambda x: (safe_float(x.get("impact_score")), str(x.get("time", ""))), reverse=True)
+    return out[:max_items]
+
+
+def _collect_news_mx_primary_v21(self, stock_code="", max_items=80, include_wencai=False, keyword="", mx_mode="一键扫描", date_scope="最近3天"):
+    """妙想主力。一键扫描，不使用问财；东方财富/新浪只做少量补充。"""
+    items, errors = [], []
+    self.errors = []
+    max_items = int(max_items or _date_scope_to_max_items_v21(date_scope))
+
+    if get_mx_apikey():
+        queries = _build_mx_news_queries_v21(stock_code=stock_code, keyword=keyword, date_scope=date_scope)
+        per_query = max(6, min(18, int(max_items / max(1, min(len(queries), 6))) + 4))
+        for q in queries:
+            mx_items, mx_err = mx_search_query_v20(q, max_items=per_query)
+            if mx_items:
+                for it in mx_items:
+                    it = _normalize_news_item_chinese_v21(it)
+                    it["query_hint"] = q
+                    items.append(it)
+            elif mx_err:
+                errors.append(f"妙想资讯搜索失败：{q}｜{mx_err}")
+    else:
+        errors.append("未配置 MX_APIKEY，妙想资讯搜索未启用")
+
+    # 补充源：只用于丰富，不抢主源位置，不用问财。
+    try:
+        supplement_n = 12 if stock_code else 18
+        if stock_code:
+            items.extend(self._fetch_stock_announcements_em(stock_code, max_items=supplement_n))
+        else:
+            items.extend(self._fetch_sina_live(max_items=supplement_n))
+            items.extend(self._fetch_em_global(max_items=supplement_n))
+    except Exception as e:
+        errors.append(f"补充新闻源失败：{e}")
+
+    cleaned = _dedupe_news_items_v21(items, max_items=max_items, date_scope=date_scope)
+    self.errors = errors + list(getattr(self, "errors", []) or [])
+    return {"items": cleaned, "errors": self.errors, "count": len(cleaned), "queries": _build_mx_news_queries_v21(stock_code, keyword, date_scope)}
+
+try:
+    HighEndNewsFetcher.collect = _collect_news_mx_primary_v21
+except Exception:
+    pass
+
+
+def _run_ai_agents_chinese_v21(self, items, topics, sector_view, flow, risk, candidate_stocks, stock_code, mode):
+    compact_news = "\n".join([f"- 【{i.get('platform','资讯')}】{i.get('title','')}" for i in items[:35]])
+    topics_text = "、".join([str(t.get("topic", "")) for t in topics[:12] if t.get("topic")]) or "暂未形成明确主题"
+    sectors_text = "；".join([f"{x.get('板块')}：{x.get('核心线索','')}" for x in sector_view[:8]]) or "暂未形成明确板块映射"
+    stocks_text = "、".join([f"{x.get('name')}({x.get('code')})" for x in candidate_stocks[:8]]) or "暂无明确候选股"
+    risk_text = "；".join(risk.get("risk_factors", [])[:8]) or "暂无明显风险词集中出现"
+    prompt = f"""
+你是A股新闻情报分析员。请只用中文输出，不要写英文单词，不要写代码，不要写英文缩写标题，不要输出字典或字段名。
+
+关注对象：{stock_code or '全市场'}
+日期范围：{mode}
+流量状态：综合分{flow.get('score')}，热度{flow.get('level')}，阶段{flow.get('stage')}。
+热点主题：{topics_text}
+板块线索：{sectors_text}
+候选股票：{stocks_text}
+风险线索：{risk_text}
+新闻材料：
+{compact_news}
+
+请按下面六段输出，每段用中文小标题：
+一、今日情报总览
+二、个股或行业核心变化
+三、题材与板块影响
+四、重点观察股票
+五、风险提示
+六、下一步观察计划
+
+要求：语言要直接、清楚、实用；不要出现英文栏目名；不要出现程序字段名；不要空话。
+"""
+    report = call_ai(prompt, temperature=0.2)
+    return {"chief_report": _clean_ai_report_chinese_v21(report)}
+
+
+def _clean_ai_report_chinese_v21(report):
+    """清理 AI 报告里常见的英文字段/字典痕迹。保留股票代码这类必要数字。"""
+    if isinstance(report, dict):
+        report = report.get("chief_report") or report.get("report") or json.dumps(report, ensure_ascii=False)
+    text = str(report or "").strip()
+    # 如果模型/旧代码返回了字典字符串，尽量提取 chief_report 内容。
+    m = re.search(r"chief_report['\"]?\s*[:=]\s*['\"](.+?)['\"]\s*[,}]", text, flags=re.S)
+    if m:
+        text = m.group(1)
+    replacements = {
+        "AI": "智能",
+        "NEWS": "新闻",
+        "REPORT": "研报",
+        "ANNOUNCEMENT": "公告",
+        "MX": "妙想",
+        "source": "来源",
+        "platform": "类型",
+        "title": "标题",
+        "summary": "摘要",
+        "chief_report": "情报报告",
+        "risk": "风险",
+        "score": "分数",
+        "mode": "模式",
+    }
+    for a, b in replacements.items():
+        text = text.replace(a, b)
+    return text
+
+try:
+    HighEndNewsAnalyzer.run_ai_agents = _run_ai_agents_chinese_v21
+except Exception:
+    pass
+
+
+def _extract_ai_report_text_v21(ai_report):
+    if isinstance(ai_report, dict):
+        text = ai_report.get("chief_report") or ai_report.get("report") or ""
+    else:
+        text = str(ai_report or "")
+    return _clean_ai_report_chinese_v21(text)
+
+
+def render_high_end_news_terminal():
+    st.markdown("### 🛰️ 新闻情报板块")
+    st.info("本页已改为：妙想资讯搜索一键扫描。输入个股或关键词后，系统会一次性抓取个股消息、公告、研报、行业概念、市场热点和宏观要闻；问财已停用。")
+
+    c_status1, c_status2, c_status3 = st.columns(3)
+    c_status1.metric("妙想资讯", "已配置" if bool(get_mx_apikey()) else "未配置")
+    c_status2.metric("问财", "已停用")
+    c_status3.metric("扫描方式", "一键综合扫描")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        stock_code = st.text_input("关注个股或名称（可选）", placeholder="例如：002484 / 江海股份", key="news_stock_code_v21")
+    with c2:
+        keyword = st.text_input("补充关键词（可选）", placeholder="例如：半导体、低空经济、降息", key="news_keyword_v21_clean")
+
+    c3, c4 = st.columns([1, 1])
+    with c3:
+        date_scope = st.selectbox("情报时间范围", ["今天", "最近3天", "最近7天", "最近15天", "最近30天"], index=1, key="news_date_scope_v21")
+    with c4:
+        use_ai_news = st.checkbox("生成智能情报报告", value=True, key="news_ai_v21")
+
+    if st.button("🚀 启动妙想情报扫描", type="primary", width="stretch", key="news_scan_v21"):
+        if use_ai_news and not api_key:
+            st.warning("未配置智能模型密钥，将只展示新闻列表和规则分析。")
+            use_ai_news = False
+
+        if not get_mx_apikey():
+            st.error("未配置妙想接口密钥。请在 Streamlit Secrets 中添加 MX_APIKEY 后再使用。")
+            return
+
+        max_items = _date_scope_to_max_items_v21(date_scope)
+        with st.spinner(f"正在通过妙想资讯搜索扫描{date_scope}的个股、公告、研报、行业和宏观情报..."):
+            fetcher = HighEndNewsFetcher(max_items=max_items)
+            raw = fetcher.collect(
+                stock_code=stock_code.strip(),
+                keyword=keyword.strip(),
+                max_items=max_items,
+                include_wencai=False,
+                mx_mode="一键综合扫描",
+                date_scope=date_scope,
+            )
+            items = raw.get("items", [])
+
+        if not items:
+            st.error("妙想资讯搜索暂未返回有效结果。可以换一个股票代码、股票名称或关键词重试。")
+            if raw.get("errors"):
+                with st.expander("查看失败详情"):
+                    st.write(raw.get("errors"))
+            return
+
+        analyzer = HighEndNewsAnalyzer()
+        with st.spinner("正在进行题材识别、板块映射与风险分析..."):
+            res = analyzer.analyze(items, stock_code=stock_code.strip() or keyword.strip(), use_ai=use_ai_news, mode=date_scope)
+
+        flow = res.get("flow", {})
+        risk = res.get("risk", {})
+        st.success(f"情报扫描完成：获取到 {len(items)} 条有效信息。主数据源：妙想资讯搜索。")
+        if raw.get("errors"):
+            with st.expander("数据源提示", expanded=False):
+                st.write("\n".join(raw.get("errors", [])[-20:]))
+        if raw.get("queries"):
+            with st.expander("本次妙想检索范围", expanded=False):
+                for q in raw.get("queries", []):
+                    st.write("- " + q)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("情报热度", flow.get("level", "观察"))
+        k2.metric("信息条数", len(items))
+        k3.metric("风险等级", risk.get("risk_level", "低"))
+        k4.metric("时间范围", date_scope)
+
+        tab1, tab2, tab3, tab4 = st.tabs(["🧠 智能报告", "📰 情报列表", "🏭 板块映射", "⚠️ 风险提示"])
+
+        with tab1:
+            report_text = _extract_ai_report_text_v21(res.get("ai_report"))
+            if report_text:
+                st.markdown(report_text)
+            else:
+                st.caption("未生成智能报告。")
+
+        with tab2:
+            show_rows = []
+            for it in items:
+                show_rows.append({
+                    "时间": it.get("time", ""),
+                    "类型": it.get("platform", "资讯"),
+                    "来源": it.get("source", "妙想资讯搜索"),
+                    "标题": it.get("title", ""),
+                    "摘要": str(it.get("summary", ""))[:260],
+                    "匹配题材": "、".join(it.get("matched_sectors", []) or []),
+                    "影响分": round(safe_float(it.get("impact_score"), 0), 1),
+                })
+            st.dataframe(pd.DataFrame(show_rows), width="stretch", hide_index=True)
+
+        with tab3:
+            sector_view = res.get("sector_view", []) or []
+            if sector_view:
+                st.dataframe(pd.DataFrame(sector_view), width="stretch", hide_index=True)
+            else:
+                st.caption("暂未识别出明确板块映射。")
+
+        with tab4:
+            risk_factors = risk.get("risk_factors", []) or []
+            if risk_factors:
+                for x in risk_factors:
+                    st.warning(str(x))
+            else:
+                st.success("当前情报中暂未发现明显集中风险词。")
+
+        try:
+            HighEndNewsDB().save_run(mode=date_scope, stock_code=(stock_code.strip() or keyword.strip()), score=flow.get("score", 0), summary=_extract_ai_report_text_v21(res.get("ai_report"))[:1500])
+        except Exception:
+            pass
+
+    with st.expander("📚 最近情报扫描记录", expanded=False):
+        df_recent = HighEndNewsDB().recent_runs(limit=8)
+        if df_recent is not None and not df_recent.empty:
+            st.dataframe(df_recent, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无历史记录。")
+
+# ================= v21 新闻情报：妙想一键扫描 + 日期范围 + 中文报告微创修复结束 =================
+
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
