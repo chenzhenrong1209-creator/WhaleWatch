@@ -6616,6 +6616,139 @@ def get_hot_blocks():
 # ================= v18 资金热点行业板块精准修复结束 =================
 
 
+# ================= v19 资金热点 yfinance 行业ETF代理补充开始 =================
+# 目标：当东方财富/AKShare/妙想均拿不到“行业板块”时，增加 yfinance 行业ETF代理。
+# 重要说明：yfinance 不提供东方财富A股行业板块主力净流入，因此这里不伪造资金流；只用行业ETF的真实涨跌幅、成交量、价格作为“行业强弱代理”。
+# 页面会在“数据源”中明确标注为 yfinance行业ETF代理，避免和东方财富行业板块资金流混淆。
+
+_get_hot_blocks_v18_industry = get_hot_blocks
+
+YF_SECTOR_ETF_MAP_V19 = [
+    ("证券", "512880.SS", "证券ETF"),
+    ("银行", "512800.SS", "银行ETF"),
+    ("半导体", "512480.SS", "半导体ETF"),
+    ("芯片", "159995.SZ", "芯片ETF"),
+    ("新能源车", "515030.SS", "新能源车ETF"),
+    ("光伏", "515790.SS", "光伏ETF"),
+    ("医药", "512010.SS", "医药ETF"),
+    ("医疗", "512170.SS", "医疗ETF"),
+    ("消费", "159928.SZ", "消费ETF"),
+    ("食品饮料", "515170.SS", "食品饮料ETF"),
+    ("酒", "512690.SS", "酒ETF"),
+    ("军工", "512660.SS", "军工ETF"),
+    ("传媒", "512980.SS", "传媒ETF"),
+    ("游戏", "159869.SZ", "游戏ETF"),
+    ("汽车", "516110.SS", "汽车ETF"),
+    ("有色金属", "512400.SS", "有色金属ETF"),
+    ("煤炭", "515220.SS", "煤炭ETF"),
+    ("钢铁", "515210.SS", "钢铁ETF"),
+    ("房地产", "512200.SS", "房地产ETF"),
+    ("化工", "516020.SS", "化工ETF"),
+    ("稀土", "516150.SS", "稀土ETF"),
+    ("人工智能", "515070.SS", "人工智能AI ETF"),
+    ("云计算", "516510.SS", "云计算ETF"),
+]
+
+
+def _yf_sector_proxy_blocks_v19():
+    """用 yfinance 获取A股行业ETF代理数据。不是东方财富行业板块资金流，不提供主力净流入。"""
+    try:
+        import yfinance as yf
+    except Exception as e:
+        raise RuntimeError(f"yfinance未安装或导入失败：{e}")
+
+    tickers = [t for _, t, _ in YF_SECTOR_ETF_MAP_V19]
+    data = yf.download(tickers=tickers, period="7d", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False, timeout=6)
+    if data is None or getattr(data, "empty", True):
+        return []
+
+    records = []
+    multi = isinstance(data.columns, pd.MultiIndex)
+    for sector, ticker, note in YF_SECTOR_ETF_MAP_V19:
+        try:
+            if multi:
+                if ticker not in data.columns.get_level_values(0):
+                    continue
+                df = data[ticker].dropna(how="all")
+            else:
+                df = data.dropna(how="all")
+            if df is None or df.empty or "Close" not in df.columns:
+                continue
+            df = df.dropna(subset=["Close"])
+            if len(df) < 2:
+                continue
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            close = safe_float(last.get("Close"), 0)
+            prev_close = safe_float(prev.get("Close"), 0)
+            if close <= 0 or prev_close <= 0:
+                continue
+            pct = (close / prev_close - 1) * 100
+            volume = safe_float(last.get("Volume"), 0)
+            amount_proxy = close * volume
+            records.append({
+                "板块代码": ticker,
+                "板块名称": sector,
+                "热点分": 0.0,
+                "涨跌幅": round(pct, 2),
+                "主力净流入": "-",
+                "成交额": round(amount_proxy, 2),
+                "上涨家数": "-",
+                "下跌家数": "-",
+                "领涨股票": note,
+                "数据源": "yfinance行业ETF代理｜非主力资金流",
+            })
+        except Exception:
+            continue
+
+    if not records:
+        return []
+    df = pd.DataFrame(records)
+    df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce").fillna(0)
+    df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce").fillna(0)
+    df["涨幅_rank"] = df["涨跌幅"].rank(pct=True).fillna(0)
+    df["成交_rank"] = df["成交额"].rank(pct=True).fillna(0)
+    df["热点分"] = (df["涨幅_rank"] * 70 + df["成交_rank"] * 30).round(2)
+    df = df.sort_values(["热点分", "涨跌幅", "成交额"], ascending=False).head(20)
+    return df[["板块代码", "板块名称", "热点分", "涨跌幅", "主力净流入", "成交额", "上涨家数", "下跌家数", "领涨股票", "数据源"]].to_dict("records")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_hot_blocks():
+    """v19：行业板块优先；若真实板块接口全空，再用 yfinance 行业ETF代理补充。"""
+    cache_path = _cache_file("blocks", f"hot_industry_blocks_v19_{datetime.now().strftime('%Y%m%d')}.json")
+
+    records, err = _surgical_call_with_timeout(_get_hot_blocks_v18_industry, timeout_sec=10, default=[])
+    if records:
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": records})
+        return records
+
+    yf_records, yf_err = _surgical_call_with_timeout(_yf_sector_proxy_blocks_v19, timeout_sec=8, default=[])
+    if yf_records:
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": yf_records})
+        return yf_records
+
+    cached = _json_load(cache_path, max_age_seconds=8 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        data = cached["records"]
+        for r in data:
+            r["数据源"] = f"{r.get('数据源','行业板块缓存')}｜缓存 {cached.get('time','')}"
+        return data
+
+    old_cache = _cache_file("blocks", f"hot_industry_blocks_v18_{datetime.now().strftime('%Y%m%d')}.json")
+    cached = _json_load(old_cache, max_age_seconds=8 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        data = cached["records"]
+        for r in data:
+            r["数据源"] = f"{r.get('数据源','行业板块缓存')}｜缓存 {cached.get('time','')}"
+        return data
+
+    if globals().get("DEBUG_MODE", False):
+        st.caption(f"资金热点失败：v18行业板块={err}; yfinance行业ETF代理={yf_err}")
+    return []
+# ================= v19 资金热点 yfinance 行业ETF代理补充结束 =================
+
+
 # ================= v14 妙想 MX 微创叠加层结束 =================
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
