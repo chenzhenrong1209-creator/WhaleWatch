@@ -6749,6 +6749,345 @@ def get_hot_blocks():
 # ================= v19 资金热点 yfinance 行业ETF代理补充结束 =================
 
 
+
+
+# ================= v20 新闻情报：妙想资讯搜索主力化微创修复开始 =================
+# 目标：不重写系统，只把“新闻情报”模块的数据主源切换为妙想 mx-search。
+# 设计：妙想作为主力军；问财彻底不再参与；新浪/东财仅作为补充；失败不拖死页面。
+
+def _mx_recursive_find_items_v20(obj):
+    """递归提取妙想 news-search 返回里的资讯 item 列表。"""
+    found = []
+    if obj is None:
+        return found
+    if isinstance(obj, dict):
+        # 标准结构：data.data.llmSearchResponse.data
+        if isinstance(obj.get("llmSearchResponse"), dict):
+            data = obj["llmSearchResponse"].get("data")
+            if isinstance(data, list):
+                found.extend([x for x in data if isinstance(x, dict)])
+        # 有些响应可能直接叫 searchResponse / data
+        for key in ["searchResponse", "result", "data", "items", "list", "records"]:
+            val = obj.get(key)
+            if isinstance(val, list):
+                # 如果列表里像资讯 item，直接收；否则递归。
+                for it in val:
+                    if isinstance(it, dict) and any(k in it for k in ["title", "content", "date", "informationType", "entityFullName"]):
+                        found.append(it)
+                    else:
+                        found.extend(_mx_recursive_find_items_v20(it))
+            elif isinstance(val, dict):
+                found.extend(_mx_recursive_find_items_v20(val))
+        # 继续兜底递归其他字段
+        for val in obj.values():
+            if isinstance(val, (dict, list)):
+                found.extend(_mx_recursive_find_items_v20(val))
+    elif isinstance(obj, list):
+        for it in obj:
+            found.extend(_mx_recursive_find_items_v20(it))
+    return found
+
+
+def _mx_text_fallback_item_v20(data, query):
+    """当妙想返回的是文本回答而非结构化列表时，转成一条新闻情报。"""
+    if not isinstance(data, dict):
+        return None
+    text_candidates = []
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if str(k) in ["llmSearchResponse", "searchResponse", "content", "answer", "summary", "result"] and isinstance(v, str):
+                    text_candidates.append(v)
+                elif isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    walk(data)
+    text = "\n".join([t.strip() for t in text_candidates if isinstance(t, str) and len(t.strip()) > 20]).strip()
+    if not text:
+        return None
+    return {
+        "source": "妙想资讯搜索",
+        "platform": "妙想",
+        "title": f"妙想资讯搜索结果：{query[:40]}",
+        "summary": text[:1200],
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "url": "",
+    }
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def mx_search_query_v20(query, max_items=20):
+    """妙想资讯搜索主力函数：兼容 NEWS/REPORT/ANNOUNCEMENT，并做结构化解析。"""
+    data, err = _mx_post("/news-search", {"query": query}, timeout_sec=8)
+    if not data:
+        return [], err
+    raw_items = _mx_recursive_find_items_v20(data)
+    out = []
+    type_map = {"REPORT": "研报", "NEWS": "新闻", "ANNOUNCEMENT": "公告"}
+    for it in raw_items:
+        title = str(it.get("title") or it.get("name") or "").strip()
+        content = str(it.get("content") or it.get("summary") or it.get("abstract") or "").strip()
+        if not title and content:
+            title = content[:80]
+        if not title:
+            continue
+        info_type = str(it.get("informationType") or it.get("type") or "").strip()
+        platform = type_map.get(info_type, info_type or "妙想")
+        entity = str(it.get("entityFullName") or it.get("entityName") or it.get("securityName") or "").strip()
+        ins = str(it.get("insName") or it.get("source") or it.get("mediaName") or "").strip()
+        rating = str(it.get("rating") or "").strip()
+        date = str(it.get("date") or it.get("publishTime") or it.get("time") or "").strip()
+        meta = []
+        if entity:
+            meta.append(f"证券：{entity}")
+        if ins and ins not in ["妙想资讯", "妙想资讯搜索"]:
+            meta.append(f"来源/机构：{ins}")
+        if rating:
+            meta.append(f"评级：{rating}")
+        summary = ("；".join(meta) + ("\n" if meta and content else "") + content).strip()
+        out.append({
+            "source": "妙想资讯搜索",
+            "platform": platform,
+            "title": title,
+            "summary": summary[:1500],
+            "time": date,
+            "url": str(it.get("url") or it.get("link") or ""),
+        })
+    if not out:
+        fb = _mx_text_fallback_item_v20(data, query)
+        if fb:
+            out.append(fb)
+    return out[:max_items], None
+
+
+def _resolve_stock_name_v20(stock_code):
+    """尽量把股票代码解析成简称，用于提高妙想搜索命中率。"""
+    code = str(stock_code or "").strip().zfill(6)
+    if not code or len(code) != 6:
+        return ""
+    try:
+        q, _ = _surgical_call_with_timeout(lambda: get_stock_quote(code), timeout_sec=5, default=None)
+        if isinstance(q, dict):
+            name = str(q.get("name") or "").strip()
+            if name and not name.startswith("代码"):
+                return name
+    except Exception:
+        pass
+    return ""
+
+
+def _build_mx_news_queries_v20(stock_code="", keyword="", mode="标准"):
+    """根据输入构造妙想资讯搜索问句。"""
+    code = str(stock_code or "").strip()
+    keyword = str(keyword or "").strip()
+    queries = []
+    if code:
+        code6 = code.zfill(6) if code.isdigit() else code
+        name = _resolve_stock_name_v20(code6)
+        target = f"{code6} {name}".strip()
+        queries.extend([
+            f"{target} 最新消息 最新公告 最新研报 机构观点 舆情动态",
+            f"{target} 近期公告 业绩 重大事项 风险提示",
+            f"{target} 股价异动 原因 市场观点 热点新闻",
+        ])
+    if keyword:
+        queries.extend([
+            f"{keyword} 近期动态 最新消息 行业新闻 政策 研报 舆情趋势",
+            f"{keyword} 相关上市公司 市场热点 资金关注 事件催化",
+        ])
+    if not queries:
+        if mode == "宏观要闻":
+            queries.append("今日中国宏观经济要闻 政策 央行 财政 汇率 A股影响")
+        elif mode == "行业概念":
+            queries.append("今日A股行业概念近期动态 热点板块 政策催化 产业趋势")
+        elif mode == "市场热点":
+            queries.append("今日A股市场热点 舆论趋势 资金关注 题材发酵")
+        else:
+            queries.append("今日A股重要财经新闻 公告 研报 市场热点 宏观经济要闻")
+    # 深度模式多查一条宏观/行业联动，极速模式只查第一条。
+    if mode == "深度" and len(queries) < 4:
+        queries.append("今日A股重要公告 机构研报 行业热点 宏观政策综合影响")
+    if mode == "极速":
+        queries = queries[:1]
+    return queries[:4]
+
+
+def _dedupe_news_items_v20(items, max_items=60):
+    seen, out = set(), []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("summary") or "").strip()
+        if not title:
+            continue
+        key = re.sub(r"\s+", "", title)[:90]
+        if key in seen:
+            continue
+        seen.add(key)
+        item["title"] = title
+        try:
+            item["impact_score"] = HighEndNewsFetcher()._score_item(item)
+            item["matched_sectors"] = HighEndNewsFetcher()._match_sectors(title + " " + str(item.get("summary", "")))
+        except Exception:
+            item["impact_score"] = safe_float(item.get("impact_score"), 50)
+            item["matched_sectors"] = item.get("matched_sectors", [])
+        out.append(item)
+    out = sorted(out, key=lambda x: (safe_float(x.get("impact_score")), str(x.get("time", ""))), reverse=True)
+    return out[:max_items]
+
+
+# 覆盖原 collect：妙想主力，问财不再参与；新浪/东财作为补充，不拖垮主流程。
+def _collect_news_mx_primary_v20(self, stock_code="", max_items=60, include_wencai=False, keyword="", mx_mode="标准"):
+    items, errors = [], []
+    self.errors = []
+
+    # 1) 妙想资讯搜索主力军
+    if get_mx_apikey():
+        per_query = max(6, min(20, int(max_items / 2)))
+        for q in _build_mx_news_queries_v20(stock_code=stock_code, keyword=keyword, mode=mx_mode):
+            mx_items, mx_err = mx_search_query_v20(q, max_items=per_query)
+            if mx_items:
+                items.extend(mx_items)
+            elif mx_err:
+                errors.append(f"妙想资讯搜索失败：{q}｜{mx_err}")
+    else:
+        errors.append("未配置 MX_APIKEY，妙想资讯搜索未启用")
+
+    # 2) 真实新闻源补充：不使用问财
+    # 个股查询时，补少量公告；非个股查询时，补财经快讯和全局新闻。
+    try:
+        if stock_code:
+            items.extend(self._fetch_stock_announcements_em(stock_code, max_items=min(15, max_items)))
+        else:
+            items.extend(self._fetch_sina_live(max_items=min(20, max_items)))
+            items.extend(self._fetch_em_global(max_items=min(20, max_items)))
+            items.extend(self._fetch_em_announcements(max_items=min(15, max_items)))
+    except Exception as e:
+        errors.append(f"补充新闻源失败：{e}")
+
+    cleaned = _dedupe_news_items_v20(items, max_items=max_items)
+    self.errors = errors + list(getattr(self, "errors", []) or [])
+    return {"items": cleaned, "errors": self.errors, "count": len(cleaned)}
+
+try:
+    HighEndNewsFetcher.collect = _collect_news_mx_primary_v20
+except Exception:
+    pass
+
+
+def render_high_end_news_terminal():
+    st.markdown("### 🛰️ 新闻情报板块")
+    st.info("本页已切换为：妙想资讯搜索主力军。支持按个股代码、行业/概念关键词、市场热点、宏观要闻搜索；问财已关闭，不再参与新闻情报链路。")
+    c_status1, c_status2, c_status3 = st.columns(3)
+    c_status1.metric("妙想资讯", "已配置" if bool(get_mx_apikey()) else "未配置")
+    c_status2.metric("问财新闻", "已停用")
+    c_status3.metric("模式", "MX主力 + 真实新闻补充")
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        stock_code = st.text_input("关注个股代码（可选）", placeholder="例如：300750 / 002484", key="news_stock_code")
+    with c2:
+        keyword = st.text_input("行业/概念/宏观关键词（可选）", placeholder="例如：半导体、低空经济、降息", key="news_keyword_v20")
+    with c3:
+        max_items = st.slider("情报数量", 20, 120, 60, 10)
+
+    c4, c5 = st.columns([1, 1])
+    with c4:
+        mode = st.selectbox("妙想搜索模式", ["标准", "深度", "极速", "行业概念", "市场热点", "宏观要闻"], index=0)
+    with c5:
+        use_ai_news = st.checkbox("生成 AI 情报报告", value=True)
+
+    if st.button("🚀 启动妙想情报扫描", type="primary", width="stretch"):
+        if use_ai_news and not api_key:
+            st.warning("未配置 GROQ_API_KEY，将只展示规则引擎分析。")
+            use_ai_news = False
+
+        if not get_mx_apikey():
+            st.error("未配置 MX_APIKEY。请在 Streamlit Secrets 中添加 MX_APIKEY 后再使用妙想资讯搜索。")
+            return
+
+        with st.spinner("正在通过妙想资讯搜索抓取个股/行业/宏观情报..."):
+            fetcher = HighEndNewsFetcher(max_items=max_items)
+            raw = fetcher.collect(
+                stock_code=stock_code.strip(),
+                keyword=keyword.strip(),
+                max_items=max_items,
+                include_wencai=False,
+                mx_mode=mode,
+            )
+            items = raw.get("items", [])
+
+        if not items:
+            st.error("妙想资讯搜索暂未返回有效结果。请换一个股票代码、股票名称或行业关键词重试。")
+            if raw.get("errors"):
+                with st.expander("查看失败详情"):
+                    st.write(raw.get("errors"))
+            return
+
+        analyzer = HighEndNewsAnalyzer()
+        with st.spinner("正在进行题材识别、板块映射与风险雷达计算..."):
+            res = analyzer.analyze(items, stock_code=stock_code.strip(), use_ai=use_ai_news, mode=mode)
+
+        flow = res.get("flow", {})
+        risk = res.get("risk", {})
+        st.success(f"情报扫描完成：共获取 {len(items)} 条有效信息。主数据源：妙想资讯搜索。")
+        if raw.get("errors"):
+            with st.expander("数据源提示 / 失败记录", expanded=False):
+                st.write("\n".join(raw.get("errors", [])[-20:]))
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("综合情报分", f"{res.get('score', 0):.1f}")
+        k2.metric("新闻/公告数", len(items))
+        k3.metric("利好", flow.get("positive", 0))
+        k4.metric("风险", risk.get("risk_count", 0))
+
+        st.markdown("#### 🧭 题材热度映射")
+        sector_scores = flow.get("sector_scores", {})
+        if sector_scores:
+            sdf = pd.DataFrame([{"题材/板块": k, "热度分": v} for k, v in sector_scores.items()]).sort_values("热度分", ascending=False)
+            st.dataframe(sdf, width="stretch", hide_index=True)
+        else:
+            st.caption("暂未识别出明确题材。")
+
+        st.markdown("#### 📰 妙想资讯搜索结果")
+        show_rows = []
+        for it in items[:max_items]:
+            show_rows.append({
+                "时间": it.get("time", ""),
+                "类型": it.get("platform", ""),
+                "来源": it.get("source", ""),
+                "标题": it.get("title", ""),
+                "摘要": str(it.get("summary", ""))[:220],
+                "匹配题材": "、".join(it.get("matched_sectors", []) or []),
+                "影响分": round(safe_float(it.get("impact_score"), 0), 1),
+            })
+        st.dataframe(pd.DataFrame(show_rows), width="stretch", hide_index=True)
+
+        if res.get("ai_report"):
+            st.markdown("#### 🧠 AI 情报报告")
+            st.markdown(res.get("ai_report"))
+
+        if risk.get("risk_items"):
+            with st.expander("⚠️ 风险词命中明细"):
+                st.write(risk.get("risk_items"))
+
+        try:
+            HighEndNewsDB().save_run(mode=mode, stock_code=stock_code.strip(), score=res.get("score", 0), summary=res.get("ai_report") or json.dumps(flow, ensure_ascii=False))
+        except Exception:
+            pass
+
+    with st.expander("📚 最近情报扫描记录", expanded=False):
+        df_recent = HighEndNewsDB().recent_runs(limit=8)
+        if df_recent is not None and not df_recent.empty:
+            st.dataframe(df_recent, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无历史记录。")
+
+# ================= v20 新闻情报：妙想资讯搜索主力化微创修复结束 =================
+
+
 # ================= v14 妙想 MX 微创叠加层结束 =================
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
