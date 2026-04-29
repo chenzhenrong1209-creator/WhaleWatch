@@ -7516,6 +7516,355 @@ def render_high_end_news_terminal():
 # ================= v21 新闻情报：妙想一键扫描 + 日期范围 + 中文报告微创修复结束 =================
 
 
+
+# ================= v22 新闻情报：专业报告 + 严格板块映射 + 个股资讯侧栏微创修复开始 =================
+# 目标：保留 v21 一键妙想扫描和原页面结构，只修三处：
+# 1）智能报告提示词升级为专业投研报告；
+# 2）板块映射改为“证据匹配”，避免无关新闻被强行映射到板块；
+# 3）风险提示旁边增加“个股专项资讯”小面板。
+
+_STRICT_SECTOR_KWS_V22 = {
+    "AI": ["人工智能", "大模型", "算力", "智能体", "AI应用"],
+    "算力": ["算力", "CPO", "光模块", "服务器", "液冷", "数据中心", "云计算"],
+    "半导体": ["芯片", "半导体", "存储", "先进封装", "光刻机", "晶圆", "国产替代"],
+    "新能源车": ["新能源车", "智能驾驶", "固态电池", "锂电", "充电桩", "电动车", "车载"],
+    "机器人": ["机器人", "人形机器人", "减速器", "伺服", "传感器", "执行器"],
+    "低空经济": ["低空", "飞行汽车", "eVTOL", "无人机", "通航", "空域"],
+    "医药": ["创新药", "医药", "医疗", "减肥药", "CXO", "临床", "药品"],
+    "消费": ["白酒", "旅游", "餐饮", "家电", "零售", "免税", "食品饮料"],
+    "金融": ["银行", "券商", "保险", "资本市场", "并购重组", "证券"],
+    "地产链": ["房地产", "地产", "城中村", "家居", "建材", "物业"],
+    "军工": ["军工", "航天", "卫星", "商业航天", "低轨", "导弹", "航空发动机"],
+    "黄金有色": ["黄金", "铜", "铝", "稀土", "有色", "贵金属", "锂矿"],
+}
+
+
+def _sector_evidence_v22(text: str):
+    """返回 {板块: [命中的关键词]}。只基于新闻标题/摘要正文，不基于查询语句，避免误映射。"""
+    text = str(text or "")
+    ev = {}
+    for sec, kws in _STRICT_SECTOR_KWS_V22.items():
+        hits = []
+        for kw in kws:
+            if kw and kw.lower() in text.lower():
+                hits.append(kw)
+        if hits:
+            ev[sec] = hits
+    return ev
+
+
+def _title_has_sector_evidence_v22(item, sec):
+    title = str(item.get("title", ""))
+    for kw in _STRICT_SECTOR_KWS_V22.get(sec, []):
+        if kw.lower() in title.lower():
+            return True
+    return False
+
+
+def _item_text_for_mapping_v22(item):
+    # 注意：不要把 query_hint 放进去，否则“半导体查询”会把所有结果都映射到半导体。
+    return f"{item.get('title','')} {item.get('summary','')}"
+
+
+def _strict_build_sector_view_v22(self, items, topics):
+    sector_counter = Counter()
+    sector_sources = {}
+    sector_keywords = {}
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = _item_text_for_mapping_v22(item)
+        evidence = _sector_evidence_v22(text)
+        if not evidence:
+            continue
+
+        impact = safe_float(item.get("impact_score"), 50)
+        title = str(item.get("title") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        clue = title or summary[:80]
+        if not clue:
+            continue
+
+        for sec, hits in evidence.items():
+            # 标题中命中更可信；摘要中命中也可用但权重低一点。
+            title_hit = _title_has_sector_evidence_v22(item, sec)
+            weight = 3 if title_hit else 1
+            weight += 1 if impact >= 65 else 0
+            sector_counter[sec] += weight
+            sector_keywords.setdefault(sec, Counter()).update(hits)
+            sector_sources.setdefault(sec, [])
+            # 核心线索必须与该板块有证据关系，不再把无关标题塞进来。
+            if len(sector_sources[sec]) < 5:
+                sector_sources[sec].append({
+                    "线索": clue[:120],
+                    "证据词": "、".join(hits[:4]),
+                    "类型": item.get("platform", "资讯"),
+                    "时间": item.get("time", ""),
+                })
+
+    rows = []
+    for sec, val in sector_counter.most_common(12):
+        clues = sector_sources.get(sec, [])
+        # 防止偶发词导致错误映射：至少需要两条线索，或一条标题强命中。
+        has_strong = any(_title_has_sector_evidence_v22({"title": c.get("线索", "")}, sec) for c in clues)
+        if len(clues) < 2 and not has_strong:
+            continue
+        kw_text = "、".join([k for k, _ in sector_keywords.get(sec, Counter()).most_common(5)])
+        clue_text = "；".join([f"{c.get('线索')}【证据：{c.get('证据词')}】" for c in clues[:3]])
+        rows.append({
+            "板块": sec,
+            "热度分": min(100, val * 10),
+            "影响方向": "偏利好" if val >= 4 else "观察",
+            "证据关键词": kw_text,
+            "核心线索": clue_text,
+            "候选标的": "、".join([s["name"] for s in NEWS_SECTOR_STOCK_POOL.get(sec, [])[:3]])
+        })
+    return rows
+
+try:
+    HighEndNewsAnalyzer.build_sector_view = _strict_build_sector_view_v22
+except Exception:
+    pass
+
+
+def _run_ai_agents_professional_v22(self, items, topics, sector_view, flow, risk, candidate_stocks, stock_code, mode):
+    """升级版提示词：让报告更像专业投研情报，而不是新闻摘要。"""
+    compact_news = "\n".join([
+        f"- 【{i.get('platform','资讯')}｜{i.get('time','')}】{i.get('title','')}"
+        for i in (items or [])[:45]
+    ])
+    topics_text = "、".join([str(t.get("topic", "")) for t in (topics or [])[:15] if t.get("topic")]) or "暂未形成明确主题"
+    sectors_text = "\n".join([
+        f"- {x.get('板块')}：热度{x.get('热度分')}，证据词：{x.get('证据关键词','')}，线索：{x.get('核心线索','')}"
+        for x in (sector_view or [])[:8]
+    ]) or "暂未形成可靠板块映射"
+    stocks_text = "、".join([f"{x.get('name')}({x.get('code')})" for x in (candidate_stocks or [])[:10]]) or "暂无明确候选股"
+    risk_text = "；".join((risk or {}).get("risk_factors", [])[:10]) or "暂无明显集中风险"
+    focus = stock_code or "全市场"
+
+    prompt = f"""
+你是服务于专业投资经理的A股新闻情报官。请只用中文输出，不要出现英文字段名，不要输出代码，不要复述原始数据表。
+
+【关注对象】{focus}
+【时间范围】{mode}
+【情报热度】{flow.get('level')}，阶段：{flow.get('stage')}，综合分：{flow.get('score')}
+【热点主题】{topics_text}
+【经过证据过滤后的板块映射】
+{sectors_text}
+【候选股票】{stocks_text}
+【风险线索】{risk_text}
+【新闻材料】
+{compact_news}
+
+请生成一份让我能直接用于盘前/盘中决策的专业级情报报告，结构如下：
+
+一、首席结论
+用三句话以内给出今天最重要的判断：主线是什么、强度如何、该进攻还是观察。
+
+二、核心催化链条
+不是简单罗列新闻，而是说明“事件—产业链—板块—个股”的传导路径。每条链条都要写清楚为什么成立，不能硬凑。
+
+三、个股或行业重点解读
+如果关注对象是单只股票，就重点分析这只股票的最新消息、公告、研报、舆情、风险和短期关注点；如果是行业或市场，就分析最强方向和分歧点。
+
+四、资金与情绪推演
+结合新闻密度、题材扩散、风险词，判断是潜伏、发酵、高潮还是退潮，并说明次日或盘中最需要观察的信号。
+
+五、可执行观察清单
+给出三到五条可执行观察点，例如：看哪个板块是否继续放量、看哪类公告是否发酵、看哪只标的是否突破或回踩。
+
+六、风险与反证
+列出会推翻当前判断的信号，尤其是监管、减持、业绩不及预期、题材兑现、市场大跌等。
+
+七、一句话定调
+最后用一句话给出：进攻、轻仓试错、等待确认、还是防守。
+
+要求：
+1. 报告要有判断、有逻辑、有取舍，不要写成新闻摘要。
+2. 不确定的地方要明确说“不足以确认”，不要强行下结论。
+3. 板块映射必须基于证据过滤后的板块，不要把无关新闻硬套到板块。
+4. 语言要专业但要好懂，适合手机上快速阅读。
+"""
+    report = call_ai(prompt, temperature=0.18)
+    return {"chief_report": _clean_ai_report_chinese_v21(report)}
+
+try:
+    HighEndNewsAnalyzer.run_ai_agents = _run_ai_agents_professional_v22
+except Exception:
+    pass
+
+
+def _filter_stock_specific_news_v22(items, stock_text, max_items=12):
+    """从已获取情报中筛出与单独搜索个股更直接相关的资讯。"""
+    target = str(stock_text or "").strip()
+    if not target:
+        return []
+    targets = [target]
+    if target.isdigit():
+        code6 = target.zfill(6)
+        targets.append(code6)
+        try:
+            resolved = _resolve_stock_name_v21(code6)
+            if resolved:
+                for part in str(resolved).split():
+                    if part and part not in targets:
+                        targets.append(part)
+        except Exception:
+            pass
+    out = []
+    for item in items or []:
+        text = f"{item.get('title','')} {item.get('summary','')} {item.get('query_hint','')}"
+        if any(t and t in text for t in targets):
+            out.append(item)
+    return out[:max_items]
+
+
+def render_high_end_news_terminal():
+    st.markdown("### 🛰️ 新闻情报板块")
+    st.info("本页为：妙想资讯搜索一键扫描。系统会一次性抓取个股消息、公告、研报、行业概念、市场热点和宏观要闻；问财已停用。")
+
+    c_status1, c_status2, c_status3 = st.columns(3)
+    c_status1.metric("妙想资讯", "已配置" if bool(get_mx_apikey()) else "未配置")
+    c_status2.metric("问财", "已停用")
+    c_status3.metric("扫描方式", "一键综合扫描")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        stock_code = st.text_input("关注个股或名称（可选）", placeholder="例如：002484 / 江海股份", key="news_stock_code_v22")
+    with c2:
+        keyword = st.text_input("补充关键词（可选）", placeholder="例如：半导体、低空经济、降息", key="news_keyword_v22")
+
+    c3, c4 = st.columns([1, 1])
+    with c3:
+        date_scope = st.selectbox("情报时间范围", ["今天", "最近3天", "最近7天", "最近15天", "最近30天"], index=1, key="news_date_scope_v22")
+    with c4:
+        use_ai_news = st.checkbox("生成智能情报报告", value=True, key="news_ai_v22")
+
+    if st.button("🚀 启动妙想情报扫描", type="primary", width="stretch", key="news_scan_v22"):
+        if use_ai_news and not api_key:
+            st.warning("未配置智能模型密钥，将只展示新闻列表和规则分析。")
+            use_ai_news = False
+        if not get_mx_apikey():
+            st.error("未配置妙想接口密钥。请在 Streamlit Secrets 中添加 MX_APIKEY 后再使用。")
+            return
+
+        max_items = _date_scope_to_max_items_v21(date_scope)
+        with st.spinner(f"正在通过妙想资讯搜索扫描{date_scope}的个股、公告、研报、行业和宏观情报..."):
+            fetcher = HighEndNewsFetcher(max_items=max_items)
+            raw = fetcher.collect(
+                stock_code=stock_code.strip(),
+                keyword=keyword.strip(),
+                max_items=max_items,
+                include_wencai=False,
+                mx_mode="一键综合扫描",
+                date_scope=date_scope,
+            )
+            items = raw.get("items", [])
+
+        if not items:
+            st.error("妙想资讯搜索暂未返回有效结果。可以换一个股票代码、股票名称或关键词重试。")
+            if raw.get("errors"):
+                with st.expander("查看失败详情"):
+                    st.write(raw.get("errors"))
+            return
+
+        analyzer = HighEndNewsAnalyzer()
+        with st.spinner("正在进行专业情报研判、证据过滤和风险分析..."):
+            res = analyzer.analyze(items, stock_code=stock_code.strip() or keyword.strip(), use_ai=use_ai_news, mode=date_scope)
+
+        flow = res.get("flow", {})
+        risk = res.get("risk", {})
+        st.success(f"情报扫描完成：获取到 {len(items)} 条有效信息。主数据源：妙想资讯搜索。")
+        if raw.get("errors"):
+            with st.expander("数据源提示", expanded=False):
+                st.write("\n".join(raw.get("errors", [])[-20:]))
+        if raw.get("queries"):
+            with st.expander("本次妙想检索范围", expanded=False):
+                for q in raw.get("queries", []):
+                    st.write("- " + q)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("情报热度", flow.get("level", "观察"))
+        k2.metric("信息条数", len(items))
+        k3.metric("风险等级", risk.get("risk_level", "低"))
+        k4.metric("时间范围", date_scope)
+
+        tab1, tab2, tab3, tab4 = st.tabs(["🧠 智能报告", "📰 情报列表", "🏭 板块映射", "⚠️ 风险提示与个股资讯"])
+
+        with tab1:
+            report_text = _extract_ai_report_text_v21(res.get("ai_report"))
+            if report_text:
+                st.markdown(report_text)
+            else:
+                st.caption("未生成智能报告。")
+
+        with tab2:
+            show_rows = []
+            for it in items:
+                show_rows.append({
+                    "时间": it.get("time", ""),
+                    "类型": it.get("platform", "资讯"),
+                    "来源": it.get("source", "妙想资讯搜索"),
+                    "标题": it.get("title", ""),
+                    "摘要": str(it.get("summary", ""))[:260],
+                    "匹配题材": "、".join(it.get("matched_sectors", []) or []),
+                    "影响分": round(safe_float(it.get("impact_score"), 0), 1),
+                })
+            st.dataframe(pd.DataFrame(show_rows), width="stretch", hide_index=True)
+
+        with tab3:
+            sector_view = res.get("sector_view", []) or []
+            if sector_view:
+                st.caption("板块映射已改为证据过滤：只有新闻标题/摘要中出现明确关键词的板块才会展示，避免无关线索误入。")
+                st.dataframe(pd.DataFrame(sector_view), width="stretch", hide_index=True)
+            else:
+                st.caption("暂未识别出有明确证据支撑的板块映射。")
+
+        with tab4:
+            left, right = st.columns([1, 1])
+            with left:
+                st.markdown("#### ⚠️ 风险提示")
+                risk_factors = risk.get("risk_factors", []) or []
+                if risk_factors:
+                    for x in risk_factors:
+                        st.warning(str(x))
+                else:
+                    st.success("当前情报中暂未发现明显集中风险词。")
+            with right:
+                st.markdown("#### 🎯 个股专项资讯")
+                stock_focus = stock_code.strip()
+                stock_items = _filter_stock_specific_news_v22(items, stock_focus, max_items=12)
+                if stock_focus and stock_items:
+                    for it in stock_items:
+                        title = str(it.get("title", ""))[:90]
+                        meta = "｜".join([str(it.get("time", "")), str(it.get("platform", "资讯"))]).strip("｜")
+                        st.markdown(f"**{title}**")
+                        if meta:
+                            st.caption(meta)
+                        summary = str(it.get("summary", "")).strip()
+                        if summary:
+                            st.write(summary[:180])
+                        st.markdown("---")
+                elif stock_focus:
+                    st.info("本次情报中没有筛出与该个股直接相关的独立资讯，建议同时输入股票简称再试一次。")
+                else:
+                    st.caption("输入个股代码或名称后，这里会单独展示该个股的相关资讯。")
+
+        try:
+            HighEndNewsDB().save_run(mode=date_scope, stock_code=(stock_code.strip() or keyword.strip()), score=flow.get("score", 0), summary=_extract_ai_report_text_v21(res.get("ai_report"))[:1500])
+        except Exception:
+            pass
+
+    with st.expander("📚 最近情报扫描记录", expanded=False):
+        df_recent = HighEndNewsDB().recent_runs(limit=8)
+        if df_recent is not None and not df_recent.empty:
+            st.dataframe(df_recent, width="stretch", hide_index=True)
+        else:
+            st.caption("暂无历史记录。")
+
+# ================= v22 新闻情报：专业报告 + 严格板块映射 + 个股资讯侧栏微创修复结束 =================
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
