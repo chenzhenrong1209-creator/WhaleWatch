@@ -6428,6 +6428,194 @@ def get_stock_quote(symbol):
 
 # ================= v17 个股总市值精准修复结束 =================
 
+# ================= v18 资金热点行业板块精准修复开始 =================
+# 目标：资金热点只展示“行业板块”数据，不再把个股/选股结果伪装成板块。
+# 数据链路：东方财富行业板块直连 → AKShare行业资金流/行业板块 → 妙想行业板块查询 → 最近一次真实缓存。
+# 重要原则：不使用个股clist聚合、不使用妙想个股选股结果、不使用内置观察池。
+
+
+def _em_industry_board_direct_v18():
+    """东方财富行业板块直连接口。返回 BK 行业板块，不是个股。"""
+    base = "https://push2.eastmoney.com/api/qt/clist/get"
+    fields = "f1,f2,f3,f4,f8,f12,f13,f14,f20,f21,f22,f23,f24,f25,f62,f115,f128,f140,f141,f136,f152"
+    params = {
+        "pn": 1,
+        "pz": 120,
+        "po": 1,
+        "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2,
+        "invt": 2,
+        "fid": "f62",
+        # m:90+t:2 是东方财富行业板块 BK 列表；不是 A 股个股列表。
+        "fs": "m:90+t:2",
+        "fields": fields,
+    }
+    url = base + "?" + urlencode(params, doseq=True)
+    headers = _eastmoney_headers(url, "https://quote.eastmoney.com/center/boardlist.html#industry_board") if "_eastmoney_headers" in globals() else {"User-Agent": random.choice(USER_AGENTS)}
+    res = SESSION.get(url, headers=headers, timeout=(2, 5), verify=False)
+    if res.status_code != 200:
+        raise RuntimeError(f"东方财富行业板块HTTP {res.status_code}")
+    data = _loads_json_or_jsonp(res.text)
+    diff = data.get("data", {}).get("diff", []) if isinstance(data, dict) and isinstance(data.get("data"), dict) else []
+    if isinstance(diff, dict):
+        diff = list(diff.values())
+    return diff or []
+
+
+def _normalize_industry_board_rows_v18(rows, source="东方财富行业板块直连"):
+    """把东方财富/其他源的行业板块数据统一成资金热点页面需要的字段。"""
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        code = str(r.get("f12") or r.get("板块代码") or r.get("代码") or "").strip()
+        name = str(r.get("f14") or r.get("板块名称") or r.get("行业名称") or r.get("名称") or "").strip()
+        # 行业板块代码通常是 BK 开头。若没有代码，也必须有明确板块/行业名称。
+        if not name:
+            continue
+        # 过滤明显的个股代码，避免把股票列表混进板块页。
+        if re.fullmatch(r"\d{6}", code):
+            continue
+        if re.fullmatch(r"\d{6}", name):
+            continue
+        pct = safe_float(r.get("f3") if "f3" in r else (r.get("涨跌幅") or r.get("涨幅")), 0)
+        main_net = safe_float(r.get("f62") if "f62" in r else (r.get("主力净流入") or r.get("今日主力净流入-净额") or r.get("净额")), 0)
+        amount = safe_float(r.get("f20") if "f20" in r else (r.get("成交额") or r.get("总市值") or 0), 0)
+        leader = r.get("f128") or r.get("领涨股票") or r.get("领涨股") or r.get("领涨名称") or "-"
+        up_count = r.get("上涨家数") or r.get("上涨数") or ""
+        down_count = r.get("下跌家数") or r.get("下跌数") or ""
+        out.append({
+            "板块代码": code,
+            "板块名称": name,
+            "热点分": 0.0,
+            "涨跌幅": pct,
+            "主力净流入": main_net,
+            "成交额": amount,
+            "上涨家数": up_count,
+            "下跌家数": down_count,
+            "领涨股票": leader,
+            "数据源": source,
+        })
+    if not out:
+        return []
+    df = pd.DataFrame(out)
+    for c in ["涨跌幅", "主力净流入", "成交额"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df["涨幅_rank"] = df["涨跌幅"].rank(pct=True).fillna(0)
+    df["资金_rank"] = df["主力净流入"].rank(pct=True).fillna(0)
+    df["成交_rank"] = df["成交额"].rank(pct=True).fillna(0)
+    df["热点分"] = (df["涨幅_rank"] * 35 + df["资金_rank"] * 50 + df["成交_rank"] * 15).round(2)
+    df = df.sort_values(["热点分", "主力净流入", "涨跌幅"], ascending=False)
+    df = df.drop_duplicates(subset=["板块名称"]).head(30)
+    cols = ["板块代码", "板块名称", "热点分", "涨跌幅", "主力净流入", "成交额", "上涨家数", "下跌家数", "领涨股票", "数据源"]
+    return df[[c for c in cols if c in df.columns]].to_dict("records")
+
+
+def _ak_industry_blocks_v18():
+    """AKShare 仅取行业板块/行业资金流，不取概念，不取个股资金流。"""
+    records = []
+    loaders = []
+    try:
+        if hasattr(ak, "stock_sector_fund_flow_rank"):
+            loaders.append(("AKShare东方财富行业资金流", lambda: ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")))
+        if hasattr(ak, "stock_board_industry_name_em"):
+            loaders.append(("AKShare东方财富行业板块", lambda: ak.stock_board_industry_name_em()))
+    except Exception:
+        loaders = []
+    for source, loader in loaders:
+        df, err = _surgical_call_with_timeout(loader, timeout_sec=4, default=None)
+        if df is None or getattr(df, "empty", True):
+            continue
+        try:
+            recs = _normalize_industry_board_rows_v18(df.to_dict("records"), source=source)
+            if recs:
+                records.extend(recs)
+        except Exception:
+            continue
+    return records
+
+
+def _mx_industry_blocks_v18():
+    """妙想只作为行业板块补充；严格过滤个股结果。"""
+    query = "今日A股东方财富行业板块资金净流入排名、行业板块涨跌幅、领涨股票，返回行业板块列表，不要返回个股列表"
+    rows, err = mx_data_query(query, max_rows=50) if "mx_data_query" in globals() else ([], "mx_data_query缺失")
+    if not rows and "mx_xuangu_query" in globals():
+        rows, err = mx_xuangu_query(query, max_rows=50)
+    converted = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        name = _pick_value(r, ["行业", "板块"]) or _pick_value(r, ["板块名称"]) or _pick_value(r, ["行业名称"])
+        # 必须明确是行业/板块字段；如果只有股票名称/代码，拒绝作为资金热点板块展示。
+        if not name:
+            continue
+        code = _pick_value(r, ["板块代码"]) or _pick_value(r, ["行业代码"]) or ""
+        if re.fullmatch(r"\d{6}", str(code).strip()):
+            continue
+        converted.append({
+            "板块代码": code,
+            "板块名称": name,
+            "涨跌幅": _pick_value(r, ["涨跌幅"]) or _pick_value(r, ["涨幅"]),
+            "主力净流入": _pick_value(r, ["主力", "净"]) or _pick_value(r, ["资金", "净流入"]) or _pick_value(r, ["净流入"]),
+            "成交额": _pick_value(r, ["成交额"]),
+            "上涨家数": _pick_value(r, ["上涨家数"]),
+            "下跌家数": _pick_value(r, ["下跌家数"]),
+            "领涨股票": _pick_value(r, ["领涨"]),
+        })
+    return _normalize_industry_board_rows_v18(converted, source="妙想行业板块查询")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_hot_blocks():
+    """v18：资金热点只展示行业板块，不展示个股。"""
+    cache_path = _cache_file("blocks", f"hot_industry_blocks_v18_{datetime.now().strftime('%Y%m%d')}.json")
+    errors = []
+
+    # 1. 东方财富行业板块直连，最快且最贴近用户在东方财富看到的“行业板块”。
+    rows, err = _surgical_call_with_timeout(_em_industry_board_direct_v18, timeout_sec=6, default=[])
+    if rows:
+        recs = _normalize_industry_board_rows_v18(rows, source="东方财富行业板块直连")
+        if recs:
+            _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": recs})
+            return recs
+    else:
+        errors.append(f"东方财富行业板块直连：{err}")
+
+    # 2. AKShare 行业板块兜底，只取行业，不取概念/个股。
+    recs, err = _surgical_call_with_timeout(_ak_industry_blocks_v18, timeout_sec=7, default=[])
+    if recs:
+        df = pd.DataFrame(recs)
+        if "热点分" in df.columns:
+            df = df.sort_values(["热点分", "主力净流入", "涨跌幅"], ascending=False)
+        recs = df.drop_duplicates(subset=["板块名称"]).head(30).to_dict("records")
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": recs})
+        return recs
+    else:
+        errors.append(f"AKShare行业板块：{err}")
+
+    # 3. 妙想行业板块补充，严格过滤个股结果。
+    recs, err = _surgical_call_with_timeout(_mx_industry_blocks_v18, timeout_sec=8, default=[])
+    if recs:
+        _json_save(cache_path, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "records": recs})
+        return recs
+    else:
+        errors.append(f"妙想行业板块：{err}")
+
+    # 4. 只使用最近一次真实行业板块缓存。
+    cached = _json_load(cache_path, max_age_seconds=8 * 3600)
+    if cached and isinstance(cached.get("records"), list):
+        data = cached["records"]
+        for r in data:
+            r["数据源"] = f"{r.get('数据源','行业板块真实缓存')}｜缓存 {cached.get('time','')}"
+        return data
+
+    if globals().get("DEBUG_MODE", False):
+        st.caption("资金热点行业板块失败：" + "；".join([str(e) for e in errors if e]))
+    return []
+# ================= v18 资金热点行业板块精准修复结束 =================
+
+
 # ================= v14 妙想 MX 微创叠加层结束 =================
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
