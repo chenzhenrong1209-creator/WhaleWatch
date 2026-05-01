@@ -91,6 +91,68 @@ st.markdown(
 api_key = st.secrets.get("GROQ_API_KEY", "")
 
 
+def _secret_get_first(keys, default=""):
+    """从 Streamlit Secrets 读取第一个存在的配置。"""
+    for key in keys:
+        try:
+            val = st.secrets.get(key, "")
+            if val:
+                return str(val).strip()
+        except Exception:
+            pass
+    return default
+
+
+def get_mimo_config_from_secrets():
+    """读取小米 MiMo 配置。兼容顶层写法和 [mimo] 分组写法。"""
+    cfg = {
+        "api_key": _secret_get_first(["MIMO_API_KEY", "XIAOMI_MIMO_API_KEY", "MIMO_KEY"]),
+        "base_url": _secret_get_first(["MIMO_BASE_URL", "XIAOMI_MIMO_BASE_URL"], "https://api.xiaomimimo.com/v1"),
+        "model": _secret_get_first(["MIMO_MODEL", "XIAOMI_MIMO_MODEL"], "mimo-v2-pro"),
+    }
+    try:
+        section = st.secrets.get("mimo", {})
+        if isinstance(section, dict):
+            cfg["api_key"] = cfg["api_key"] or str(section.get("api_key") or section.get("apikey") or section.get("key") or "").strip()
+            cfg["base_url"] = str(section.get("base_url") or cfg["base_url"]).strip().rstrip("/")
+            cfg["model"] = str(section.get("model") or cfg["model"]).strip()
+    except Exception:
+        pass
+    cfg["base_url"] = cfg["base_url"].rstrip("/")
+    return cfg
+
+
+mimo_config = get_mimo_config_from_secrets()
+
+
+def call_mimo_ai(prompt, model=None, temperature=0.25, timeout=45):
+    """调用小米 MiMo OpenAI 兼容接口。失败时抛出异常，交给 call_ai 统一降级。"""
+    if not mimo_config.get("api_key"):
+        raise RuntimeError("未配置 MIMO_API_KEY")
+    exec_model = model or mimo_config.get("model") or "mimo-v2-pro"
+    url = f"{mimo_config['base_url']}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {mimo_config['api_key']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "WhaleWatch-Streamlit/1.0",
+    }
+    payload = {
+        "model": exec_model,
+        "messages": [
+            {"role": "system", "content": "你是A股量化投研终端的首席策略分析师。请用中文输出，避免英文字段名，结论要专业、可执行、重视风险反证。"},
+            {"role": "user", "content": str(prompt)},
+        ],
+        "temperature": temperature,
+        "stream": False,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"MiMo HTTP {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
 def get_tushare_token_from_secrets():
     """只从 Streamlit Secrets 读取 Tushare Token，避免把 token 写在代码或页面输入框里。"""
     for key in ["TUSHARE_TOKEN", "TUSHARE_API_KEY", "TS_TOKEN", "tushare_token"]:
@@ -482,14 +544,30 @@ def _fetch_jqdata_moneyflow_pool(max_stocks=5000, trade_date=None):
 with st.sidebar:
     st.header("⚙️ 终端控制台")
 
-    # 新增：手动选择 LLM 模型
+    # 新增：手动选择 LLM 模型。MiMo 作为主力军，Groq 作为备用。
     st.markdown("### 🧠 核心推理引擎")
-    selected_model = st.selectbox(
-        "选择大模型",
-        ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"],
+    mimo_ready = bool(mimo_config.get("api_key"))
+    ai_provider_options = ["小米 MiMo（主力）", "Groq（备用）"] if mimo_ready else ["Groq（备用）", "小米 MiMo（未配置）"]
+    selected_ai_provider = st.selectbox(
+        "选择 AI 引擎",
+        ai_provider_options,
         index=0,
-        help="手动指定底层计算模型，精准控制分析逻辑"
+        help="建议优先使用小米 MiMo。Groq 保留为备用通道。"
     )
+    if selected_ai_provider.startswith("小米 MiMo") and mimo_ready:
+        mimo_model_default = mimo_config.get("model") or "mimo-v2-pro"
+        selected_model = st.text_input(
+            "MiMo 模型 ID",
+            value=mimo_model_default,
+            help="默认从 Streamlit Secrets 的 MIMO_MODEL 或 [mimo].model 读取；旗舰版一般可填 mimo-v2-pro，具体以你的套餐文档为准。"
+        ).strip() or mimo_model_default
+    else:
+        selected_model = st.selectbox(
+            "Groq 备用模型",
+            ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"],
+            index=0,
+            help="仅在未配置 MiMo 或 MiMo 调用失败时使用。"
+        )
 
     # 新增：手动干预技术参数
     st.markdown("### 🎛️ 策略参数微调")
@@ -499,6 +577,14 @@ with st.sidebar:
         ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
 
     st.markdown("### 🔐 数据源密钥")
+    if mimo_ready:
+        st.success(f"MiMo：已从 secrets 读取｜模型 {selected_model}")
+    else:
+        st.warning("MiMo：未读取到，请在 secrets 配置 MIMO_API_KEY")
+    if api_key:
+        st.success("Groq：已配置备用 Key")
+    else:
+        st.warning("Groq：未配置备用 Key")
     if ts_token:
         st.success("Tushare Token：已从 secrets 读取")
     else:
@@ -2390,8 +2476,33 @@ def get_kline(symbol, days=220):
 
 # ================= AI 计算核心 =================
 def call_ai(prompt, model=None, temperature=0.3):
+    """统一 AI 入口：MiMo 主力，Groq 备用。"""
+    exec_model = model if model else selected_model
+    prefer_mimo = str(globals().get("selected_ai_provider", "")).startswith("小米 MiMo")
+
+    # 1) 小米 MiMo 主力通道
+    if prefer_mimo and mimo_config.get("api_key"):
+        try:
+            return call_mimo_ai(prompt, model=exec_model, temperature=temperature)
+        except Exception as mimo_exc:
+            # MiMo 失败时自动降级到 Groq，避免页面直接不可用。
+            if not api_key:
+                return f"❌ MiMo 调用失败，且未配置 Groq 备用：{mimo_exc}"
+            try:
+                client = Groq(api_key=api_key)
+                completion = client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama-3.3-70b-versatile",
+                    temperature=temperature
+                )
+                return "【MiMo暂不可用，已自动切换Groq备用】\n\n" + completion.choices[0].message.content
+            except Exception as groq_exc:
+                return f"❌ AI 计算节点故障：MiMo={mimo_exc}；Groq={groq_exc}"
+
+    # 2) Groq 备用通道
     try:
-        exec_model = model if model else selected_model
+        if not api_key:
+            return "❌ AI 计算节点故障：未配置 MiMo 或 Groq API Key"
         client = Groq(api_key=api_key)
         completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
