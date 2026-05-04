@@ -8671,6 +8671,338 @@ except Exception:
 
 # ================= v26 爱问财 SkillHub 官方环境变量 + hithink-macro-query 精准修复结束 =================
 
+
+
+# ================= v27 爱问财官方指定技能精准挂载开始 =================
+# 微创目标：不重写系统，只把用户提供的 6 个官方 skill id 精确映射到对应功能模块。
+# 1) hithink-sector-selector  -> 资金热点/板块选择
+# 2) hithink-industry-query    -> 资金热点/行业数据、新闻行业动态
+# 3) report-search            -> 新闻情报/研报搜索、个股专项资讯
+# 4) announcement-search      -> 新闻情报/公告搜索、个股专项资讯
+# 5) hithink-zhishu-query     -> 宏观看板/指数数据补充
+# 6) hithink-market-query     -> 个股解析/行情数据补充、宏观看板补充
+
+try:
+    _V27_EXACT_SKILLS = {
+        "板块选择": ["hithink-sector-selector"],
+        "行业数据": ["hithink-industry-query"],
+        "研报搜索": ["report-search", "hithink-report-search", "research-report-search"],
+        "公告搜索": ["announcement-search", "hithink-announcement-search", "notice-search"],
+        "指数数据": ["hithink-zhishu-query", "zhishu-query", "index-query"],
+        "行情数据": ["hithink-market-query", "market-query", "quote-query"],
+    }
+    for _g, _skills in _V27_EXACT_SKILLS.items():
+        IWENCAI_OFFICIAL_SKILLS[_g] = list(dict.fromkeys(_skills + IWENCAI_OFFICIAL_SKILLS.get(_g, [])))
+
+    # 同步补进旧分组，避免原有函数按旧组名调用时漏掉官方精确技能。
+    IWENCAI_OFFICIAL_SKILLS["市场热点"] = list(dict.fromkeys([
+        "hithink-sector-selector", "hithink-industry-query"
+    ] + IWENCAI_OFFICIAL_SKILLS.get("市场热点", [])))
+    IWENCAI_OFFICIAL_SKILLS["宏观数据"] = list(dict.fromkeys([
+        "hithink-macro-query", "hithink-zhishu-query"
+    ] + IWENCAI_OFFICIAL_SKILLS.get("宏观数据", [])))
+except Exception:
+    pass
+
+
+def _v27_to_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        s = str(x).replace(',', '').replace('%', '').replace('亿', '').strip()
+        if s in ('', '-', 'None', 'nan'):
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def _v27_node_text(node):
+    if isinstance(node, dict):
+        parts = []
+        for k, v in node.items():
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                parts.append(f"{k}:{v}")
+        return " ".join(parts)
+    return str(node or "")
+
+
+def _v27_extract_sector_rows_from_iwc(raw_pack, max_rows=50):
+    """只提取行业/板块，不把个股误当板块。"""
+    raw = raw_pack.get('raw') if isinstance(raw_pack, dict) and 'raw' in raw_pack else raw_pack
+    rows, seen = [], set()
+    sector_words = (
+        '行业', '板块', '概念', '主题', '赛道', 'BK', '申万', '中信', '同花顺',
+        '证券', '银行', '半导体', '电池', '软件', '消费电子', '汽车', '有色', '煤炭', '医药', '传媒', '游戏'
+    )
+    stock_like_keys = ('股票代码', '证券代码', '代码')
+    for node in _iwc_walk(raw):
+        if not isinstance(node, dict):
+            continue
+        name = _iwc_text_value(node, [
+            '板块名称', '行业名称', '概念名称', '所属行业', '所属板块', '行业', '板块', '概念', 'name', '名称'
+        ]).strip()
+        code = _iwc_text_value(node, ['板块代码', '行业代码', '概念代码', 'code', '代码']).strip()
+        text = _v27_node_text(node)
+        if not name:
+            continue
+        # 明确过滤股票：6 位纯数字代码且名称不像行业/板块时，不进入资金热点板块。
+        if re.fullmatch(r'\d{6}', name) or (re.fullmatch(r'\d{6}', code) and not any(w in text for w in sector_words)):
+            continue
+        # 纯公司名但没有行业/板块语义，过滤。
+        if not any(w in text for w in sector_words) and not any(w in name for w in sector_words):
+            continue
+        key = (code or name, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            '板块代码': code,
+            '板块名称': name,
+            '涨跌幅': _v27_to_float(_iwc_text_value(node, ['涨跌幅', '涨幅', 'changePct', 'pct', '涨跌幅(%)']), 0),
+            '主力净流入': _v27_to_float(_iwc_text_value(node, ['主力净流入', '资金净流入', '净流入', '主力资金', '资金流入']), 0),
+            '主力净占比': _v27_to_float(_iwc_text_value(node, ['主力净占比', '净占比', '资金净占比']), 0),
+            '成交额': _v27_to_float(_iwc_text_value(node, ['成交额', 'amount', '成交额(亿)']), 0),
+            '上涨家数': _iwc_text_value(node, ['上涨家数', '上涨数']),
+            '下跌家数': _iwc_text_value(node, ['下跌家数', '下跌数']),
+            '领涨股票': _iwc_text_value(node, ['领涨股票', '领涨股', '龙头股', '代表股票']),
+            '数据源': '爱问财SkillHub｜板块/行业官方技能',
+        })
+        if len(rows) >= max_rows:
+            break
+    return rows
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def iwencai_sector_industry_blocks_v27(date_scope='今天', max_rows=50):
+    """资金热点模块专用：优先使用官方 hithink-sector-selector + hithink-industry-query。"""
+    queries = [
+        f'{date_scope} A股行业板块涨跌幅、成交额、主力资金净流入、领涨股票，只返回行业板块和概念板块，不要返回个股列表',
+        f'{date_scope} 强势行业板块和概念板块，资金流向排名，行业数据，板块热度，领涨龙头',
+    ]
+    packs_all, errors = [], []
+    for q in queries:
+        packs, errs = iwencai_official_query(
+            q,
+            skill_groups=['板块选择', '行业数据', '行情数据', '市场热点'],
+            date_scope=date_scope,
+            timeout_sec=7,
+            stop_on_first=False,
+        )
+        packs_all.extend(packs or [])
+        errors.extend(errs or [])
+        if packs_all:
+            break
+    rows = []
+    for pack in packs_all[:8]:
+        rows.extend(_v27_extract_sector_rows_from_iwc({'raw': pack.get('raw')}, max_rows=max_rows))
+        if len(rows) >= max_rows:
+            break
+    # 标准化字段以适配原资金热点表格。
+    if rows and '_normalize_industry_board_rows_v18' in globals():
+        try:
+            norm = _normalize_industry_board_rows_v18(rows, source='爱问财SkillHub｜hithink-sector-selector/hithink-industry-query')
+            if norm:
+                return norm[:max_rows], errors
+        except Exception:
+            pass
+    return rows[:max_rows], errors
+
+
+try:
+    _get_hot_blocks_before_iwc_v27 = get_hot_blocks
+
+    @st.cache_data(ttl=900, show_spinner=False)
+    def get_hot_blocks():
+        # 先用官方板块/行业技能，避免上一层把个股数据当板块；失败后回退原 v19/v26 链路。
+        iwc_rows, iwc_errs = _surgical_call_with_timeout(
+            iwencai_sector_industry_blocks_v27,
+            timeout_sec=9,
+            default=([], ['爱问财板块/行业技能超时'])
+        )
+        if isinstance(iwc_rows, tuple):
+            iwc_rows, iwc_errs = iwc_rows
+        if iwc_rows:
+            return iwc_rows
+        records, err = _surgical_call_with_timeout(_get_hot_blocks_before_iwc_v27, timeout_sec=10, default=[])
+        if records:
+            return records
+        if globals().get('DEBUG_MODE', False):
+            st.caption(f'资金热点：爱问财官方板块/行业技能={iwc_errs}; 原链路={err}')
+        return []
+except Exception:
+    pass
+
+
+def _v27_extract_quote_fields_from_iwc(raw_pack):
+    """从 hithink-market-query 返回中提取个股/指数行情字段。"""
+    raw = raw_pack.get('raw') if isinstance(raw_pack, dict) and 'raw' in raw_pack else raw_pack
+    out = {}
+    for node in _iwc_walk(raw):
+        if not isinstance(node, dict):
+            continue
+        # 尽量宽松提取，但只补字段，不覆盖已有有效实时字段。
+        name = _iwc_text_value(node, ['股票名称', '证券简称', '名称', 'name'])
+        price = _v27_to_float(_iwc_text_value(node, ['最新价', '现价', '价格', '收盘价', 'close', 'price']), None)
+        pct = _v27_to_float(_iwc_text_value(node, ['涨跌幅', '涨幅', 'changePct', 'pct']), None)
+        pe = _v27_to_float(_iwc_text_value(node, ['动态市盈率', '市盈率TTM', '市盈率', 'PE', 'pe']), None)
+        pb = _v27_to_float(_iwc_text_value(node, ['市净率', 'PB', 'pb']), None)
+        turnover = _v27_to_float(_iwc_text_value(node, ['换手率', 'turnover']), None)
+        cap = _v27_to_float(_iwc_text_value(node, ['总市值', '市值', '总市值(亿)', 'marketCap', '总市值亿元']), None)
+        amount = _v27_to_float(_iwc_text_value(node, ['成交额', 'amount']), None)
+        if name and not out.get('name'):
+            out['name'] = name
+        for k, v in [('price', price), ('pct', pct), ('pe', pe), ('pb', pb), ('turnover', turnover), ('market_cap', cap), ('amount', amount)]:
+            if v is not None and v != 0 and out.get(k) in (None, '', 0, 0.0):
+                out[k] = v
+        if len(out) >= 3:
+            break
+    if out:
+        out['source'] = '爱问财SkillHub｜hithink-market-query'
+    return out
+
+
+try:
+    _get_stock_quote_before_iwc_v27 = get_stock_quote
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def get_stock_quote(symbol):
+        quote = _get_stock_quote_before_iwc_v27(symbol)
+        if not isinstance(quote, dict):
+            quote = {}
+        need_fill = any(quote.get(k) in (None, '', '-', 0, 0.0) for k in ['market_cap', 'pe', 'pb', 'turnover'])
+        if need_fill and get_iwencai_config().get('api_key'):
+            q = f'{symbol} 最新行情 最新价 涨跌幅 总市值 市盈率 市净率 换手率 成交额'
+            packs, errs = iwencai_official_query(q, skill_groups=['行情数据'], date_scope='今天', timeout_sec=6, stop_on_first=True)
+            if packs:
+                extra = _v27_extract_quote_fields_from_iwc({'raw': packs[0].get('raw')})
+                for k, v in extra.items():
+                    if k == 'source':
+                        continue
+                    if quote.get(k) in (None, '', '-', 0, 0.0) and v not in (None, '', '-', 0, 0.0):
+                        quote[k] = v
+                if extra:
+                    quote['source'] = str(quote.get('source', '')).strip() + ' → 爱问财行情补充'
+                    quote['quality_score'] = min(10, int(quote.get('quality_score', 6) or 6) + 1)
+                    missing = [m for m in ['market_cap', 'pe', 'pb', 'turnover'] if quote.get(m) in (None, '', '-', 0, 0.0)]
+                    quote['missing_fields'] = missing
+        return quote
+except Exception:
+    pass
+
+
+try:
+    _get_market_pulse_before_iwc_v27 = get_market_pulse
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def get_market_pulse():
+        pulse = _get_market_pulse_before_iwc_v27()
+        if not isinstance(pulse, dict):
+            pulse = {}
+        # 只补缺失指数，不覆盖原有 AKShare/东财/新浪/腾讯真实结果。
+        targets = {
+            '上证指数': '上证指数', '深证成指': '深证成指', '创业板指': '创业板指', '沪深300': '沪深300', '科创50': '科创50'
+        }
+        missing = [name for name in targets if not pulse.get(name) or str(pulse.get(name, {}).get('price', '')).strip() in ('', '-', '待同步')]
+        if missing and get_iwencai_config().get('api_key'):
+            q = '今天 ' + '、'.join(missing) + ' 指数最新点位 涨跌幅 成交额'
+            packs, errs = iwencai_official_query(q, skill_groups=['指数数据', '行情数据'], date_scope='今天', timeout_sec=6, stop_on_first=False)
+            for pack in packs[:4]:
+                extra = _v27_extract_quote_fields_from_iwc({'raw': pack.get('raw')})
+                text = json.dumps(pack.get('raw'), ensure_ascii=False)[:3000]
+                for name in list(missing):
+                    if name in text and extra.get('price'):
+                        pulse[name] = {
+                            'price': extra.get('price'),
+                            'pct': extra.get('pct', 0),
+                            'source': '爱问财SkillHub｜hithink-zhishu-query',
+                            'status': '真实接口补充'
+                        }
+        return pulse
+except Exception:
+    pass
+
+
+# 新闻情报：用用户指定的公告/研报/行业/板块/指数/行情技能重排查询计划。
+def _iwc_build_news_queries(stock_code='', keyword='', date_scope='最近3天'):
+    base = str(stock_code or keyword or 'A股').strip()
+    qs = []
+    if stock_code:
+        qs.extend([
+            f'{base} {date_scope} 最新公告 重大事项 风险提示',
+            f'{base} {date_scope} 最新研报 机构观点 评级 目标价',
+            f'{base} {date_scope} 最新行情 市值 市盈率 市净率 换手率 成交额',
+            f'{base} {date_scope} 所属行业 概念板块 行业动态 资金流向',
+        ])
+    if keyword:
+        qs.extend([
+            f'{keyword} {date_scope} 行业数据 板块动态 资金流向 产业链 最新消息',
+            f'{keyword} {date_scope} 研报 机构观点 公告 相关上市公司',
+        ])
+    qs.extend([
+        f'{date_scope} A股市场热点 行业板块 资金流向 舆论趋势',
+        f'{date_scope} 宏观经济要闻 政策 利率 汇率 流动性 重要指数行情',
+    ])
+    return list(dict.fromkeys([q for q in qs if q.strip()]))[:8]
+
+
+def iwencai_news_search(stock_code='', keyword='', date_scope='最近3天', max_items=36):
+    """v27：新闻情报按官方指定 skill 分工调用。"""
+    all_items, errors, queries = [], [], []
+    if stock_code:
+        skill_plan = ['公告搜索', '研报搜索', '行情数据', '行业数据', '板块选择']
+    elif keyword:
+        skill_plan = ['行业数据', '板块选择', '研报搜索', '公告搜索', '行情数据', '指数数据']
+    else:
+        skill_plan = ['指数数据', '行情数据', '行业数据', '板块选择']
+    for q in _iwc_build_news_queries(stock_code, keyword, date_scope):
+        queries.append(q)
+        packs, errs = iwencai_official_query(q, skill_groups=skill_plan, date_scope=date_scope, timeout_sec=7, stop_on_first=False)
+        for pack in packs[:10]:
+            raw = {'raw': pack.get('raw'), 'skill_group': pack.get('skill_group'), 'skill_alias': pack.get('skill_alias')}
+            items = _iwc_extract_news_items(raw, query_hint=f"{pack.get('skill_group')}｜{q}", max_items=8)
+            for it in items:
+                it['platform'] = f"爱问财·{pack.get('skill_group')}"
+                it['source'] = it.get('source') or '爱问财官方技能库'
+                it['skill_alias'] = pack.get('skill_alias')
+            all_items.extend(items)
+        errors.extend(errs[-4:] if errs else [])
+        if len(all_items) >= max_items:
+            break
+    normalized = []
+    try:
+        fetcher = HighEndNewsFetcher()
+    except Exception:
+        fetcher = None
+    for item in all_items[:max_items]:
+        try:
+            if fetcher:
+                item['impact_score'] = fetcher._score_item(item)
+                item['matched_sectors'] = fetcher._match_sectors(str(item.get('title', '')) + ' ' + str(item.get('summary', '')))
+        except Exception:
+            item.setdefault('impact_score', 0)
+            item.setdefault('matched_sectors', [])
+        normalized.append(item)
+    dedup, seen = [], set()
+    for it in normalized:
+        key = (str(it.get('title', '')) + str(it.get('summary', ''))[:120]).strip()
+        if key and key not in seen:
+            seen.add(key)
+            dedup.append(it)
+    return dedup[:max_items], errors, queries
+
+try:
+    _render_news_before_iwc_v27 = render_high_end_news_terminal
+    def render_high_end_news_terminal():
+        cfg = get_iwencai_config()
+        if cfg.get('api_key'):
+            st.caption('✅ 爱问财官方技能已按模块接入：板块选择 hithink-sector-selector｜行业数据 hithink-industry-query｜研报 report-search｜公告 announcement-search｜指数 hithink-zhishu-query｜行情 hithink-market-query。')
+        _render_news_before_iwc_v27()
+except Exception:
+    pass
+
+# ================= v27 爱问财官方指定技能精准挂载结束 =================
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
