@@ -84,11 +84,23 @@ st.markdown("""
 
 st.title("🏦 AI 智能量化投研终端")
 st.markdown(
-    f"<div class='terminal-header'>TERMINAL BUILD v11.0-HOTBLOCK-NONBLOCKING | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
+    f"<div class='terminal-header'>TERMINAL BUILD v25.0-IWENCAI-OFFICIAL-SKILLS | SYS_TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | MULTI-TF HOTFIX + MANUAL OVERRIDE</div>",
     unsafe_allow_html=True
 )
 
 api_key = st.secrets.get("GROQ_API_KEY", "")
+
+
+def _secret_get_first(keys, default=""):
+    """从 Streamlit Secrets 读取第一个存在的配置。"""
+    for key in keys:
+        try:
+            val = st.secrets.get(key, "")
+            if val:
+                return str(val).strip()
+        except Exception:
+            pass
+    return default
 
 
 def get_tushare_token_from_secrets():
@@ -482,13 +494,13 @@ def _fetch_jqdata_moneyflow_pool(max_stocks=5000, trade_date=None):
 with st.sidebar:
     st.header("⚙️ 终端控制台")
 
-    # 新增：手动选择 LLM 模型
+    # AI 引擎：删除 MiMo，仅保留 Groq 作为稳定推理通道。
     st.markdown("### 🧠 核心推理引擎")
     selected_model = st.selectbox(
-        "选择大模型",
+        "Groq 模型",
         ["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"],
         index=0,
-        help="手动指定底层计算模型，精准控制分析逻辑"
+        help="小米 MiMo 已按你的要求删除；当前 AI 报告统一走 Groq。"
     )
 
     # 新增：手动干预技术参数
@@ -499,6 +511,11 @@ with st.sidebar:
         ema_long = st.number_input("长期 EMA", min_value=20, max_value=250, value=120, step=1)
 
     st.markdown("### 🔐 数据源密钥")
+    st.caption("MiMo：已删除，不再参与本终端调用。")
+    if api_key:
+        st.success("Groq：已配置 AI Key")
+    else:
+        st.warning("Groq：未配置 AI Key")
     if ts_token:
         st.success("Tushare Token：已从 secrets 读取")
     else:
@@ -2390,17 +2407,27 @@ def get_kline(symbol, days=220):
 
 # ================= AI 计算核心 =================
 def call_ai(prompt, model=None, temperature=0.3):
+    """统一 AI 入口：MiMo 已删除，当前仅使用 Groq。"""
+    exec_model = model if model else selected_model
     try:
-        exec_model = model if model else selected_model
+        if not api_key:
+            return "❌ AI 计算节点故障：未配置 GROQ_API_KEY"
         client = Groq(api_key=api_key)
         completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是A股量化投研终端首席策略分析师。请用中文输出，避免暴露英文字段名；结论要专业、可执行，并主动给出风险反证。"
+                },
+                {"role": "user", "content": str(prompt)}
+            ],
             model=exec_model,
             temperature=temperature
         )
         return completion.choices[0].message.content
     except Exception as e:
         return f"❌ AI 计算节点故障: {e}"
+
 # ================= 宏观分析与数据采集模块 (整合版) =================
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -7865,6 +7892,505 @@ def render_high_end_news_terminal():
 
 # ================= v22 新闻情报：专业报告 + 严格板块映射 + 个股资讯侧栏微创修复结束 =================
 
+
+# ================= v24 爱问财 SkillHub 微创接入层开始 =================
+# 设计原则：不安装本地 skill，不改原 UI 主体；仅通过 Streamlit Secrets 中的 API Key / URL
+# 调用爱问财 SkillHub 作为可选增强数据源。失败快速跳过，不拖慢已修好的妙想、资金热点、个股解析逻辑。
+# Secrets 支持：
+# IWENCAI_API_KEY = "..."
+# IWENCAI_URL = "https://..."  # 运行时接口地址，不是 download_and_install.sh 安装脚本
+# 或 [iwencai] api_key="..." url="..."
+
+
+def get_iwencai_config():
+    """读取爱问财 SkillHub 配置。兼容顶层 secrets 和 [iwencai] 分组。"""
+    api_key = ""
+    base_url = ""
+    try:
+        api_key = str(st.secrets.get("IWENCAI_API_KEY", "") or st.secrets.get("IWC_API_KEY", "") or "").strip()
+        base_url = str(st.secrets.get("IWENCAI_URL", "") or st.secrets.get("IWENCAI_BASE_URL", "") or st.secrets.get("IWC_URL", "") or "").strip()
+    except Exception:
+        pass
+    try:
+        sec = st.secrets.get("iwencai", {})
+        if isinstance(sec, dict):
+            api_key = api_key or str(sec.get("api_key") or sec.get("apikey") or sec.get("key") or "").strip()
+            base_url = base_url or str(sec.get("url") or sec.get("base_url") or sec.get("endpoint") or "").strip()
+    except Exception:
+        pass
+    return {"api_key": api_key, "url": base_url.rstrip("/")}
+
+
+
+
+# 爱问财官方 SkillHub 能力注册表：统一纳入终端。
+# 说明：不同运行时对 skill 名称的字段命名可能不同，因此每类技能设置多组别名。
+IWENCAI_OFFICIAL_SKILLS = {
+    "A股选股": ["stock-screen", "a-stock-screen", "select-a-share", "ask-stock-a", "问财选A股", "选A股"],
+    "港股选股": ["hk-stock-screen", "select-hk-stock", "ask-stock-hk", "问财选港股", "选港股"],
+    "美股选股": ["us-stock-screen", "select-us-stock", "ask-stock-us", "问财选美股", "选美股"],
+    "ETF筛选": ["etf-screen", "select-etf", "问财选ETF", "选ETF"],
+    "基金筛选": ["fund-screen", "select-fund", "问财选基金", "选基金"],
+    "基金经理": ["fund-manager", "fund-manager-screen", "问财选基金经理"],
+    "可转债": ["convertible-bond", "convertible-bond-screen", "问财选可转债", "选可转债"],
+    "期货期权": ["futures-options", "future-option", "derivatives-screen", "期货期权"],
+    "宏观数据": ["macro-data", "macro-search", "宏观数据查询", "宏观数据"],
+    "财务数据": ["financial-data", "finance-data", "财务数据查询", "财务数据"],
+    "行情数据": ["market-data", "quote-data", "行情数据查询", "行情数据"],
+    "资金流向": ["capital-flow", "money-flow", "fund-flow", "资金流向"],
+    "新闻资讯": ["news-search", "information-search", "资讯搜索", "新闻搜索"],
+    "公告搜索": ["announcement-search", "notice-search", "公告搜索", "公告查询"],
+    "研报搜索": ["research-report-search", "report-search", "研报搜索", "研报查询"],
+    "董秘问答": ["ir-qa-search", "investor-qa", "董秘问答", "互动易"],
+    "产业链分析": ["industry-chain", "chain-analysis", "产业链分析", "产业链解读"],
+    "市场热点": ["market-hotspot", "hotspot-search", "热点追踪", "市场热点"],
+}
+
+
+def iwencai_skill_aliases(skill_group):
+    aliases = IWENCAI_OFFICIAL_SKILLS.get(skill_group, [])
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    return list(dict.fromkeys(list(aliases) + [str(skill_group)]))
+
+
+def iwencai_official_query(query, skill_groups=None, date_scope="最近3天", timeout_sec=7, stop_on_first=True):
+    """按官方技能分组依次调用 SkillHub。失败快速跳过，不阻塞主页面。"""
+    skill_groups = skill_groups or ["新闻资讯"]
+    results, errors = [], []
+    for group in skill_groups:
+        for alias in iwencai_skill_aliases(group):
+            raw, err = iwencai_skill_query(query, skill=alias, date_scope=date_scope, timeout_sec=timeout_sec)
+            if raw:
+                results.append({"skill_group": group, "skill_alias": alias, "raw": raw})
+                if stop_on_first:
+                    return results, errors
+            elif err:
+                errors.append(f"{group}/{alias}: {err}")
+            if len(errors) >= 10 and stop_on_first:
+                break
+    return results, errors
+
+def _iwc_runtime_url_candidates(base_url):
+    """基于用户配置生成候选运行时接口地址。若用户填的是安装脚本地址，直接判定为不可用。"""
+    base_url = str(base_url or "").strip().rstrip("/")
+    if not base_url:
+        return []
+    if base_url.endswith(".sh") or "download_and_install" in base_url:
+        return []
+    # 如果用户填的是完整接口，优先直连；同时尝试常见 skillhub runner 路径。
+    return list(dict.fromkeys([
+        base_url,
+        base_url + "/api/skill/run",
+        base_url + "/api/skills/run",
+        base_url + "/skill/run",
+        base_url + "/skillhub/api/skill/run",
+        base_url + "/skillhub/api/run",
+        base_url + "/api/v1/skill/run",
+        base_url + "/api/v1/query",
+        base_url + "/query",
+        base_url + "/search",
+    ]))
+
+
+def _iwc_payload_candidates(query, skill="search", date_scope="最近3天"):
+    """兼容不同 SkillHub 服务端的常见入参格式。"""
+    query = str(query or "").strip()
+    skill = str(skill or "search").strip()
+    base_meta = {"date_scope": date_scope, "dateScope": date_scope, "timeRange": date_scope}
+    return [
+        {"query": query, "skill": skill, **base_meta},
+        {"question": query, "skill": skill, **base_meta},
+        {"input": query, "skill": skill, **base_meta},
+        {"keyword": query, "skill": skill, **base_meta},
+        {"content": query, "skill": skill, **base_meta},
+        {"toolQuery": query, "skill": skill, **base_meta},
+        {"query": query, "skillName": skill, **base_meta},
+        {"query": query, "skillId": skill, **base_meta},
+        {"query": query, "tool": skill, **base_meta},
+        {"skill": skill, "arguments": {"query": query, "date_scope": date_scope}},
+        {"skillName": skill, "arguments": {"query": query, "date_scope": date_scope}},
+        {"messages": [{"role": "user", "content": query}], "skill": skill, **base_meta},
+    ]
+
+
+def _iwc_headers(api_key):
+    return {
+        "Content-Type": "application/json",
+        "apikey": api_key,
+        "apiKey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "Mozilla/5.0 (compatible; WhaleWatch-IWenCaiSkillHub/1.0)",
+    }
+
+
+def _iwc_is_success_payload(data):
+    if not isinstance(data, dict):
+        return True
+    code = data.get("code", data.get("status", data.get("errorCode", 0)))
+    # 兼容 0 / 200 / success / ok / None 等成功标识
+    if code in (None, 0, 200, "0", "200", "success", "SUCCESS", "ok", "OK"):
+        return True
+    # 有些接口直接以 data/result 返回，不给 code。
+    if any(k in data for k in ["data", "result", "results", "items", "answer", "content", "text"]):
+        return True
+    return False
+
+
+def _iwc_brief_error(data):
+    if isinstance(data, dict):
+        return str(data.get("message") or data.get("msg") or data.get("error") or data.get("errorMsg") or data.get("code") or "返回状态异常")[:180]
+    return "返回状态异常"
+
+
+def _iwc_post_once(url, payload, api_key, timeout_sec=7):
+    try:
+        r = requests.post(url, headers=_iwc_headers(api_key), json=payload, timeout=(2, timeout_sec), verify=False)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {r.text[:120]}"
+        ctype = r.headers.get("content-type", "")
+        try:
+            data = r.json()
+        except Exception:
+            text = r.text.strip()
+            if not text:
+                return None, "空响应"
+            data = {"text": text}
+        if not _iwc_is_success_payload(data):
+            return None, _iwc_brief_error(data)
+        return data, None
+    except Exception as exc:
+        return None, str(exc)[:180]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def iwencai_skill_query(query, skill="search", date_scope="最近3天", timeout_sec=7):
+    """爱问财 SkillHub 统一入口。返回原始 JSON/text 包装；失败快速返回。"""
+    cfg = get_iwencai_config()
+    api_key, base_url = cfg.get("api_key"), cfg.get("url")
+    if not api_key:
+        return None, "未配置 IWENCAI_API_KEY"
+    urls = _iwc_runtime_url_candidates(base_url)
+    if not urls:
+        return None, "未配置可用 IWENCAI_URL；请填运行时 API 地址，不要填 download_and_install.sh 安装脚本地址"
+    errors = []
+    for url in urls[:8]:
+        for payload in _iwc_payload_candidates(query, skill=skill, date_scope=date_scope)[:4]:
+            data, err = _iwc_post_once(url, payload, api_key, timeout_sec=timeout_sec)
+            if data is not None:
+                return {"source_url": url, "payload": payload, "raw": data}, None
+            if err:
+                errors.append(f"{url}: {err}")
+            # 同一个 URL 不要尝试过多 payload，避免慢。
+            if len(errors) >= 8:
+                break
+        if len(errors) >= 8:
+            break
+    return None, "；".join(errors[-4:]) if errors else "爱问财 SkillHub 无返回"
+
+
+def _iwc_walk(obj, max_nodes=2000):
+    """递归遍历 SkillHub 返回，兼容未知结构。"""
+    stack = [obj]
+    seen = 0
+    while stack and seen < max_nodes:
+        cur = stack.pop()
+        seen += 1
+        yield cur
+        if isinstance(cur, dict):
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur:
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+
+
+def _iwc_text_value(d, keys):
+    if not isinstance(d, dict):
+        return ""
+    for k in keys:
+        if k in d and d.get(k) not in (None, ""):
+            v = d.get(k)
+            if isinstance(v, (dict, list)):
+                return json.dumps(v, ensure_ascii=False)[:1200]
+            return str(v)
+    return ""
+
+
+def _iwc_extract_news_items(raw_pack, query_hint="", max_items=20):
+    """把爱问财 SkillHub 的未知返回结构转换成新闻情报列表。"""
+    if not raw_pack:
+        return []
+    raw = raw_pack.get("raw") if isinstance(raw_pack, dict) and "raw" in raw_pack else raw_pack
+    out = []
+    # 1. 优先提取 dict 结构中的标题/摘要。
+    for node in _iwc_walk(raw):
+        if not isinstance(node, dict):
+            continue
+        title = _iwc_text_value(node, ["title", "标题", "newsTitle", "name", "名称", "headline", "subject"])
+        summary = _iwc_text_value(node, ["summary", "摘要", "content", "内容", "text", "answer", "desc", "description", "结论"])
+        date = _iwc_text_value(node, ["date", "time", "datetime", "publishTime", "发布时间", "日期"])
+        url = _iwc_text_value(node, ["url", "link", "链接"])
+        source = _iwc_text_value(node, ["source", "来源", "media", "from"]) or "爱问财技能库"
+        typ = _iwc_text_value(node, ["type", "类型", "category", "informationType"]) or "技能情报"
+        if title or summary:
+            text_key = (title + summary)[:160]
+            if len(text_key.strip()) < 6:
+                continue
+            out.append({
+                "source": source,
+                "platform": "爱问财" if not typ else f"爱问财·{typ}",
+                "title": title or str(summary)[:80],
+                "summary": summary or title,
+                "time": date,
+                "url": url,
+                "query_hint": query_hint,
+            })
+        if len(out) >= max_items:
+            break
+    # 2. 如果只返回长文本回答，也转成一条情报。
+    if not out:
+        text_bits = []
+        for node in _iwc_walk(raw):
+            if isinstance(node, str) and len(node.strip()) >= 20:
+                text_bits.append(node.strip())
+            elif isinstance(node, dict):
+                for k in ["answer", "content", "text", "result", "data"]:
+                    v = node.get(k)
+                    if isinstance(v, str) and len(v.strip()) >= 20:
+                        text_bits.append(v.strip())
+            if len(text_bits) >= 3:
+                break
+        if text_bits:
+            text = "\n".join(text_bits)[:1800]
+            out.append({
+                "source": "爱问财技能库",
+                "platform": "爱问财·综合情报",
+                "title": f"爱问财技能库返回：{str(query_hint)[:40]}",
+                "summary": text,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "query_hint": query_hint,
+            })
+    # 去重
+    dedup, seen = [], set()
+    for it in out:
+        key = (str(it.get("title", "")) + str(it.get("summary", ""))[:60]).strip()
+        if key and key not in seen:
+            seen.add(key)
+            dedup.append(it)
+    return dedup[:max_items]
+
+
+def _iwc_build_news_queries(stock_code="", keyword="", date_scope="最近3天"):
+    base = str(stock_code or keyword or "A股市场").strip()
+    queries = []
+    if base:
+        queries.extend([
+            f"{base} {date_scope} 最新消息 公告 研报 机构观点 风险提示",
+            f"{base} {date_scope} 舆情动态 资金关注 事件催化",
+        ])
+    if keyword and keyword != stock_code:
+        queries.append(f"{keyword} {date_scope} 行业动态 概念催化 市场热点 舆论趋势")
+    queries.append(f"A股 {date_scope} 市场热点 行业板块 资金关注 宏观要闻")
+    return list(dict.fromkeys([q for q in queries if q.strip()]))[:4]
+
+
+def iwencai_news_search(stock_code="", keyword="", date_scope="最近3天", max_items=36):
+    """爱问财官方 SkillHub 全技能新闻/公告/研报/董秘问答/热点/宏观检索。"""
+    all_items, errors, queries = [], [], []
+    skill_plan = ["新闻资讯", "公告搜索", "研报搜索", "董秘问答", "市场热点", "宏观数据", "产业链分析"]
+    for q in _iwc_build_news_queries(stock_code, keyword, date_scope):
+        queries.append(q)
+        raw_packs, err_list = iwencai_official_query(q, skill_groups=skill_plan, date_scope=date_scope, timeout_sec=7, stop_on_first=False)
+        for pack in raw_packs[:8]:
+            raw = {"raw": pack.get("raw"), "skill_group": pack.get("skill_group"), "skill_alias": pack.get("skill_alias")}
+            items = _iwc_extract_news_items(raw, query_hint=f"{pack.get('skill_group')}｜{q}", max_items=8)
+            for it in items:
+                it["platform"] = f"爱问财·{pack.get('skill_group')}"
+                it["source"] = it.get("source") or "爱问财官方技能库"
+            all_items.extend(items)
+        errors.extend(err_list[-3:] if err_list else [])
+        if len(all_items) >= max_items:
+            break
+    # 统一补影响分和板块映射字段，保持和原新闻情报模块兼容。
+    normalized = []
+    fetcher = None
+    try:
+        fetcher = HighEndNewsFetcher()
+    except Exception:
+        fetcher = None
+    for item in all_items[:max_items]:
+        try:
+            if fetcher:
+                item["impact_score"] = fetcher._score_item(item)
+                item["matched_sectors"] = fetcher._match_sectors(str(item.get("title", "")) + " " + str(item.get("summary", "")))
+        except Exception:
+            item.setdefault("impact_score", 0)
+            item.setdefault("matched_sectors", [])
+        normalized.append(item)
+    # 去重
+    dedup, seen = [], set()
+    for it in normalized:
+        key = (str(it.get("title", "")) + str(it.get("summary", ""))[:100]).strip()
+        if key and key not in seen:
+            seen.add(key)
+            dedup.append(it)
+    return dedup[:max_items], errors, queries
+
+
+def iwencai_stock_deep_search(stock_code_or_name, date_scope="最近7天", max_items=36):
+    """面向单股的官方技能全量扫描：公告、研报、财务、行情、资金、董秘问答、产业链。"""
+    base = str(stock_code_or_name or "").strip()
+    if not base:
+        return [], ["未输入个股代码或名称"], []
+    queries = [
+        f"{base} {date_scope} 最新公告 重大事项 风险提示",
+        f"{base} {date_scope} 研报 机构观点 评级 目标价",
+        f"{base} {date_scope} 最新消息 舆情动态 事件催化",
+        f"{base} 财务数据 市值 市盈率 市净率 ROE 净利润 营收",
+        f"{base} 行情数据 资金流向 主力资金 换手率 成交额",
+        f"{base} 董秘问答 投资者互动",
+        f"{base} 所属行业 概念题材 产业链 上下游",
+    ]
+    skill_plan = ["公告搜索", "研报搜索", "新闻资讯", "财务数据", "行情数据", "资金流向", "董秘问答", "产业链分析"]
+    items, errors = [], []
+    for q in queries:
+        packs, errs = iwencai_official_query(q, skill_groups=skill_plan, date_scope=date_scope, timeout_sec=7, stop_on_first=False)
+        errors.extend(errs[-2:] if errs else [])
+        for pack in packs[:5]:
+            extracted = _iwc_extract_news_items({"raw": pack.get("raw")}, query_hint=f"{pack.get('skill_group')}｜{q}", max_items=5)
+            for it in extracted:
+                it["platform"] = f"爱问财·{pack.get('skill_group')}"
+                it["source"] = it.get("source") or "爱问财官方技能库"
+            items.extend(extracted)
+        if len(items) >= max_items:
+            break
+    dedup, seen = [], set()
+    for it in items:
+        key = (str(it.get("title", "")) + str(it.get("summary", ""))[:120]).strip()
+        if key and key not in seen:
+            seen.add(key)
+            dedup.append(it)
+    return dedup[:max_items], errors, queries
+
+
+def _iwc_extract_industry_rows(raw_pack, max_rows=30):
+    raw = raw_pack.get("raw") if isinstance(raw_pack, dict) and "raw" in raw_pack else raw_pack
+    rows = []
+    for node in _iwc_walk(raw):
+        if isinstance(node, dict):
+            name = _iwc_text_value(node, ["板块名称", "行业名称", "行业", "板块", "name", "名称"])
+            code = _iwc_text_value(node, ["板块代码", "行业代码", "code", "代码"])
+            # 过滤个股代码，防止再次把个股当板块。
+            if not name or re.fullmatch(r"\d{6}", str(code).strip()) or re.fullmatch(r"\d{6}", str(name).strip()):
+                continue
+            rows.append({
+                "板块代码": code,
+                "板块名称": name,
+                "涨跌幅": _iwc_text_value(node, ["涨跌幅", "涨幅", "changePct", "pct"]),
+                "主力净流入": _iwc_text_value(node, ["主力净流入", "资金净流入", "净流入", "主力资金"]),
+                "成交额": _iwc_text_value(node, ["成交额", "amount"]),
+                "上涨家数": _iwc_text_value(node, ["上涨家数", "上涨数"]),
+                "下跌家数": _iwc_text_value(node, ["下跌家数", "下跌数"]),
+                "领涨股票": _iwc_text_value(node, ["领涨股票", "领涨股", "龙头股"]),
+            })
+        if len(rows) >= max_rows:
+            break
+    return rows
+
+
+def _iwc_industry_blocks_v24():
+    q = "今日A股行业板块资金流向排名，行业板块涨跌幅、主力净流入、成交额、领涨股票，只返回行业板块，不要返回个股"
+    packs, errs = iwencai_official_query(q, skill_groups=["资金流向", "市场热点", "行情数据", "A股选股"], date_scope="今天", timeout_sec=7, stop_on_first=False)
+    if not packs:
+        return [], "；".join(errs[-3:]) if errs else "爱问财官方技能库无行业板块返回"
+    rows = []
+    for pack in packs[:6]:
+        rows.extend(_iwc_extract_industry_rows({"raw": pack.get("raw")}, max_rows=30))
+        if len(rows) >= 50:
+            break
+    if not rows:
+        return [], "爱问财技能库未返回可识别的行业板块字段"
+    if "_normalize_industry_board_rows_v18" in globals():
+        return _normalize_industry_board_rows_v18(rows, source="爱问财技能库行业板块"), None
+    return rows, None
+
+
+# 新闻情报：在 v22 妙想主力基础上，叠加爱问财 SkillHub。不是旧 pywencai，也不走浏览器爬虫。
+try:
+    _news_collect_before_iwc_v24 = HighEndNewsFetcher.collect
+
+    def _collect_news_with_iwencai_skillhub_v24(self, stock_code="", max_items=80, include_wencai=False, keyword="", mx_mode="一键扫描", date_scope="最近3天"):
+        base = _news_collect_before_iwc_v24(self, stock_code=stock_code, max_items=max_items, include_wencai=False, keyword=keyword, mx_mode=mx_mode, date_scope=date_scope)
+        if not isinstance(base, dict):
+            base = {"items": [], "errors": ["原新闻采集器返回异常"], "queries": []}
+        items = list(base.get("items", []) or [])
+        errors = list(base.get("errors", []) or [])
+        queries = list(base.get("queries", []) or [])
+        iwc_items, iwc_errors, iwc_queries = iwencai_news_search(stock_code=stock_code, keyword=keyword, date_scope=date_scope, max_items=max(16, int(max_items * 0.45)))
+        if iwc_items:
+            # 爱问财技能库作为补强源，放在前面，但保留妙想结果。
+            items = iwc_items + items
+        errors.extend(iwc_errors or [])
+        queries.extend(["爱问财SkillHub｜" + q for q in (iwc_queries or [])])
+        # 去重并限制总量
+        dedup, seen = [], set()
+        for it in items:
+            key = (str(it.get("title", "")) + str(it.get("summary", ""))[:80]).strip()
+            if key and key not in seen:
+                seen.add(key)
+                dedup.append(it)
+            if len(dedup) >= max_items:
+                break
+        base["items"] = dedup
+        base["errors"] = errors
+        base["queries"] = queries
+        return base
+
+    HighEndNewsFetcher.collect = _collect_news_with_iwencai_skillhub_v24
+except Exception:
+    pass
+
+
+# 资金热点：在 v19 真实行业板块/yfinance 可用逻辑之外，增加爱问财行业板块补强；只在原结果为空时启用，避免破坏已经可用的资金板块。
+try:
+    _get_hot_blocks_before_iwc_v24 = get_hot_blocks
+
+    @st.cache_data(ttl=900, show_spinner=False)
+    def get_hot_blocks():
+        records, err = _surgical_call_with_timeout(_get_hot_blocks_before_iwc_v24, timeout_sec=10, default=[])
+        if records:
+            return records
+        iwc_records, iwc_err = _surgical_call_with_timeout(_iwc_industry_blocks_v24, timeout_sec=8, default=([], "爱问财行业板块超时"))
+        if isinstance(iwc_records, tuple):
+            iwc_records, iwc_err = iwc_records
+        if iwc_records:
+            return iwc_records
+        if globals().get("DEBUG_MODE", False):
+            st.caption(f"资金热点：原链路失败={err}; 爱问财SkillHub={iwc_err}")
+        return []
+except Exception:
+    pass
+
+
+# 在新闻情报页的状态提示中补充爱问财 SkillHub 配置状态：保留原页面，只替换顶部说明更准确。
+try:
+    _render_news_before_iwc_v24 = render_high_end_news_terminal
+
+    def render_high_end_news_terminal():
+        cfg = get_iwencai_config()
+        if cfg.get("api_key") and cfg.get("url"):
+            st.caption("✅ 爱问财官方 SkillHub 已接入：新闻、公告、研报、董秘问答、行情、财务、资金、宏观、产业链、A股/港股/美股/ETF/基金/可转债等技能已统一纳入增强层。")
+        elif cfg.get("api_key") and not cfg.get("url"):
+            st.caption("⚠️ 已读取爱问财 API Key，但未配置 IWENCAI_URL；爱问财 SkillHub 暂不参与检索。")
+        _render_news_before_iwc_v24()
+except Exception:
+    pass
+
+# ================= v24 爱问财 SkillHub 微创接入层结束 =================
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
@@ -8359,17 +8885,4 @@ with tab5:
                         if show_raw_lhb and df_lhb is not None and not df_lhb.empty:
                             st.dataframe(df_lhb, width="stretch", hide_index=True)
                         else:
-                            st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
-# ================= Tab 6: 主力资金选股 =================
-with tab6:
-    try:
-        render_main_force_tab()
-    except Exception as exc:
-        render_module_crash_box("主力资金", exc)
-
-# ================= Tab 7: 高端情报终端 Pro =================
-with tab7:
-    try:
-        render_high_end_news_terminal()
-    except Exception as exc:
-        render_module_crash_box("新闻情报", exc)
+                            st.info("勾选“显示原始
