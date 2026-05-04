@@ -8885,4 +8885,17 @@ with tab5:
                         if show_raw_lhb and df_lhb is not None and not df_lhb.empty:
                             st.dataframe(df_lhb, width="stretch", hide_index=True)
                         else:
-                            st.info("勾选“显示原始
+                            st.info("勾选“显示原始明细数据”后展示完整龙虎榜明细。")
+# ================= Tab 6: 主力资金选股 =================
+with tab6:
+    try:
+        render_main_force_tab()
+    except Exception as exc:
+        render_module_crash_box("主力资金", exc)
+
+# ================= Tab 7: 高端情报终端 Pro =================
+with tab7:
+    try:
+        render_high_end_news_terminal()
+    except Exception as exc:
+        render_module_crash_box("新闻情报", exc)
