@@ -8391,6 +8391,286 @@ except Exception:
 
 # ================= v24 爱问财 SkillHub 微创接入层结束 =================
 
+
+
+# ================= v26 爱问财 SkillHub 官方环境变量 + hithink-macro-query 精准修复开始 =================
+# 微创目标：不动原页面和已修好的妙想/yfinance/资金板块逻辑，只修爱问财 SkillHub 接入不生效的问题。
+# 关键修复：
+# 1. 支持官方文档环境变量 IWENCAI_BASE_URL=https://openapi.iwencai.com；未配置 URL 但配置了 Key 时默认使用该地址。
+# 2. 增加官方示例技能 hithink-macro-query 的精确 skill id。
+# 3. 扩大 OpenAPI/SkillHub 常见运行时路径、Header、Payload 兼容；但每次请求仍短超时，失败不拖死页面。
+# 4. Streamlit Cloud 不执行安装脚本，不写 shell profile；Secrets 等价于云端永久配置。
+
+try:
+    import shutil as _iwc_shutil
+except Exception:
+    _iwc_shutil = None
+
+
+def get_iwencai_config():
+    """读取爱问财官方 SkillHub 配置。兼容官方 IWENCAI_BASE_URL / IWENCAI_API_KEY。"""
+    api_key = ""
+    base_url = ""
+    try:
+        api_key = str(
+            st.secrets.get("IWENCAI_API_KEY", "")
+            or st.secrets.get("IWC_API_KEY", "")
+            or st.secrets.get("IWENCAI_KEY", "")
+            or ""
+        ).strip()
+        base_url = str(
+            st.secrets.get("IWENCAI_BASE_URL", "")
+            or st.secrets.get("IWENCAI_URL", "")
+            or st.secrets.get("IWC_URL", "")
+            or ""
+        ).strip()
+    except Exception:
+        pass
+    try:
+        sec = st.secrets.get("iwencai", {})
+        if isinstance(sec, dict):
+            api_key = api_key or str(sec.get("api_key") or sec.get("apikey") or sec.get("key") or "").strip()
+            base_url = base_url or str(sec.get("base_url") or sec.get("url") or sec.get("endpoint") or "").strip()
+    except Exception:
+        pass
+    # 官方文档给出的默认地址。只要有 key，就允许默认走 openapi。
+    if api_key and not base_url:
+        base_url = "https://openapi.iwencai.com"
+    return {"api_key": api_key, "url": base_url.rstrip("/")}
+
+
+# 在原注册表基础上补充官方 hithink-* 技能 ID。已知官方示例 hithink-macro-query 必须精确加入。
+try:
+    IWENCAI_OFFICIAL_SKILLS.update({
+        "宏观数据": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("宏观数据", []) + [
+            "hithink-macro-query", "macro-query", "hithink_macro_query"
+        ])),
+        "新闻资讯": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("新闻资讯", []) + [
+            "hithink-news-query", "hithink-information-query", "news-query", "information-query"
+        ])),
+        "公告搜索": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("公告搜索", []) + [
+            "hithink-announcement-query", "announcement-query", "notice-query"
+        ])),
+        "研报搜索": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("研报搜索", []) + [
+            "hithink-research-report-query", "hithink-report-query", "research-report-query", "report-query"
+        ])),
+        "行情数据": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("行情数据", []) + [
+            "hithink-market-query", "hithink-quote-query", "market-query", "quote-query"
+        ])),
+        "资金流向": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("资金流向", []) + [
+            "hithink-capital-flow-query", "hithink-money-flow-query", "capital-flow-query", "money-flow-query"
+        ])),
+        "市场热点": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("市场热点", []) + [
+            "hithink-hotspot-query", "market-hotspot-query", "hotspot-query"
+        ])),
+        "产业链分析": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("产业链分析", []) + [
+            "hithink-industry-chain-query", "industry-chain-query"
+        ])),
+        "A股选股": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("A股选股", []) + [
+            "hithink-a-stock-screen", "hithink-stock-screen", "stock-screen-query", "a-stock-screen-query"
+        ])),
+        "财务数据": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("财务数据", []) + [
+            "hithink-financial-query", "hithink-finance-query", "financial-query", "finance-query"
+        ])),
+        "董秘问答": list(dict.fromkeys(IWENCAI_OFFICIAL_SKILLS.get("董秘问答", []) + [
+            "hithink-ir-qa-query", "ir-qa-query", "investor-qa-query"
+        ])),
+    })
+except Exception:
+    pass
+
+
+def _iwc_cli_status_v26():
+    """仅检查 CLI 是否存在；云端不自动安装，避免部署失败。"""
+    try:
+        if _iwc_shutil:
+            for cmd in ["iwencai", "skillhub", "iwc"]:
+                path = _iwc_shutil.which(cmd)
+                if path:
+                    return True, f"检测到 CLI：{cmd}"
+    except Exception:
+        pass
+    return False, "未检测到本地 CLI；Streamlit Cloud 将使用 OpenAPI 直连方式"
+
+
+def _iwc_runtime_url_candidates(base_url):
+    """基于官方 IWENCAI_BASE_URL 生成运行时接口候选。"""
+    base_url = str(base_url or "").strip().rstrip("/")
+    if not base_url:
+        return []
+    if base_url.endswith(".sh") or "download_and_install" in base_url:
+        return []
+    # 若用户填的是完整运行时接口，排第一；同时补充 openapi/skillhub 常见路径。
+    candidates = [
+        base_url,
+        base_url + "/skillhub/api/run",
+        base_url + "/skillhub/api/skill/run",
+        base_url + "/skillhub/openapi/v1/run",
+        base_url + "/skillhub/openapi/v1/skill/run",
+        base_url + "/openapi/skillhub/v1/run",
+        base_url + "/openapi/skillhub/v1/skill/run",
+        base_url + "/api/skillhub/v1/run",
+        base_url + "/api/skillhub/v1/skill/run",
+        base_url + "/api/v1/skill/run",
+        base_url + "/api/v1/skills/run",
+        base_url + "/api/skill/run",
+        base_url + "/api/skills/run",
+        base_url + "/v1/skill/run",
+        base_url + "/v1/query",
+        base_url + "/api/v1/query",
+        base_url + "/query",
+        base_url + "/search",
+        # 兼容部分 SkillHub/Claw 风格服务端。
+        base_url + "/finskillshub/api/claw/query",
+        base_url + "/skillhub/api/claw/query",
+        base_url + "/api/claw/query",
+    ]
+    return list(dict.fromkeys(candidates))
+
+
+def _iwc_headers(api_key):
+    """兼容官方 OpenAPI 与常见 SkillHub 网关的认证头。"""
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "apikey": api_key,
+        "apiKey": api_key,
+        "x-api-key": api_key,
+        "X-API-Key": api_key,
+        "x-iwencai-api-key": api_key,
+        "IWENCAI_API_KEY": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "Mozilla/5.0 (compatible; WhaleWatch-IWenCaiSkillHub/2.0)",
+    }
+
+
+def _iwc_payload_candidates(query, skill="search", date_scope="最近3天"):
+    """优先按官方 SkillHub 的 skill id 调用；兼容多种参数名。"""
+    query = str(query or "").strip()
+    skill = str(skill or "search").strip()
+    meta = {"date_scope": date_scope, "dateScope": date_scope, "timeRange": date_scope, "range": date_scope}
+    args = {"query": query, "question": query, "keyword": query, "date_scope": date_scope, "dateScope": date_scope}
+    return [
+        {"skillId": skill, "arguments": args},
+        {"skillName": skill, "arguments": args},
+        {"skill": skill, "arguments": args},
+        {"name": skill, "arguments": args},
+        {"tool": skill, "arguments": args},
+        {"skill_id": skill, "input": {"query": query, "date_scope": date_scope}},
+        {"skillId": skill, "input": {"query": query, "dateScope": date_scope}},
+        {"skillName": skill, "input": {"query": query, "dateScope": date_scope}},
+        {"skill": skill, "input": query, **meta},
+        {"skill": skill, "query": query, **meta},
+        {"skillName": skill, "query": query, **meta},
+        {"skillId": skill, "query": query, **meta},
+        {"query": query, "skill": skill, **meta},
+        {"question": query, "skill": skill, **meta},
+        {"input": query, "skill": skill, **meta},
+        {"keyword": query, "skill": skill, **meta},
+        {"messages": [{"role": "user", "content": query}], "skill": skill, **meta},
+        # 有些 openapi 网关只收 question/query，不收 skill；作为最后兼容。
+        {"query": query, **meta},
+        {"question": query, **meta},
+    ]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def iwencai_skill_query(query, skill="search", date_scope="最近3天", timeout_sec=7):
+    """v26：爱问财官方 SkillHub 统一入口。支持 IWENCAI_BASE_URL 默认 openapi。"""
+    cfg = get_iwencai_config()
+    api_key, base_url = cfg.get("api_key"), cfg.get("url")
+    if not api_key:
+        return None, "未配置 IWENCAI_API_KEY"
+    urls = _iwc_runtime_url_candidates(base_url)
+    if not urls:
+        return None, "未配置可用 IWENCAI_BASE_URL；请填 https://openapi.iwencai.com，不要填安装脚本地址"
+    errors = []
+    # 先试精确 skill id 的常见 payload，再试无 skill payload。总尝试次数压低，避免页面卡死。
+    for url in urls[:10]:
+        for payload in _iwc_payload_candidates(query, skill=skill, date_scope=date_scope)[:8]:
+            data, err = _iwc_post_once(url, payload, api_key, timeout_sec=timeout_sec)
+            if data is not None:
+                return {"source_url": url, "payload": payload, "raw": data}, None
+            if err:
+                errors.append(f"{url}: {err}")
+            if len(errors) >= 12:
+                break
+        if len(errors) >= 12:
+            break
+    return None, "；".join(errors[-5:]) if errors else "爱问财 SkillHub 无返回"
+
+
+def _iwc_build_news_queries(stock_code="", keyword="", date_scope="最近3天"):
+    """v26：新闻情报查询词更贴近官方技能能力。"""
+    base = str(stock_code or keyword or "A股").strip()
+    qs = []
+    if stock_code:
+        qs.extend([
+            f"{base} {date_scope} 最新消息 新闻 公告 研报 机构观点 风险提示",
+            f"{base} {date_scope} 董秘问答 投资者互动 重大事项",
+            f"{base} 所属行业 概念题材 产业链 上下游 最新动态",
+        ])
+    if keyword:
+        qs.extend([
+            f"{keyword} {date_scope} 最新新闻 行业动态 概念催化 市场热点 舆论趋势",
+            f"{keyword} {date_scope} 相关A股 产业链 资金流向 风险提示",
+        ])
+    qs.extend([
+        f"{date_scope} A股市场热点 舆论趋势 政策催化 风险事件",
+        f"{date_scope} 宏观经济要闻 政策 利率 汇率 流动性 产业政策",
+    ])
+    return list(dict.fromkeys([q for q in qs if q.strip()]))[:8]
+
+
+def iwencai_news_search(stock_code="", keyword="", date_scope="最近3天", max_items=36):
+    """v26：爱问财官方技能库新闻/公告/研报/宏观/热点检索。hithink-macro-query 已作为精确技能纳入。"""
+    all_items, errors, queries = [], [], []
+    # 宏观数据中已包含 hithink-macro-query；新闻/公告/研报也尽量用官方 skill id。
+    skill_plan = ["新闻资讯", "公告搜索", "研报搜索", "董秘问答", "市场热点", "宏观数据", "产业链分析"]
+    for q in _iwc_build_news_queries(stock_code, keyword, date_scope):
+        queries.append(q)
+        raw_packs, err_list = iwencai_official_query(q, skill_groups=skill_plan, date_scope=date_scope, timeout_sec=7, stop_on_first=False)
+        for pack in raw_packs[:10]:
+            raw = {"raw": pack.get("raw"), "skill_group": pack.get("skill_group"), "skill_alias": pack.get("skill_alias")}
+            items = _iwc_extract_news_items(raw, query_hint=f"{pack.get('skill_group')}｜{q}", max_items=8)
+            for it in items:
+                it["platform"] = f"爱问财·{pack.get('skill_group')}"
+                it["source"] = it.get("source") or "爱问财官方技能库"
+                it["skill_alias"] = pack.get("skill_alias")
+            all_items.extend(items)
+        errors.extend(err_list[-4:] if err_list else [])
+        if len(all_items) >= max_items:
+            break
+    normalized = []
+    try:
+        fetcher = HighEndNewsFetcher()
+    except Exception:
+        fetcher = None
+    for item in all_items[:max_items]:
+        try:
+            if fetcher:
+                item["impact_score"] = fetcher._score_item(item)
+                item["matched_sectors"] = fetcher._match_sectors(str(item.get("title", "")) + " " + str(item.get("summary", "")))
+        except Exception:
+            item.setdefault("impact_score", 0)
+            item.setdefault("matched_sectors", [])
+        normalized.append(item)
+    dedup, seen = [], set()
+    for it in normalized:
+        key = (str(it.get("title", "")) + str(it.get("summary", ""))[:100]).strip()
+        if key and key not in seen:
+            seen.add(key)
+            dedup.append(it)
+    return dedup[:max_items], errors, queries
+
+# 状态说明：不改变页面，只在日志/调试中更准确地说明接入方式。
+try:
+    _iwc_cli_ok_v26, _iwc_cli_msg_v26 = _iwc_cli_status_v26()
+except Exception:
+    _iwc_cli_ok_v26, _iwc_cli_msg_v26 = False, "CLI 状态未知"
+
+# ================= v26 爱问财 SkillHub 官方环境变量 + hithink-macro-query 精准修复结束 =================
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
