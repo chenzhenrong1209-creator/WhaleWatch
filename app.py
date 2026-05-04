@@ -9003,6 +9003,185 @@ except Exception:
 
 # ================= v27 爱问财官方指定技能精准挂载结束 =================
 
+
+# ================= v28 爱问财官方 query2data 接口修复开始 =================
+# 根因修复：上一版把官方技能当作 SkillHub runner 调用，容易触发“当前 skill 版本过低”。
+# 根据官方技能文档，实际金融查询应调用：{IWENCAI_BASE_URL}/v1/query2data。
+# 请求体只传自然语言 query / page / limit / is_cache / expand_index，不再把 skillId 发送给服务端执行。
+
+
+def get_iwencai_config():
+    # 读取爱问财配置。优先官方变量：IWENCAI_BASE_URL / IWENCAI_API_KEY / IWENCAI_API_URL。
+    api_key = ""
+    base_url = ""
+    api_url = ""
+    try:
+        api_key = str(
+            st.secrets.get("IWENCAI_API_KEY", "")
+            or st.secrets.get("IWC_API_KEY", "")
+            or st.secrets.get("IWENCAI_KEY", "")
+            or ""
+        ).strip()
+        base_url = str(
+            st.secrets.get("IWENCAI_BASE_URL", "")
+            or st.secrets.get("IWENCAI_URL", "")
+            or st.secrets.get("IWC_URL", "")
+            or ""
+        ).strip()
+        api_url = str(st.secrets.get("IWENCAI_API_URL", "") or "").strip()
+    except Exception:
+        pass
+    try:
+        sec = st.secrets.get("iwencai", {})
+        if isinstance(sec, dict):
+            api_key = api_key or str(sec.get("api_key") or sec.get("apikey") or sec.get("key") or "").strip()
+            base_url = base_url or str(sec.get("base_url") or sec.get("url") or sec.get("endpoint") or "").strip()
+            api_url = api_url or str(sec.get("api_url") or sec.get("query2data_url") or "").strip()
+    except Exception:
+        pass
+    if api_key and not base_url:
+        base_url = "https://openapi.iwencai.com"
+    base_url = base_url.rstrip("/")
+    if not api_url and base_url:
+        api_url = base_url if base_url.endswith("/v1/query2data") else base_url + "/v1/query2data"
+    return {"api_key": api_key, "url": base_url, "api_url": api_url}
+
+
+def _iwc_headers(api_key):
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (compatible; WhaleWatch-IWenCai-query2data/1.0)",
+        "apikey": api_key,
+        "x-api-key": api_key,
+    }
+
+
+def _iwc_skill_query_rewrite(query, skill_group="", skill_alias="", date_scope="最近3天"):
+    # 把技能名转成问财自然语言查询，不再把 skillId 传给远端 runner。
+    q = str(query or "").strip()
+    sg = str(skill_group or skill_alias or "").strip()
+    if not q:
+        q = f"{date_scope} A股市场"
+    rules = {
+        "板块选择": "只返回行业板块或概念板块，包含板块名称、涨跌幅、成交额、主力资金净流入、领涨股票，不要返回个股列表",
+        "行业数据": "查询行业板块数据，包含行业名称、涨跌幅、成交额、资金流向、上涨家数、下跌家数、领涨股票",
+        "市场热点": "查询A股市场热点行业板块和概念板块，包含热度原因、涨跌幅、成交额、领涨股票，不要返回个股列表",
+        "研报搜索": "查询相关研报、机构观点、评级变化、目标价、发布时间和研究机构",
+        "公告搜索": "查询相关公告、重大事项、风险提示、公告日期和公告标题",
+        "新闻资讯": "查询相关新闻、资讯、舆情动态、事件催化和发布时间",
+        "宏观数据": "查询宏观经济要闻、政策、利率、汇率、流动性、重要指数和市场影响",
+        "指数数据": "查询指数最新点位、涨跌幅、成交额和相关市场表现",
+        "行情数据": "查询行情数据，包含最新价、涨跌幅、成交额、换手率、总市值、市盈率、市净率",
+        "资金流向": "查询资金流向、主力净流入、主力净占比、成交额和排名",
+        "财务数据": "查询财务数据、估值、市盈率、市净率、总市值、营收和利润",
+        "产业链分析": "查询产业链、上下游、相关行业、相关上市公司和事件影响",
+        "董秘问答": "查询董秘问答、投资者互动、公司回应和关键信息",
+        "A股选股": "查询A股相关股票并给出股票代码、股票名称、涨跌幅、成交额和理由",
+    }
+    add = ""
+    for k, v in rules.items():
+        if k in sg:
+            add = v
+            break
+    alias = str(skill_alias or "")
+    if not add:
+        if "sector" in alias or "板块" in alias:
+            add = rules["板块选择"]
+        elif "industry" in alias or "行业" in alias:
+            add = rules["行业数据"]
+        elif "report" in alias or "研报" in alias:
+            add = rules["研报搜索"]
+        elif "announcement" in alias or "公告" in alias:
+            add = rules["公告搜索"]
+        elif "zhishu" in alias or "index" in alias or "指数" in alias:
+            add = rules["指数数据"]
+        elif "market" in alias or "行情" in alias:
+            add = rules["行情数据"]
+        elif "macro" in alias or "宏观" in alias:
+            add = rules["宏观数据"]
+    if add and add not in q:
+        q = f"{q}，{add}"
+    return q
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def iwencai_query2data(query, page="1", limit="20", timeout_sec=8):
+    # 爱问财官方金融查询接口。返回 datas，不调用 SkillHub runner。
+    cfg = get_iwencai_config()
+    api_key, api_url = cfg.get("api_key"), cfg.get("api_url")
+    if not api_key:
+        return None, "未配置 IWENCAI_API_KEY"
+    if not api_url:
+        return None, "未配置 IWENCAI_BASE_URL 或 IWENCAI_API_URL"
+    if "download_and_install" in api_url or api_url.endswith(".sh"):
+        return None, "当前配置的是安装脚本地址，不是 query2data 接口地址"
+    payload = {
+        "query": str(query or "").strip(),
+        "source": "test",
+        "page": str(page),
+        "limit": str(limit),
+        "is_cache": "1",
+        "expand_index": "true",
+    }
+    try:
+        r = requests.post(api_url, headers=_iwc_headers(api_key), json=payload, timeout=(3, timeout_sec), verify=False)
+        text = r.text[:500]
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}: {text}"
+        try:
+            data = r.json()
+        except Exception:
+            return {"text": r.text, "datas": []}, None
+        if isinstance(data, dict):
+            if data.get("error") or data.get("errorMsg"):
+                return None, str(data.get("error") or data.get("errorMsg"))[:300]
+            if data.get("code") not in (None, 0, 200, "0", "200") and not any(k in data for k in ["datas", "data", "result"]):
+                return None, str(data.get("message") or data.get("msg") or data.get("code"))[:300]
+        return data, None
+    except Exception as exc:
+        return None, str(exc)[:300]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def iwencai_skill_query(query, skill="search", date_scope="最近3天", timeout_sec=8):
+    # 兼容旧函数名：skill 只用于改写查询，不再传给远端执行。
+    rewritten = _iwc_skill_query_rewrite(query, skill_group=str(skill), skill_alias=str(skill), date_scope=date_scope)
+    data, err = iwencai_query2data(rewritten, page="1", limit="30", timeout_sec=timeout_sec)
+    if data is not None:
+        return {"source_url": get_iwencai_config().get("api_url"), "payload": {"query": rewritten, "skill_hint": skill}, "raw": data}, None
+    return None, err
+
+
+def iwencai_official_query(query, skill_groups=None, date_scope="最近3天", timeout_sec=8, stop_on_first=True):
+    # v28：所有官方技能统一走 query2data。skill_groups 只决定查询意图。
+    skill_groups = skill_groups or ["新闻资讯"]
+    results, errors = [], []
+    for group in list(skill_groups)[:5]:
+        aliases = iwencai_skill_aliases(group) if 'iwencai_skill_aliases' in globals() else [group]
+        alias = aliases[0] if aliases else group
+        rewritten = _iwc_skill_query_rewrite(query, skill_group=group, skill_alias=alias, date_scope=date_scope)
+        raw, err = iwencai_skill_query(rewritten, skill=alias, date_scope=date_scope, timeout_sec=timeout_sec)
+        if raw:
+            results.append({"skill_group": group, "skill_alias": alias, "raw": raw})
+            if stop_on_first:
+                return results, errors
+        elif err:
+            errors.append(f"{group}/{alias}: {err}")
+    return results, errors
+
+try:
+    _render_news_before_iwc_v28 = render_high_end_news_terminal
+    def render_high_end_news_terminal():
+        cfg = get_iwencai_config()
+        if cfg.get('api_key'):
+            st.caption('✅ 爱问财已切换为官方 query2data 数据接口：IWENCAI_BASE_URL → /v1/query2data；官方 skill 名称仅用于查询意图改写，不再调用低版本 SkillHub runner。')
+        _render_news_before_iwc_v28()
+except Exception:
+    pass
+
+# ================= v28 爱问财官方 query2data 接口修复结束 =================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 个股解析",
     "📈 宏观推演",
